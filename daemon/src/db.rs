@@ -1,0 +1,86 @@
+use sqlite::{Connection, State};
+use std::fs;
+use tracing::info;
+
+static SCHEMA: &str = include_str!("../../db/db.sql");
+
+pub struct Db {
+    conn: Connection,
+}
+
+impl Db {
+    pub fn new() -> anyhow::Result<Self> {
+        let mut db_path = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        db_path.push(".aria");
+        fs::create_dir_all(&db_path)?;
+        db_path.push("daemon.db");
+
+        let conn = sqlite::open(&db_path)?;
+        let db = Self { conn };
+        if !db.has_table("identity")? {
+            db.run_migration()?;
+        }
+        db.ensure_config_table()?;
+        Ok(db)
+    }
+
+    fn has_table(&self, name: &str) -> anyhow::Result<bool> {
+        let mut statement = self.conn
+            .prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")?;
+        statement.bind((1, name))?;
+        if let State::Row = statement.next()? {
+            let count: i64 = statement.read(0)?;
+            return Ok(count > 0);
+        }
+        Ok(false)
+    }
+
+    fn run_migration(&self) -> anyhow::Result<()> {
+        self.conn.execute(SCHEMA)?;
+        Ok(())
+    }
+
+    fn ensure_config_table(&self) -> anyhow::Result<()> {
+        if !self.has_table("config")? {
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );"
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut statement = self.conn.prepare("SELECT value FROM config WHERE key = ?")?;
+        statement.bind((1, key))?;
+        if let State::Row = statement.next()? {
+            return Ok(Some(statement.read::<String, _>(0)?));
+        }
+        Ok(None)
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut statement = self.conn.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")?;
+        statement.bind((1, key))?;
+        statement.bind((2, value))?;
+        statement.next()?;
+        Ok(())
+    }
+
+    pub fn ensure_stub_identity(&self) -> anyhow::Result<()> {
+        let mut statement = self.conn.prepare("SELECT count(*) FROM identity")?;
+        if let State::Row = statement.next()? {
+            let count: i64 = statement.read(0)?;
+            if count == 0 {
+                info!("No identity found. Creating stub identity for Phase 1...");
+                self.conn.execute(
+                    "INSERT INTO identity (did, public_key, private_key, manifest_path) 
+                     VALUES ('did:aria:jayesh', 'stub_pub', 'stub_priv', '~/.aria/manifest.json')"
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

@@ -31,7 +31,7 @@ dirs = "5"
 notify = "6"
 
 # HTTP client (for LLM API calls from host functions)
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 # Cron scheduler
 tokio-cron-scheduler = "0.10"

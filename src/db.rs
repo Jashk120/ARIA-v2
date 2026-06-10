@@ -83,4 +83,31 @@ impl Db {
         }
         Ok(())
     }
+
+    pub fn save_message(&self, agent_did: &str, direction: &str, content: &str) -> anyhow::Result<()> {
+        let mut statement = self.conn.prepare(
+            "INSERT INTO messages (agent_did, direction, content) VALUES (?, ?, ?)"
+        )?;
+        statement.bind((1, agent_did))?;
+        statement.bind((2, direction))?;
+        statement.bind((3, content))?;
+        statement.next()?;
+        Ok(())
+    }
+
+    pub fn get_history(&self, agent_did: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT direction, content FROM messages WHERE agent_did = ? ORDER BY timestamp DESC LIMIT ?"
+        )?;
+        statement.bind((1, agent_did))?;
+        statement.bind((2, limit as i64))?;
+        
+        let mut history = Vec::new();
+        while let State::Row = statement.next()? {
+            let direction: String = statement.read(0)?;
+            let content: String = statement.read(1)?;
+            history.push((direction, content));
+        }
+        Ok(history)
+    }
 }

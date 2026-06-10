@@ -135,5 +135,5 @@ async fn main() -> anyhow::Result<()> {
 
     let db = bootstrap_db()?;
     let api_key = prompt_api_key(&db)?;
-    repl::run(&api_key)
+    repl::run(&db, &api_key).await
 }

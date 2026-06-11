@@ -37,11 +37,7 @@ For normal conversation (no tools needed):
 {"type":"chat","content":"your response here"}
 
 == AVAILABLE SKILLS ==
-- search.web: args: {"query": "search terms", "max_results": 5}
-- find.fs:    args: {"path": "~/some/dir/", "pattern": "*.pdf"}
-- read.fs:    args: {"path": "/absolute/path/to/file.txt"}
-- notify:     args: {"message": "text", "channel": "terminal"}
-
+ build_skills_prompt()
 == RULES ==
 - Always think before acting (emit a thought first)
 - Never call a skill without a preceding thought
@@ -199,6 +195,31 @@ pub async fn run(db: &Db, api_key: &str, cfg: RuntimeConfig) -> anyhow::Result<(
     Ok(())
 }
 
+fn build_skills_prompt() -> String {
+    let exe = std::env::current_exe().unwrap();
+    let root = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).unwrap();
+    let skills_dir = root.join("skills");
+
+    let mut lines = vec!["== AVAILABLE SKILLS ==".to_string()];
+
+    // Walk skills/<category>/<action>.<category>/manifest.toml
+    if let Ok(categories) = std::fs::read_dir(&skills_dir) {
+        for cat in categories.flatten() {
+            if let Ok(skills) = std::fs::read_dir(cat.path()) {
+                for skill in skills.flatten() {
+                    let manifest_path = skill.path().join("manifest.toml");
+                    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                        if let Ok(m) = toml::from_str::<SkillManifest>(&text) {
+                            lines.push(format!("- {}: {}", m.name, m.description));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 async fn run_react_loop(
     api_key: String,
     mut history: Vec<serde_json::Value>,
@@ -240,14 +261,8 @@ async fn run_react_loop(
 
                     // Inject runtime config into args — no db needed
                     let mut enriched = args.clone();
-                    if skill == "search.web" {
-                        enriched["searxng_url"] = json!(searxng_url);
-                        if let Some(ref k) = brave_api_key {
-                            enriched["brave_api_key"] = json!(k);
-                        }
-                    }
-
-                    let observation = match crate::skills::run_skill_raw(&skill, &enriched).await {
+                    
+                    let observation = match crate::skills::run_skill(&skill, &enriched).await {
                         Ok(val) => val.to_string(),
                         Err(e) => format!("skill error: {}", e),
                     };

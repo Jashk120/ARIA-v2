@@ -7,3 +7,10 @@ action = "Reading {url}"
 
 [capabilities]
 http = true
+
+[call]
+args_schema   = '{"url":"string","max_chars":4000}'
+output_schema = '{"url":"string","text":"string","chars":"number"}'
+
+[react]
+max_steps = 3

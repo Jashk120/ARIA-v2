@@ -8,6 +8,13 @@ action = "Searching the web for \"{query}\""
 [capabilities]
 http = true
 
+[call]
+args_schema   = '{"query":"string","max_results":5}'
+output_schema = '{"results":[{"title":"string","url":"string","snippet":"string"}],"source":"string"}'
+
+[react]
+max_steps = 3
+
 [config.searxng_url]
 default = "http://localhost:8080"
 inject  = true

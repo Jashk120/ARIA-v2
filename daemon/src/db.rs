@@ -21,6 +21,7 @@ impl Db {
             db.run_migration()?;
         }
         db.ensure_config_table()?;
+        db.ensure_skills_table()?;
         Ok(db)
     }
 
@@ -52,6 +53,22 @@ impl Db {
         Ok(())
     }
 
+    fn ensure_skills_table(&self) -> anyhow::Result<()> {
+        if !self.has_table("skills")? {
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS skills (
+                    name         TEXT PRIMARY KEY,
+                    version      TEXT NOT NULL,
+                    wasm_path    TEXT NOT NULL,
+                    installed_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );"
+            )?;
+        }
+        Ok(())
+    }
+
+    // ── Config ────────────────────────────────────────────────────────────────
+
     pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut statement = self.conn.prepare("SELECT value FROM config WHERE key = ?")?;
         statement.bind((1, key))?;
@@ -62,12 +79,57 @@ impl Db {
     }
 
     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let mut statement = self.conn.prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")?;
+        let mut statement = self.conn
+            .prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")?;
         statement.bind((1, key))?;
         statement.bind((2, value))?;
         statement.next()?;
         Ok(())
     }
+
+    // ── Skills ────────────────────────────────────────────────────────────────
+
+    pub fn install_skill(&self, name: &str, version: &str, wasm_path: &str) -> anyhow::Result<()> {
+        let mut statement = self.conn
+            .prepare("INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)")?;
+        statement.bind((1, name))?;
+        statement.bind((2, version))?;
+        statement.bind((3, wasm_path))?;
+        statement.next()?;
+        Ok(())
+    }
+
+    pub fn get_skill(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let mut statement = self.conn
+            .prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
+        statement.bind((1, name))?;
+        if let State::Row = statement.next()? {
+            return Ok(Some(statement.read::<String, _>(0)?));
+        }
+        Ok(None)
+    }
+
+    pub fn list_skills(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut statement = self.conn
+            .prepare("SELECT name, version FROM skills ORDER BY name")?;
+        let mut skills = Vec::new();
+        while let State::Row = statement.next()? {
+            skills.push((
+                statement.read::<String, _>(0)?,
+                statement.read::<String, _>(1)?,
+            ));
+        }
+        Ok(skills)
+    }
+
+    pub fn remove_skill(&self, name: &str) -> anyhow::Result<()> {
+        let mut statement = self.conn.prepare("DELETE FROM skills WHERE name = ?")?;
+        statement.bind((1, name))?;
+        statement.next()?;
+        Ok(())
+    }
+
+    // ── Identity ──────────────────────────────────────────────────────────────
 
     pub fn ensure_stub_identity(&self) -> anyhow::Result<()> {
         let mut statement = self.conn.prepare("SELECT count(*) FROM identity")?;
@@ -76,13 +138,15 @@ impl Db {
             if count == 0 {
                 info!("No identity found. Creating stub identity for Phase 1...");
                 self.conn.execute(
-                    "INSERT INTO identity (did, public_key, private_key, manifest_path) 
+                    "INSERT INTO identity (did, public_key, private_key, manifest_path)
                      VALUES ('did:aria:jayesh', 'stub_pub', 'stub_priv', '~/.aria/manifest.json')"
                 )?;
             }
         }
         Ok(())
     }
+
+    // ── Messages ──────────────────────────────────────────────────────────────
 
     pub fn save_message(&self, agent_did: &str, direction: &str, content: &str) -> anyhow::Result<()> {
         let mut statement = self.conn.prepare(
@@ -101,7 +165,7 @@ impl Db {
         )?;
         statement.bind((1, agent_did))?;
         statement.bind((2, limit as i64))?;
-        
+
         let mut history = Vec::new();
         while let State::Row = statement.next()? {
             let direction: String = statement.read(0)?;

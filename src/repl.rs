@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::config::CONFIG;
+use crate::config::{CONFIG, RuntimeConfig};
 use crate::db::Db;
 
 const AGENT_DID: &str = "did:aria:jayesh";
@@ -14,7 +14,8 @@ You decide whether a user message needs tool use or is just a conversation.
 
 == WHEN TO USE TOOLS ==
 Use tools ONLY when the user explicitly wants to interact with files, data, or the system.
-- "read my resume", "find files", "rate this document" → use tools
+- "search for X", "find info on Y", "look up Z" → use search.web skill
+- "read my resume", "find files", "rate this document" → use file skills
 - "hi", "how are you", "explain X", "what is Y" → just reply normally, NO tools
 
 == TOOL USE FORMAT ==
@@ -35,16 +36,14 @@ To give the final answer after all tool steps:
 For normal conversation (no tools needed):
 {"type":"chat","content":"your response here"}
 
-== AVAILABLE SKILLS (STUBBED) ==
-- find_files: args: {"path": "~/some/dir/", "pattern": "*.pdf"}
-- read_file: args: {"path": "/absolute/path/to/file.txt"}
-- rate: args: {"text": "document content here"}
-- summarize: args: {"text": "document content here"}
-- notify: args: {"message": "text", "channel": "terminal"}
+== AVAILABLE SKILLS ==
+- search.web: args: {"query": "search terms", "max_results": 5}
+- find.fs:    args: {"path": "~/some/dir/", "pattern": "*.pdf"}
+- read.fs:    args: {"path": "/absolute/path/to/file.txt"}
+- notify:     args: {"message": "text", "channel": "terminal"}
 
 == RULES ==
 - Always think before acting (emit a thought first)
-- For file operations, use find_files first, then confirm with the user before reading
 - Never call a skill without a preceding thought
 - Keep thoughts short and practical
 - Final answers should be friendly and summarize what was done"#;
@@ -68,7 +67,7 @@ enum AgentResponseKind {
     Final(String),
 }
 
-pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
+pub async fn run(db: &Db, api_key: &str, cfg: RuntimeConfig) -> anyhow::Result<()> {
     let history = db.get_history(AGENT_DID, 50)?;
     let mut history_reversed = history.clone();
     history_reversed.reverse();
@@ -82,11 +81,19 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
         .collect();
 
     println!("ARIA v0.5 — Governed Agent Runtime");
+    if cfg.brave_api_key.is_some() {
+        println!("Search: Brave API + SearXNG fallback");
+    } else {
+        println!("Search: SearXNG ({})", cfg.searxng_url);
+    }
     println!("Type a message, or /help for commands. Ctrl+C or /quit to exit.");
     println!();
 
     let stdin = io::stdin();
     let api_key = api_key.to_string();
+    // cfg is just two Strings — clone is cheap and makes it Send
+    let searxng_url = cfg.searxng_url.clone();
+    let brave_api_key = cfg.brave_api_key.clone();
 
     loop {
         print!("▸ You: ");
@@ -110,10 +117,11 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
         match cmd.as_str() {
             "/quit" | "/exit" | "/q" => break,
             "/help" | "/h" => {
-                println!("  /help   — show this message");
-                println!("  /quit   — exit ARIA");
-                println!("  /clear  — clear screen");
-                println!("  /key    — show redacted API key");
+                println!("  /help    — show this message");
+                println!("  /quit    — exit ARIA");
+                println!("  /clear   — clear screen");
+                println!("  /key     — show redacted API key");
+                println!("  /config  — show runtime config");
                 continue;
             }
             "/clear" => {
@@ -126,6 +134,11 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
                 println!("  Key: {}...{}", &api_key[..4.min(api_key.len())], &api_key[end..]);
                 continue;
             }
+            "/config" => {
+                println!("  searxng_url:   {}", searxng_url);
+                println!("  brave_api_key: {}", if brave_api_key.is_some() { "set" } else { "not set" });
+                continue;
+            }
             _ => {}
         }
 
@@ -135,9 +148,12 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
         let key = api_key.clone();
         let history_snap = llm_history.clone();
+        // Inject config into args before spawn — on main thread, no db hit
+        let s_url = searxng_url.clone();
+        let b_key = brave_api_key.clone();
 
         let handle = tokio::spawn(async move {
-            run_react_loop(key, history_snap, tx).await;
+            run_react_loop(key, history_snap, s_url, b_key, tx).await;
         });
 
         while let Some(event) = rx.recv().await {
@@ -150,12 +166,11 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
                     println!("💭  {}", t);
                 }
                 AgentEvent::Action { skill, args } => {
-                    let readable = describe_action(&skill, &args);
+                    let readable = crate::skills::describe_action(&skill, &args);
                     println!("⚡  {}", readable);
                 }
                 AgentEvent::Observation(o) => {
-                    let clean = o.trim_start_matches("[STUB] ");
-                    println!("📋  {}", clean);
+                    println!("📋  {}", o);
                 }
                 AgentEvent::Ask(q) => {
                     println!();
@@ -187,6 +202,8 @@ pub async fn run(db: &Db, api_key: &str) -> anyhow::Result<()> {
 async fn run_react_loop(
     api_key: String,
     mut history: Vec<serde_json::Value>,
+    searxng_url: String,
+    brave_api_key: Option<String>,
     tx: mpsc::Sender<AgentEvent>,
 ) {
     for _ in 0..MAX_REACT_STEPS {
@@ -220,7 +237,20 @@ async fn run_react_loop(
                 }
                 AgentResponseKind::Action { skill, args } => {
                     let _ = tx.send(AgentEvent::Action { skill: skill.clone(), args: args.clone() }).await;
-                    let observation = run_stub_skill(&skill, &args);
+
+                    // Inject runtime config into args — no db needed
+                    let mut enriched = args.clone();
+                    if skill == "search.web" {
+                        enriched["searxng_url"] = json!(searxng_url);
+                        if let Some(ref k) = brave_api_key {
+                            enriched["brave_api_key"] = json!(k);
+                        }
+                    }
+
+                    let observation = match crate::skills::run_skill_raw(&skill, &enriched).await {
+                        Ok(val) => val.to_string(),
+                        Err(e) => format!("skill error: {}", e),
+                    };
                     let _ = tx.send(AgentEvent::Observation(observation.clone())).await;
                     history.push(json!({ "role": "assistant", "content": raw }));
                     history.push(json!({
@@ -277,54 +307,9 @@ fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
         .collect()
 }
 
-fn describe_action(skill: &str, args: &serde_json::Value) -> String {
-    match skill {
-        "find_files" => {
-            let path = args["path"].as_str().unwrap_or("~");
-            let pattern = args["pattern"].as_str().unwrap_or("*");
-            format!("Searching {} for {}", path, pattern)
-        }
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("file");
-            format!("Reading {}", path)
-        }
-        "rate"      => "Rating document…".to_string(),
-        "summarize" => "Summarizing document…".to_string(),
-        "notify"    => {
-            let msg = args["message"].as_str().unwrap_or("(no message)");
-            format!("Sending notification: {}", msg)
-        }
-        other => format!("Running skill: {}", other),
-    }
-}
-
 fn extract_content_field(s: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(s.trim()).ok()?;
     v["content"].as_str().map(|c| c.to_string())
-}
-
-fn run_stub_skill(skill: &str, args: &serde_json::Value) -> String {
-    match skill {
-        "find_files" => {
-            let path = args["path"].as_str().unwrap_or("~/");
-            let pattern = args["pattern"].as_str().unwrap_or("*");
-            format!(
-                "[STUB] Searched {} for '{}' — found: resume_john.pdf, resume_jane.pdf, notes.txt",
-                path, pattern
-            )
-        }
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("unknown");
-            format!("[STUB] Read {} — skill not yet implemented.", path)
-        }
-        "rate"      => "[STUB] Rated document — score: 7.4/10.".to_string(),
-        "summarize" => "[STUB] Summarized document — skill not yet implemented.".to_string(),
-        "notify"    => {
-            let msg = args["message"].as_str().unwrap_or("");
-            format!("[STUB] Would notify: '{}'", msg)
-        }
-        other => format!("[STUB] Unknown skill '{}'", other),
-    }
 }
 
 async fn call_llm(api_key: &str, history: &[serde_json::Value]) -> anyhow::Result<String> {

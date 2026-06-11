@@ -8,8 +8,10 @@ use std::fs;
 mod db;
 mod config;
 mod repl;
+mod skills;
 
 use crate::db::Db;
+use crate::config::RuntimeConfig;
 
 fn print_help() {
     println!("ARIA — Governed Agent Runtime v0.5");
@@ -31,7 +33,7 @@ fn print_help() {
 fn install_service() -> anyhow::Result<()> {
     let os = env::consts::OS;
     println!("Installing ARIA Daemon as a startup service on {}...", os);
-    
+
     match os {
         "linux" => {
             let exe_path = env::current_exe()?;
@@ -55,7 +57,7 @@ WantedBy=default.target
 
             let service_path = systemd_dir.join("aria-daemon.service");
             fs::write(&service_path, service_content)?;
-            
+
             println!("✓ Service file created: {:?}", service_path);
             println!("  Run this to enable and start:");
             println!("  systemctl --user enable --now aria-daemon");
@@ -135,5 +137,6 @@ async fn main() -> anyhow::Result<()> {
 
     let db = bootstrap_db()?;
     let api_key = prompt_api_key(&db)?;
-    repl::run(&db, &api_key).await
+    let runtime_cfg = RuntimeConfig::load(&db);
+    repl::run(&db, &api_key, runtime_cfg).await
 }

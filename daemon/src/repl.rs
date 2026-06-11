@@ -82,13 +82,27 @@ For normal conversation (no tools needed):
 // ── Skills prompt builder ─────────────────────────────────────────────────────
 
 fn build_skills_prompt() -> String {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let root = exe
-        .parent().and_then(|p| p.parent()).and_then(|p| p.parent())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let skills_dir = root.join("skills");
-
     let mut blocks: Vec<String> = Vec::new();
+
+    // Use skills module to find directories more reliably
+    let root = match crate::skills::describe_action("ping.test", &json!({})).as_str() {
+        _ => {
+             // We can't easily call skill_dir here without exposing it or duplicating
+             // For prompt building, we'll keep a simpler version but more consistent 
+             // with what skills.rs does.
+             let exe = std::env::current_exe().unwrap_or_default();
+             let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
+             if root.ends_with("debug") || root.ends_with("release") {
+                if let Some(p) = root.parent() {
+                    if p.ends_with("target") {
+                        root = p.parent().unwrap_or(root);
+                    }
+                }
+             }
+             root.to_path_buf()
+        }
+    };
+    let skills_dir = root.join("skills");
 
     if let Ok(categories) = std::fs::read_dir(&skills_dir) {
         for cat in categories.flatten() {
@@ -163,7 +177,12 @@ enum AgentResponseKind {
 
 // ── REPL entry point ──────────────────────────────────────────────────────────
 
-pub async fn run(db: &Db, api_key: &str, cfg: RuntimeConfig) -> anyhow::Result<()> {
+pub async fn run(
+    db: &Db,
+    api_key: &str,
+    cfg: RuntimeConfig,
+    skills: std::sync::Arc<crate::skills::SkillManager>,
+) -> anyhow::Result<()> {
     let history = db.get_history(AGENT_DID, 50)?;
     let mut history_reversed = history.clone();
     history_reversed.reverse();
@@ -236,8 +255,9 @@ pub async fn run(db: &Db, api_key: &str, cfg: RuntimeConfig) -> anyhow::Result<(
         let s_url = searxng_url.clone();
         let b_key = brave_api_key.clone();
 
+        let sm = std::sync::Arc::clone(&skills);
         let handle = tokio::spawn(async move {
-            run_react_loop(key, history_snap, s_url, b_key, tx).await;
+            run_react_loop(key, history_snap, s_url, b_key, sm, tx).await;
         });
 
         while let Some(event) = rx.recv().await {
@@ -279,6 +299,7 @@ async fn run_react_loop(
     mut history: Vec<serde_json::Value>,
     searxng_url: String,
     brave_api_key: Option<String>,
+    skills: std::sync::Arc<crate::skills::SkillManager>,
     tx: mpsc::Sender<AgentEvent>,
 ) {
     let sys_prompt = system_prompt();
@@ -342,7 +363,7 @@ async fn run_react_loop(
                         }
                     }
 
-                    let (observation, is_error) = match crate::skills::run_skill_raw(&skill, &enriched).await {
+                    let (observation, is_error) = match skills.run_skill_raw(&skill, &enriched).await {
                         Ok(val) => (val.to_string(), false),
                         Err(e)  => (e.to_string(), true),
                     };
@@ -384,20 +405,25 @@ async fn run_react_loop(
     let _ = tx.send(AgentEvent::Done).await;
 }
 
-// ── Manifest helpers ──────────────────────────────────────────────────────────
-
-fn skill_manifest_dir(name: &str) -> Option<std::path::PathBuf> {
-    let parts: Vec<&str> = name.splitn(2, '.').collect();
-    if parts.len() != 2 { return None; }
-    let (action, category) = (parts[0], parts[1]);
-    let exe = std::env::current_exe().ok()?;
-    let root = exe.parent()?.parent()?.parent()?;
-    Some(root.join("skills").join(category).join(format!("{}.{}", action, category)))
-}
-
 fn load_react_meta(skill: &str) -> ReactMeta {
-    skill_manifest_dir(skill)
-        .and_then(|dir| std::fs::read_to_string(dir.join("manifest.toml")).ok())
+    // For now, we'll keep the meta loading simpler but we should ideally 
+    // use a cached version from SkillManager as well.
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
+    if root.ends_with("debug") || root.ends_with("release") {
+        if let Some(p) = root.parent() {
+            if p.ends_with("target") {
+                root = p.parent().unwrap_or(root);
+            }
+        }
+    }
+    
+    let parts: Vec<&str> = skill.splitn(2, '.').collect();
+    if parts.len() != 2 { return ReactMeta::default(); }
+    let (action, category) = (parts[0], parts[1]);
+    let dir = root.join("skills").join(category).join(format!("{}.{}", action, category));
+
+    std::fs::read_to_string(dir.join("manifest.toml")).ok()
         .and_then(|text| toml::from_str::<SkillMeta>(&text).ok())
         .map(|m| m.react)
         .unwrap_or_default()

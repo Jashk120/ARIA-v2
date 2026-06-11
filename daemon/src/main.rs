@@ -138,5 +138,6 @@ async fn main() -> anyhow::Result<()> {
     let db = bootstrap_db()?;
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
-    repl::run(&db, &api_key, runtime_cfg).await
+    let skills = std::sync::Arc::new(crate::skills::SkillManager::new()?);
+    repl::run(&db, &api_key, runtime_cfg, skills).await
 }

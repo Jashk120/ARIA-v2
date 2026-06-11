@@ -1,0 +1,9 @@
+name        = "scrape.web"
+version     = "0.1.0"
+description = "Fetch and extract text content from a URL"
+
+[display]
+action = "Reading {url}"
+
+[capabilities]
+http = true

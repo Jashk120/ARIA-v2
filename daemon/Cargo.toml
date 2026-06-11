@@ -2,6 +2,8 @@
 members = [
     ".",
     "skills/web/search.web",
+    "skills/web/scrape.web",
+
 ]
 
 [package]

@@ -1,0 +1,19 @@
+name        = "search.web"
+version     = "0.1.0"
+description = "Web search via SearXNG or Brave"
+
+[display]
+action = "Searching the web for \"{query}\""
+
+[capabilities]
+http = true
+
+[config.searxng_url]
+default = "http://localhost:8080"
+inject  = true
+secret  = false
+
+[config.brave_api_key]
+default = ""
+inject  = true
+secret  = true

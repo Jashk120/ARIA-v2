@@ -123,9 +123,12 @@ fn extract_text(html: &str, max_chars: usize) -> String {
     // 4. Trim and truncate
     let out = out.trim().to_string();
     if out.len() > max_chars {
-        // truncate at word boundary
-        let truncated = &out[..max_chars];
-        let last_space = truncated.rfind(' ').unwrap_or(max_chars);
+        let mut end = max_chars.min(out.len());
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &out[..end];
+        let last_space = truncated.rfind(' ').unwrap_or(end);
         format!("{}…", &truncated[..last_space])
     } else {
         out

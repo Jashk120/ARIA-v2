@@ -5,13 +5,15 @@ use anyhow::{anyhow, bail};
 use serde_json::Value;
 use std::path::PathBuf;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::db::Db;
 
 // ── Skill path resolution ─────────────────────────────────────────────────────
 
 fn skill_path(name: &str) -> anyhow::Result<PathBuf> {
-    // "search.web" → skills/web/search.web/search.web.wasm
+    // "search.web" → skills/web/search.web/target/wasm32-wasip1/release/search_web.wasm
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     if parts.len() != 2 {
         bail!("Invalid skill name '{}' — expected format: action.category", name);
@@ -25,19 +27,19 @@ fn skill_path(name: &str) -> anyhow::Result<PathBuf> {
         .and_then(|p| p.parent())          // workspace root
         .ok_or_else(|| anyhow!("Could not resolve workspace root"))?;
 
-    Ok(root
-        .join("skills")
-        .join(category)
-        .join(format!("{}.{}", action, category))
-        .join(format!("{}.{}.wasm", action, category)))
+   Ok(root
+    .join("target")
+    .join("wasm32-wasip1")
+    .join("release")
+    .join(format!("{}_{}.wasm", action, category)))
 }
 
 // ── Host state ────────────────────────────────────────────────────────────────
 
 struct HostState {
     http_client: reqwest::blocking::Client,
+    wasi: WasiP1Ctx,
 }
-
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Run a skill with db key injection (for callers that have db access).
@@ -71,48 +73,59 @@ fn enrich_args(skill: &str, args: &mut Value, db: &Db) {
         "search.web" => {
             let brave = db.get_config("brave_api_key").ok().flatten().unwrap_or_default();
             let searxng = db.get_config("searxng_url").ok().flatten()
-                .unwrap_or_else(|| "https://searx.be".to_string());
+                .unwrap_or_else(|| "http://localhost:8080".to_string());
             args["brave_api_key"] = Value::String(brave);
             args["searxng_url"] = Value::String(searxng);
         }
         _ => {}
     }
 }
-
 // ── WASM execution ────────────────────────────────────────────────────────────
 
 fn run_wasm(path: &PathBuf, args_json: &str) -> anyhow::Result<Value> {
     let engine = Engine::default();
     let module = Module::from_file(&engine, path)?;
 
+    let wasi = WasiCtxBuilder::new().build_p1();
     let state = HostState {
         http_client: reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
+        wasi,
     };
     let mut store = Store::new(&engine, state);
     let mut linker: Linker<HostState> = Linker::new(&engine);
 
-    // host_http_get — only network surface available to skills
+    p1::add_to_linker_sync(&mut linker, |s| &mut s.wasi)?;
+        // host_http_get — only network surface available to skills
     linker.func_wrap(
         "aria",
         "host_http_get",
         |mut caller: Caller<'_, HostState>,
-         url_ptr: i32, url_len: i32,
-         headers_ptr: i32, headers_len: i32|
-         -> i32 {
+        url_ptr: i32, url_len: i32,
+        headers_ptr: i32, headers_len: i32|
+        -> i32 {
             let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
                 Ok(s) => s,
-                Err(_) => return 0,
+                Err(e) => { eprintln!("[host_http_get] failed to read url: {}", e); return 0; }
             };
             let headers_json = match read_wasm_str(&mut caller, headers_ptr, headers_len) {
                 Ok(s) => s,
-                Err(_) => return 0,
+                Err(e) => { eprintln!("[host_http_get] failed to read headers: {}", e); return 0; }
             };
+            
+            eprintln!("[host_http_get] GET {}", url);
+            
             let response = do_http_get(&caller.data().http_client, &url, &headers_json);
             match response {
-                Ok(body) => write_wasm_bytes(&mut caller, &body).unwrap_or(0),
-                Err(_)   => 0,
+                Ok(body) => {
+                    eprintln!("[host_http_get] OK {} bytes", body.len());
+                    write_wasm_bytes(&mut caller, &body).unwrap_or(0)
+                }
+                Err(e) => {
+                    eprintln!("[host_http_get] FAILED: {}", e);
+                    0
+                }
             }
         },
     )?;

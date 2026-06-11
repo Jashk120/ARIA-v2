@@ -14,15 +14,21 @@ unsafe extern "C" {
     fn host_http_get(
         url_ptr: *const u8, url_len: usize,
         headers_ptr: *const u8, headers_len: usize,
-    ) -> *mut u8;
-
-    fn host_free(ptr: *mut u8);
+    ) -> u64;
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
-pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> *mut u8 {
+pub extern "C" fn alloc(size: usize) -> *mut u8 {
+    let mut buf = Vec::with_capacity(size);
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
     let input = unsafe {
         let slice = std::slice::from_raw_parts(input_ptr, input_len);
         std::str::from_utf8(slice).unwrap_or("")
@@ -33,7 +39,9 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> *mut u8 {
         Err(e) => json!({ "error": e }).to_string(),
     };
 
-    to_wasm_ptr(output)
+    let len = output.len();
+    let ptr = to_wasm_ptr(output);
+    ((ptr as u64) << 32) | (len as u64)
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -151,24 +159,26 @@ fn search_brave(query: &str, max: u8, api_key: &str) -> Result<Value, String> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn http_get(url: &str, headers_json: &str) -> Result<String, String> {
-    let ptr = unsafe {
+    let packed = unsafe {
         let u = url.as_bytes();
         let h = headers_json.as_bytes();
         host_http_get(u.as_ptr(), u.len(), h.as_ptr(), h.len())
     };
 
-    if ptr.is_null() {
-        return Err("HTTP request failed".to_string());
-    }
-
+    let (ptr, len) = unpack_ptr_len(packed);
     let s = unsafe {
-        let cstr = std::ffi::CStr::from_ptr(ptr as *const i8);
-        let owned = cstr.to_string_lossy().to_string();
-        host_free(ptr);
+        let slice = std::slice::from_raw_parts(ptr as *const u8, len);
+        let owned = String::from_utf8_lossy(slice).to_string();
+        // Since we now use a Guest-Allocated buffer, we should free it locally.
+        let _ = Vec::from_raw_parts(ptr as *mut u8, len, len);
         owned
     };
 
     Ok(s)
+}
+
+fn unpack_ptr_len(packed: u64) -> (usize, usize) {
+    ((packed >> 32) as usize, (packed & 0xFFFFFFFF) as usize)
 }
 
 fn url_encode(s: &str) -> String {

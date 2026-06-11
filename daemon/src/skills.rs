@@ -176,18 +176,14 @@ impl SkillManager {
         let module    = self.get_module(name, &path)?;
         let engine    = self.engine.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            run_wasm_instance(&engine, module, &args_json, &manifest)
-        }).await??;
-
-        Ok(result)
+        run_wasm_instance_async(&engine, module, &args_json, &manifest).await
     }
 }
 
 // ── Host state ────────────────────────────────────────────────────────────────
 
 struct HostState {
-    http_client: reqwest::blocking::Client,
+    http_client: reqwest::Client,
     wasi:        WasiP1Ctx,
 }
 
@@ -223,7 +219,7 @@ const INPUT_BUFFER_OFFSET: usize = 0;
 const MAX_INPUT_SIZE: usize = 128 * 1024; // 128KB limit for args
 const MAX_HTTP_RESPONSE_SIZE: usize = 5 * 1024 * 1024; // 5MB limit
 
-fn run_wasm_instance(
+async fn run_wasm_instance_async(
     engine: &Engine,
     module: Arc<Module>,
     args_json: &str,
@@ -231,7 +227,7 @@ fn run_wasm_instance(
 ) -> anyhow::Result<Value> {
     let wasi  = WasiCtxBuilder::new().build_p1();
     let state = HostState {
-        http_client: reqwest::blocking::Client::builder()
+        http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?,
         wasi,
@@ -240,35 +236,35 @@ fn run_wasm_instance(
     let mut store  = Store::new(engine, state);
     let mut linker: Linker<HostState> = Linker::new(engine);
 
-    p1::add_to_linker_sync(&mut linker, |s| &mut s.wasi)?;
+    p1::add_to_linker_async(&mut linker, |s| &mut s.wasi)?;
 
     // Wire capabilities declared in manifest only
     if manifest.capabilities.http {
-        linker.func_wrap(
+        linker.func_wrap_async(
             "aria",
             "host_http_get",
             |mut caller: Caller<'_, HostState>,
-             url_ptr: i32, url_len: i32,
-             headers_ptr: i32, headers_len: i32|
-             -> i32 {
-                let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
-                    Ok(s) => s,
-                    Err(e) => { eprintln!("[host_http_get] failed to read url: {}", e); return 0; }
-                };
-                let headers_json = match read_wasm_str(&mut caller, headers_ptr, headers_len) {
-                    Ok(s) => s,
-                    Err(e) => { eprintln!("[host_http_get] failed to read headers: {}", e); return 0; }
-                };
+             (url_ptr, url_len, headers_ptr, headers_len): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("[host_http_get] failed to read url: {}", e); return 0; }
+                    };
+                    let headers_json = match read_wasm_str(&mut caller, headers_ptr, headers_len) {
+                        Ok(s) => s,
+                        Err(e) => { eprintln!("[host_http_get] failed to read headers: {}", e); return 0; }
+                    };
 
-                match do_http_get(&caller.data().http_client, &url, &headers_json) {
-                    Ok(body) => {
-                        write_wasm_bytes(&mut caller, &body).unwrap_or(0)
+                    match do_http_get(&caller.data().http_client, &url, &headers_json).await {
+                        Ok(body) => {
+                            write_wasm_bytes(&mut caller, &body).await.unwrap_or(0)
+                        }
+                        Err(e) => {
+                            eprintln!("[host_http_get] FAILED: {}", e);
+                            0
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("[host_http_get] FAILED: {}", e);
-                        0
-                    }
-                }
+                })
             },
         )?;
     }
@@ -277,7 +273,7 @@ fn run_wasm_instance(
         // No-op for now as we use a fixed buffer, but prevents skill crash
     })?;
 
-    let instance = linker.instantiate(&mut store, &module)?;
+    let instance = linker.instantiate_async(&mut store, &module).await?;
     let memory   = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("Skill has no exported memory"))?;
@@ -289,16 +285,22 @@ fn run_wasm_instance(
     }
     memory.write(&mut store, INPUT_BUFFER_OFFSET, args_bytes)?;
 
-    let run_fn     = instance.get_typed_func::<(i32, i32), i32>(&mut store, "run")?;
-    let result_ptr = run_fn.call(&mut store, (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32))?;
+    let run_fn     = instance.get_typed_func::<(i32, i32), i64>(&mut store, "run")?;
+    let packed_result = run_fn.call_async(&mut store, (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32)).await?;
     
-    if result_ptr == 0 {
-        bail!("Skill 'run' returned NULL pointer");
+    if packed_result == 0 {
+        bail!("Skill 'run' returned NULL packed pointer/length");
     }
 
-    let result_str = read_wasm_cstr(&store, &memory, result_ptr as usize)?;
+    let (result_ptr, result_len) = unpack_ptr_len(packed_result);
+    let data = memory.data(&store);
+    let json_bytes = data.get(result_ptr..result_ptr + result_len)
+        .ok_or_else(|| anyhow!("Skill result memory out of bounds (ptr: {}, len: {})", result_ptr, result_len))?;
+    
+    let result_str = std::str::from_utf8(json_bytes)
+        .map_err(|e| anyhow!("Skill returned invalid UTF-8: {}", e))?;
 
-    let result: Value = serde_json::from_str(&result_str)
+    let result: Value = serde_json::from_str(result_str)
         .map_err(|e| anyhow!("Skill returned invalid JSON: {} — raw: {}", e, result_str))?;
 
     if let Some(err) = result["error"].as_str() {
@@ -322,43 +324,40 @@ fn read_wasm_str(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> anyh
     Ok(String::from_utf8_lossy(slice).to_string())
 }
 
-fn read_wasm_cstr(store: &Store<HostState>, memory: &wasmtime::Memory, ptr: usize) -> anyhow::Result<String> {
-    let data  = memory.data(store);
-    let start = data.get(ptr..).ok_or_else(|| anyhow!("Ptr out of bounds"))?;
-    let end   = start.iter().position(|&b| b == 0).unwrap_or(start.len());
-    Ok(String::from_utf8_lossy(&start[..end]).to_string())
+fn unpack_ptr_len(packed: i64) -> (usize, usize) {
+    let ptr = (packed >> 32) as usize;
+    let len = (packed & 0xFFFFFFFF) as usize;
+    (ptr, len)
 }
 
-fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> anyhow::Result<i32> {
-    let memory = caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-        .ok_or_else(|| anyhow!("No memory export found"))?;
-    
-    // 1. Get the current active size of the module's memory footprint
-    let current_memory_size = memory.data_size(&mut *caller);
-    
-    // 2. We use the current boundary as our safe base offset
-    let safe_offset = current_memory_size;
-    let total_payload_size = bytes.len() + 1; // +1 for null terminator
-    
-    // 3. Grow the memory space to encapsulate our new host-injected buffer safely out of bounds
-    let pages_needed = (total_payload_size + 65535) / 65536;
-    memory.grow(&mut *caller, pages_needed as u64)
-        .map_err(|_| anyhow!("Could not grow WASM linear memory space for host response buffer"))?;
+async fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> anyhow::Result<i64> {
+    // 1. Try to call the guest's allocator explicitly if available
+    if let Some(export) = caller.get_export("alloc") {
+        if let Some(func) = export.into_func() {
+            if let Ok(alloc_fn) = func.typed::<i32, i32>(&mut *caller) {
+                let total_len = bytes.len() as i32;
+                let allocated_ptr = alloc_fn.call_async(&mut *caller, total_len).await?;
 
-    // 4. Write data cleanly out of reach of the internal allocator footprint
-    let mut data = bytes.to_vec();
-    data.push(0); // C-string null terminator
-    memory.write(&mut *caller, safe_offset, &data)?;
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .ok_or_else(|| anyhow!("No memory export found"))?;
+
+                memory.write(&mut *caller, allocated_ptr as usize, bytes)?;
+                
+                // Pack pointer and length into i64
+                let packed = ((allocated_ptr as u64) << 32) | (bytes.len() as u64);
+                return Ok(packed as i64);
+            }
+        }
+    }
     
-    Ok(safe_offset as i32)
+    bail!("Skill missing required 'alloc' export for dynamic host-to-guest FFI data passing.");
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
-fn do_http_get(
-    client: &reqwest::blocking::Client,
+async fn do_http_get(
+    client: &reqwest::Client,
     url: &str,
     headers_json: &str,
 ) -> anyhow::Result<Vec<u8>> {
@@ -371,16 +370,15 @@ fn do_http_get(
             }
         }
     }
-    let resp = req.send()?;
+    let resp = req.send().await?;
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
     
-    let mut buffer = Vec::new();
-    use std::io::Read;
-    resp.take(MAX_HTTP_RESPONSE_SIZE as u64).read_to_end(&mut buffer)?;
-    
-    if buffer.len() >= MAX_HTTP_RESPONSE_SIZE {
+    let bytes = resp.bytes().await?;
+    let mut buffer = bytes.to_vec();
+    if buffer.len() > MAX_HTTP_RESPONSE_SIZE {
+        buffer.truncate(MAX_HTTP_RESPONSE_SIZE);
         eprintln!("[do_http_get] Response truncated to 5MB");
     }
     

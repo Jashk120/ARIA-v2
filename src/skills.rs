@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use wasmtime::{Caller, Engine, Linker, Module, Store};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
@@ -15,45 +16,45 @@ use crate::db::Db;
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct SkillManifest {
-    name:         String,
-    version:      String,
-    description:  String,
+#[derive(Deserialize, Debug)]
+pub struct SkillManifest {
+    pub name:         String,
+    pub version:      String,
+    pub description:  String,
     #[serde(default)]
-    display:      DisplayConfig,
+    pub display:      DisplayConfig,
     #[serde(default)]
-    capabilities: Capabilities,
+    pub capabilities: Capabilities,
     #[serde(default)]
-    config:       HashMap<String, ConfigEntry>,
+    pub config:       HashMap<String, ConfigEntry>,
 }
 
-#[derive(Deserialize, Default)]
-struct DisplayConfig {
+#[derive(Deserialize, Default, Debug)]
+pub struct DisplayConfig {
     /// Template string, e.g. "Searching the web for \"{query}\""
     /// {key} is replaced with args[key] at runtime
-    action: Option<String>,
+    pub action: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-struct Capabilities {
+#[derive(Deserialize, Default, Debug)]
+pub struct Capabilities {
     #[serde(default)]
-    http: bool,
+    pub http: bool,
 }
 
-#[derive(Deserialize)]
-struct ConfigEntry {
+#[derive(Deserialize, Debug)]
+pub struct ConfigEntry {
     #[serde(default)]
-    default: String,
+    pub default: String,
     /// If true, host injects this key from db into skill args
     #[serde(default)]
-    inject: bool,
+    pub inject: bool,
     /// If true, never log this value
     #[serde(default)]
-    secret: bool,
+    pub secret: bool,
 }
 
-fn load_manifest(skill_dir: &PathBuf) -> anyhow::Result<SkillManifest> {
+fn load_manifest(skill_dir: &Path) -> anyhow::Result<SkillManifest> {
     let path = skill_dir.join("manifest.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("Missing manifest.toml at {}", path.display()))?;
@@ -62,19 +63,37 @@ fn load_manifest(skill_dir: &PathBuf) -> anyhow::Result<SkillManifest> {
 
 // ── Path resolution ───────────────────────────────────────────────────────────
 
+/// Resolve the root directory of the daemon crate.
+fn get_daemon_root() -> anyhow::Result<PathBuf> {
+    if let Ok(val) = std::env::var("ARIA_DAEMON_ROOT") {
+        return Ok(PathBuf::from(val));
+    }
+    let exe = std::env::current_exe()?;
+    let mut curr = exe.as_path();
+    
+    // Climb up from target/debug/aria or similar to find daemon/
+    while let Some(parent) = curr.parent() {
+        if parent.join("Cargo.toml").exists() && parent.join("src").exists() {
+            return Ok(parent.to_path_buf());
+        }
+        curr = parent;
+        if curr.as_os_str().is_empty() || curr.parent().is_none() { break; }
+    }
+    
+    // Fallback: one level up from wherever we are
+    exe.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| anyhow!("Could not resolve daemon root. Set ARIA_DAEMON_ROOT."))
+}
+
 fn skill_dir(name: &str) -> anyhow::Result<PathBuf> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     if parts.len() != 2 {
         bail!("Invalid skill name '{}' — expected format: action.category", name);
     }
     let (action, category) = (parts[0], parts[1]);
-
-    let exe = std::env::current_exe()?;
-    let root = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow!("Could not resolve workspace root"))?;
+    let root = get_daemon_root()?;
 
     Ok(root
         .join("skills")
@@ -84,20 +103,85 @@ fn skill_dir(name: &str) -> anyhow::Result<PathBuf> {
 
 fn wasm_path(name: &str) -> anyhow::Result<PathBuf> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        bail!("Invalid skill name '{}' — expected format: action.category", name);
+    }
     let (action, category) = (parts[0], parts[1]);
-
-    let exe = std::env::current_exe()?;
-    let root = exe
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow!("Could not resolve workspace root"))?;
+    let root = get_daemon_root()?;
 
     Ok(root
         .join("target")
         .join("wasm32-wasip1")
         .join("release")
         .join(format!("{}_{}.wasm", action, category)))
+}
+
+// ── Skill Manager ─────────────────────────────────────────────────────────────
+
+pub struct SkillManager {
+    engine:  Engine,
+    modules: RwLock<HashMap<String, Arc<Module>>>,
+}
+
+impl SkillManager {
+    pub fn new() -> anyhow::Result<Self> {
+        let mut config = wasmtime::Config::new();
+        let engine = Engine::new(&config)?;
+        Ok(Self {
+            engine,
+            modules: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn get_module(&self, name: &str, path: &Path) -> anyhow::Result<Arc<Module>> {
+        {
+            let modules = self.modules.read().map_err(|_| anyhow!("Lock poisoned"))?;
+            if let Some(m) = modules.get(name) {
+                return Ok(Arc::clone(m));
+            }
+        }
+
+        let module = Module::from_file(&self.engine, path)?;
+        let module = Arc::new(module);
+        
+        let mut modules = self.modules.write().map_err(|_| anyhow!("Lock poisoned"))?;
+        modules.insert(name.to_string(), Arc::clone(&module));
+        Ok(module)
+    }
+
+    /// Run a skill with db key injection.
+    pub async fn run_skill(&self, name: &str, args: &Value, db: &Db) -> anyhow::Result<Value> {
+        let mut args = args.clone();
+        enrich_args(name, &mut args, db)?;
+        self.run_skill_raw(name, &args).await
+    }
+
+    /// Run a skill with pre-enriched args.
+    pub async fn run_skill_raw(&self, name: &str, args: &Value) -> anyhow::Result<Value> {
+        let path = wasm_path(name)?;
+
+        if !path.exists() {
+            bail!(
+                "Skill '{}' not found at {}.\nBuild it with: cargo build -p {}_{} --target wasm32-wasip1 --release",
+                name,
+                path.display(),
+                name.split('.').next().unwrap_or(name),
+                name.split('.').last().unwrap_or(name),
+            );
+        }
+
+        let dir      = skill_dir(name)?;
+        let manifest = load_manifest(&dir)?;
+        let args_json = args.to_string();
+        let module    = self.get_module(name, &path)?;
+        let engine    = self.engine.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            run_wasm_instance(&engine, module, &args_json, &manifest)
+        }).await??;
+
+        Ok(result)
+    }
 }
 
 // ── Host state ────────────────────────────────────────────────────────────────
@@ -107,44 +191,13 @@ struct HostState {
     wasi:        WasiP1Ctx,
 }
 
-// ── Public entry points ───────────────────────────────────────────────────────
-
-/// Run a skill with db key injection.
-pub async fn run_skill(name: &str, args: &Value, db: &Db) -> anyhow::Result<Value> {
-    let mut args = args.clone();
-    enrich_args(name, &mut args, db)?;
-    run_skill_raw(name, &args).await
-}
-
-/// Run a skill with pre-enriched args — no db access needed.
-pub async fn run_skill_raw(name: &str, args: &Value) -> anyhow::Result<Value> {
-    let path = wasm_path(name)?;
-
-    if !path.exists() {
-        bail!(
-            "Skill '{}' not found at {}.\nBuild it with: cargo build -p {}_{} --target wasm32-wasip1 --release",
-            name,
-            path.display(),
-            name.split('.').next().unwrap_or(name),
-            name.split('.').last().unwrap_or(name),
-        );
-    }
-
-    let dir      = skill_dir(name)?;
-    let manifest = load_manifest(&dir)?;
-    let args_json = args.to_string();
-
-    let result = tokio::task::spawn_blocking(move || {
-        run_wasm(&path, &args_json, &manifest)
-    }).await??;
-
-    Ok(result)
-}
-
 /// Inject config keys into skill args based on manifest.
 fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
     let dir      = skill_dir(skill)?;
     let manifest = load_manifest(&dir)?;
+
+    let obj = args.as_object_mut()
+        .ok_or_else(|| anyhow!("Args must be a JSON object to enrich keys"))?;
 
     for (key, entry) in &manifest.config {
         if !entry.inject {
@@ -155,10 +208,7 @@ fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
             .flatten()
             .unwrap_or_else(|| entry.default.clone());
 
-        if !entry.secret {
-            // only log non-secret injections
-        }
-        args[key] = Value::String(value);
+        obj.insert(key.clone(), Value::String(value));
     }
 
     Ok(())
@@ -166,10 +216,19 @@ fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
 
 // ── WASM execution ────────────────────────────────────────────────────────────
 
-fn run_wasm(path: &PathBuf, args_json: &str, manifest: &SkillManifest) -> anyhow::Result<Value> {
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, path)?;
+/// Memory layout convention:
+/// Offset 0: Input JSON (args)
+/// Host functions (HTTP etc) append their responses to the end of linear memory at runtime.
+const INPUT_BUFFER_OFFSET: usize = 0;
+const MAX_INPUT_SIZE: usize = 128 * 1024; // 128KB limit for args
+const MAX_HTTP_RESPONSE_SIZE: usize = 5 * 1024 * 1024; // 5MB limit
 
+fn run_wasm_instance(
+    engine: &Engine,
+    module: Arc<Module>,
+    args_json: &str,
+    manifest: &SkillManifest
+) -> anyhow::Result<Value> {
     let wasi  = WasiCtxBuilder::new().build_p1();
     let state = HostState {
         http_client: reqwest::blocking::Client::builder()
@@ -178,8 +237,8 @@ fn run_wasm(path: &PathBuf, args_json: &str, manifest: &SkillManifest) -> anyhow
         wasi,
     };
 
-    let mut store  = Store::new(&engine, state);
-    let mut linker: Linker<HostState> = Linker::new(&engine);
+    let mut store  = Store::new(engine, state);
+    let mut linker: Linker<HostState> = Linker::new(engine);
 
     p1::add_to_linker_sync(&mut linker, |s| &mut s.wasi)?;
 
@@ -201,11 +260,8 @@ fn run_wasm(path: &PathBuf, args_json: &str, manifest: &SkillManifest) -> anyhow
                     Err(e) => { eprintln!("[host_http_get] failed to read headers: {}", e); return 0; }
                 };
 
-                eprintln!("[host_http_get] GET {}", url);
-
                 match do_http_get(&caller.data().http_client, &url, &headers_json) {
                     Ok(body) => {
-                        eprintln!("[host_http_get] OK {} bytes", body.len());
                         write_wasm_bytes(&mut caller, &body).unwrap_or(0)
                     }
                     Err(e) => {
@@ -217,19 +273,29 @@ fn run_wasm(path: &PathBuf, args_json: &str, manifest: &SkillManifest) -> anyhow
         )?;
     }
 
-    // host_free always wired — skills call it unconditionally
-    linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {})?;
+    linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {
+        // No-op for now as we use a fixed buffer, but prevents skill crash
+    })?;
 
     let instance = linker.instantiate(&mut store, &module)?;
     let memory   = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("Skill has no exported memory"))?;
 
+    // Write input args
     let args_bytes = args_json.as_bytes();
-    memory.write(&mut store, 0, args_bytes)?;
+    if args_bytes.len() > MAX_INPUT_SIZE {
+        bail!("Input arguments too large (max 128KB)");
+    }
+    memory.write(&mut store, INPUT_BUFFER_OFFSET, args_bytes)?;
 
     let run_fn     = instance.get_typed_func::<(i32, i32), i32>(&mut store, "run")?;
-    let result_ptr = run_fn.call(&mut store, (0, args_bytes.len() as i32))?;
+    let result_ptr = run_fn.call(&mut store, (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32))?;
+    
+    if result_ptr == 0 {
+        bail!("Skill 'run' returned NULL pointer");
+    }
+
     let result_str = read_wasm_cstr(&store, &memory, result_ptr as usize)?;
 
     let result: Value = serde_json::from_str(&result_str)
@@ -267,10 +333,26 @@ fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> anyhow:
     let memory = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
-        .ok_or_else(|| anyhow!("No memory export"))?;
-    let offset = 65536usize;
-    memory.write(caller, offset, bytes)?;
-    Ok(offset as i32)
+        .ok_or_else(|| anyhow!("No memory export found"))?;
+    
+    // 1. Get the current active size of the module's memory footprint
+    let current_memory_size = memory.data_size(&mut *caller);
+    
+    // 2. We use the current boundary as our safe base offset
+    let safe_offset = current_memory_size;
+    let total_payload_size = bytes.len() + 1; // +1 for null terminator
+    
+    // 3. Grow the memory space to encapsulate our new host-injected buffer safely out of bounds
+    let pages_needed = (total_payload_size + 65535) / 65536;
+    memory.grow(&mut *caller, pages_needed as u64)
+        .map_err(|_| anyhow!("Could not grow WASM linear memory space for host response buffer"))?;
+
+    // 4. Write data cleanly out of reach of the internal allocator footprint
+    let mut data = bytes.to_vec();
+    data.push(0); // C-string null terminator
+    memory.write(&mut *caller, safe_offset, &data)?;
+    
+    Ok(safe_offset as i32)
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -293,14 +375,22 @@ fn do_http_get(
     if !resp.status().is_success() {
         bail!("HTTP {} for {}", resp.status(), url);
     }
-    Ok(resp.bytes()?.to_vec())
+    
+    let mut buffer = Vec::new();
+    use std::io::Read;
+    resp.take(MAX_HTTP_RESPONSE_SIZE as u64).read_to_end(&mut buffer)?;
+    
+    if buffer.len() >= MAX_HTTP_RESPONSE_SIZE {
+        eprintln!("[do_http_get] Response truncated to 5MB");
+    }
+    
+    Ok(buffer)
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
 pub fn describe_action(skill: &str, args: &Value) -> String {
-    // Load from manifest, fall back to generic
-    if let Ok(dir)      = skill_dir(skill) {
+    if let Ok(dir) = skill_dir(skill) {
         if let Ok(manifest) = load_manifest(&dir) {
             if let Some(template) = manifest.display.action {
                 return render_template(&template, args);
@@ -310,14 +400,18 @@ pub fn describe_action(skill: &str, args: &Value) -> String {
     format!("Running skill: {}", skill)
 }
 
-/// Replace {key} placeholders in template with values from args
 fn render_template(template: &str, args: &Value) -> String {
     let mut result = template.to_string();
     if let Some(obj) = args.as_object() {
         for (k, v) in obj {
             let placeholder = format!("{{{}}}", k);
-            let value = v.as_str().unwrap_or("...");
-            result = result.replace(&placeholder, value);
+            let value = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b)   => b.to_string(),
+                _ => "...".to_string(),
+            };
+            result = result.replace(&placeholder, &value);
         }
     }
     result

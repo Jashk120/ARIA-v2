@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 use serde_json::json;
 use tokio::sync::mpsc;
-
+use futures_util::StreamExt;
 use crate::config::{CONFIG, RuntimeConfig};
 use crate::db::Db;
 
@@ -49,9 +49,18 @@ fn prompt_matches_triggers(prompt: &str, triggers: &[String]) -> bool {
 
 fn system_prompt(user_prompt: &str) -> String {
     let skills = build_skills_prompt(user_prompt);
-    format!(r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
+    format!(
+r#"You are ARIA, a personal assistant and governed agent runtime.
 
-You decide whether a user message needs tool use or is just a conversation.
+== PERSONALITY ==
+- Answer in the fewest words that fully address the question
+- Never use headers, bullet points, or markdown unless explicitly asked
+- Never open with filler ("Sure!", "Of course!", "Great question!")
+- If context is missing, ask ONE short question — not multiple
+- Never apologize or reverse a correct answer unless the user explains why you are wrong
+- If challenged without a reason, ask why — do not cave
+- Never narrate your reasoning in chat responses — save that for thought steps
+- Always confirm before destructive or irreversible actions
 
 == WHEN TO USE TOOLS ==
 Use tools ONLY when the user explicitly wants to interact with files, data, or the system.
@@ -283,12 +292,10 @@ pub async fn run(
                 AgentEvent::Observation(o) => println!("📋  {}", o),
                 AgentEvent::Ask(q) => { println!(); println!("◂ Aria: {}", q); }
                 AgentEvent::Final(f) => {
-                    println!(); println!("◂ Aria: {}", f);
                     db.save_message(AGENT_DID, "received", &f).ok();
                     llm_history.push(json!({ "role": "assistant", "content": f }));
                 }
                 AgentEvent::Chat(c) => {
-                    println!(); println!("◂ Aria: {}", c);
                     db.save_message(AGENT_DID, "received", &c).ok();
                     llm_history.push(json!({ "role": "assistant", "content": c }));
                 }
@@ -449,7 +456,8 @@ fn parse_single(line: &str) -> Option<AgentResponseKind> {
 }
 
 fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
-    raw.lines()
+    raw.replace("}{", "}\n{")
+        .lines()
         .filter_map(|line| parse_single(line.trim()))
         .collect()
 }
@@ -470,6 +478,7 @@ async fn call_llm(api_key: &str, sys_prompt: &str, history: &[serde_json::Value]
     let body = json!({
         "model": CONFIG.default_model,
         "messages": messages,
+        "stream": true
     });
 
     let resp = client
@@ -486,11 +495,33 @@ async fn call_llm(api_key: &str, sys_prompt: &str, history: &[serde_json::Value]
         anyhow::bail!("OpenRouter error {}: {}", status, text);
     }
 
-    let json: serde_json::Value = resp.json().await?;
-    let content = json["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("No content in response"))?
-        .to_string();
+    let mut stream = resp.bytes_stream();
+    let mut full_content = String::new();
+    let mut buffer = String::new();
+    print!("\n◂ Aria: ");
+    io::stdout().flush().ok();
 
-    Ok(content)
+    while let Some(chunk) = stream.next().await {
+    let chunk = chunk?;
+    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(newline_pos) = buffer.find('\n') {
+            let line = buffer[..newline_pos].trim().to_string();
+            buffer = buffer[newline_pos + 1..].to_string();
+
+            if line.is_empty() || line == "data: [DONE]" { continue; }
+
+            let json_str = line.strip_prefix("data: ").unwrap_or(&line);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
+                    print!("{}", token);
+                    io::stdout().flush().ok();
+                    full_content.push_str(token);
+                }
+            }
+        }
+    }
+
+    println!();
+    Ok(full_content)
 }

@@ -319,7 +319,7 @@ fn read_wasm_str(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> anyh
         .ok_or_else(|| anyhow!("No memory export"))?;
     let data  = memory.data(caller);
     let slice = data
-        .get(ptr as usize..(ptr + len) as usize)
+        .get(ptr as usize..(ptr + len) as usize) 
         .ok_or_else(|| anyhow!("Memory read out of bounds"))?;
     Ok(String::from_utf8_lossy(slice).to_string())
 }

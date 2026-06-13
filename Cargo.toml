@@ -16,6 +16,7 @@ name = "aria"
 path = "src/main.rs"
 
 [dependencies]
+futures-util = { version = "0.3", features = ["io"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -41,7 +42,7 @@ dirs = "5"
 notify = "6"
 
 # HTTP client (for LLM API calls from host functions)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.x", features = ["json", "stream"] }
 
 # Cron scheduler
 tokio-cron-scheduler = "0.10"

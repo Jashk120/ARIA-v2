@@ -15,6 +15,8 @@ struct SkillMeta {
     name:        String,
     description: String,
     #[serde(default)]
+    triggers:    Vec<String>,
+    #[serde(default)]
     call:        CallMeta,
     #[serde(default)]
     react:       ReactMeta,
@@ -22,25 +24,31 @@ struct SkillMeta {
 
 #[derive(serde::Deserialize, Default)]
 struct CallMeta {
-    /// JSON shape the LLM should pass as args — shown verbatim in prompt
     args_schema:   Option<String>,
-    /// JSON shape the skill returns — so LLM can reason about observations
     output_schema: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
 struct ReactMeta {
-    /// Max times this skill may fire in one turn (default: unlimited within MAX_REACT_STEPS)
     max_steps: Option<usize>,
-    /// If true, skill output is the final answer — skip LLM synthesis pass
     #[serde(default)]
     terminal:  bool,
 }
 
+// ── Trigger matching ──────────────────────────────────────────────────────────
+
+fn prompt_matches_triggers(prompt: &str, triggers: &[String]) -> bool {
+    if triggers.is_empty() {
+        return true;
+    }
+    let lower = prompt.to_lowercase();
+    triggers.iter().any(|t| lower.contains(&t.to_lowercase()))
+}
+
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-fn system_prompt() -> String {
-    let skills = build_skills_prompt();
+fn system_prompt(user_prompt: &str) -> String {
+    let skills = build_skills_prompt(user_prompt);
     format!(r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
 
 You decide whether a user message needs tool use or is just a conversation.
@@ -81,29 +89,22 @@ For normal conversation (no tools needed):
 
 // ── Skills prompt builder ─────────────────────────────────────────────────────
 
-fn build_skills_prompt() -> String {
-    let mut blocks: Vec<String> = Vec::new();
-
-    // Use skills module to find directories more reliably
-    let root = match crate::skills::describe_action("ping.test", &json!({})).as_str() {
-        _ => {
-             // We can't easily call skill_dir here without exposing it or duplicating
-             // For prompt building, we'll keep a simpler version but more consistent 
-             // with what skills.rs does.
-             let exe = std::env::current_exe().unwrap_or_default();
-             let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
-             if root.ends_with("debug") || root.ends_with("release") {
-                if let Some(p) = root.parent() {
-                    if p.ends_with("target") {
-                        root = p.parent().unwrap_or(root);
-                    }
-                }
-             }
-             root.to_path_buf()
+fn skill_dir_root() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
+    if root.ends_with("debug") || root.ends_with("release") {
+        if let Some(p) = root.parent() {
+            if p.ends_with("target") {
+                root = p.parent().unwrap_or(root);
+            }
         }
-    };
-    let skills_dir = root.join("skills");
+    }
+    root.join("skills")
+}
 
+fn load_all_skills() -> Vec<SkillMeta> {
+    let mut skills = Vec::new();
+    let skills_dir = skill_dir_root();
     if let Ok(categories) = std::fs::read_dir(&skills_dir) {
         for cat in categories.flatten() {
             if !cat.path().is_dir() { continue; }
@@ -112,19 +113,28 @@ fn build_skills_prompt() -> String {
                     let manifest_path = entry.path().join("manifest.toml");
                     if let Ok(text) = std::fs::read_to_string(&manifest_path) {
                         if let Ok(m) = toml::from_str::<SkillMeta>(&text) {
-                            blocks.push(format_skill_block(&m));
+                            skills.push(m);
                         }
                     }
                 }
             }
         }
     }
+    skills
+}
 
-    if blocks.is_empty() {
-        return "== AVAILABLE SKILLS ==\n(no skills found — build WASM binaries first)".to_string();
-    }
+fn build_skills_prompt(user_prompt: &str) -> String {
+    let all_skills = load_all_skills();
 
-    format!("== AVAILABLE SKILLS ==\n{}", blocks.join("\n\n"))
+    let lines: Vec<String> = all_skills.iter().map(|m| {
+        if prompt_matches_triggers(user_prompt, &m.triggers) {
+            format_skill_block(m)
+        } else {
+            format!("- {}: {}", m.name, m.description)
+        }
+    }).collect();
+
+    format!("== AVAILABLE SKILLS ==\n{}", lines.join("\n\n"))
 }
 
 fn format_skill_block(m: &SkillMeta) -> String {
@@ -254,10 +264,11 @@ pub async fn run(
         let history_snap = llm_history.clone();
         let s_url = searxng_url.clone();
         let b_key = brave_api_key.clone();
+        let user_prompt = cmd.clone();
 
         let sm = std::sync::Arc::clone(&skills);
         let handle = tokio::spawn(async move {
-            run_react_loop(key, history_snap, s_url, b_key, sm, tx).await;
+            run_react_loop(key, history_snap, s_url, b_key, sm, tx, user_prompt).await;
         });
 
         while let Some(event) = rx.recv().await {
@@ -301,9 +312,9 @@ async fn run_react_loop(
     brave_api_key: Option<String>,
     skills: std::sync::Arc<crate::skills::SkillManager>,
     tx: mpsc::Sender<AgentEvent>,
+    user_prompt: String,
 ) {
-    let sys_prompt = system_prompt();
-    // Per-skill fire counts for manifest.react.max_steps enforcement
+    let sys_prompt = system_prompt(&user_prompt);
     let mut skill_fire_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for _ in 0..MAX_REACT_STEPS {
@@ -337,7 +348,6 @@ async fn run_react_loop(
                     let _ = tx.send(AgentEvent::Thought(thought)).await;
                 }
                 AgentResponseKind::Action { skill, args } => {
-                    // Enforce per-skill max_steps from manifest
                     let react_meta = load_react_meta(&skill);
                     if let Some(max) = react_meta.max_steps {
                         let count = skill_fire_counts.entry(skill.clone()).or_insert(0);
@@ -354,7 +364,6 @@ async fn run_react_loop(
 
                     let _ = tx.send(AgentEvent::Action { skill: skill.clone(), args: args.clone() }).await;
 
-                    // Inject runtime config — bypass db-based enrich_args
                     let mut enriched = args.clone();
                     if let Some(obj) = enriched.as_object_mut() {
                         obj.insert("searxng_url".to_string(), json!(searxng_url));
@@ -369,13 +378,11 @@ async fn run_react_loop(
                     };
                     let _ = tx.send(AgentEvent::Observation(observation.clone())).await;
 
-                    // If terminal, emit the observation directly as Final — skip LLM synthesis
                     if react_meta.terminal && !is_error {
                         let _ = tx.send(AgentEvent::Final(observation)).await;
                         should_continue = false;
                         break;
                     }
-
 
                     history.push(json!({ "role": "assistant", "content": raw }));
                     let label = if is_error { "Error from" } else { "Observation from" };
@@ -406,22 +413,10 @@ async fn run_react_loop(
 }
 
 fn load_react_meta(skill: &str) -> ReactMeta {
-    // For now, we'll keep the meta loading simpler but we should ideally 
-    // use a cached version from SkillManager as well.
-    let exe = std::env::current_exe().unwrap_or_default();
-    let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
-    if root.ends_with("debug") || root.ends_with("release") {
-        if let Some(p) = root.parent() {
-            if p.ends_with("target") {
-                root = p.parent().unwrap_or(root);
-            }
-        }
-    }
-    
     let parts: Vec<&str> = skill.splitn(2, '.').collect();
     if parts.len() != 2 { return ReactMeta::default(); }
     let (action, category) = (parts[0], parts[1]);
-    let dir = root.join("skills").join(category).join(format!("{}.{}", action, category));
+    let dir = skill_dir_root().join(category).join(format!("{}.{}", action, category));
 
     std::fs::read_to_string(dir.join("manifest.toml")).ok()
         .and_then(|text| toml::from_str::<SkillMeta>(&text).ok())

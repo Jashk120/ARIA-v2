@@ -5,7 +5,7 @@ pub struct AppConfig {
 
 pub const CONFIG: AppConfig = AppConfig {
     openrouter_url: "https://openrouter.ai/api/v1/chat/completions",
-    default_model: "google/gemma-4-31b-it:free",
+    default_model: "google/gemma-4-26b-a4b-it:free",
 };
 
 /// Loaded once at startup from db, lives in memory for the process lifetime.

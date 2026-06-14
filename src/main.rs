@@ -9,6 +9,7 @@ mod db;
 mod config;
 mod repl;
 mod skills;
+mod agent;
 
 use crate::db::Db;
 use crate::config::RuntimeConfig;

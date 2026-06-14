@@ -1,0 +1,18 @@
+name        = "read.fs"
+version     = "0.1.0"
+description = "Read the contents of a text file from the local filesystem"
+
+triggers = ["read my file", "open this file", "read the file", "show me the contents of", "what's in this file", "read my notes", "cat "]
+
+[display]
+action = "Reading {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","max_chars":4000}'
+output_schema = '{"path":"string","text":"string","chars":"number","truncated":"bool"}'
+
+[react]
+max_steps = 3

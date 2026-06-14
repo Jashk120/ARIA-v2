@@ -1,200 +1,12 @@
 use std::io::{self, BufRead, Write};
 use serde_json::json;
 use tokio::sync::mpsc;
-use futures_util::StreamExt;
-use crate::config::{CONFIG, RuntimeConfig};
+
+use crate::config::RuntimeConfig;
 use crate::db::Db;
+use crate::agent::react_loop::{run_react_loop, AgentEvent};
 
 const AGENT_DID: &str = "did:aria:jayesh";
-const MAX_REACT_STEPS: usize = 8;
-
-// ── Manifest meta (for prompt building only) ──────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct SkillMeta {
-    name:        String,
-    description: String,
-    #[serde(default)]
-    triggers:    Vec<String>,
-    #[serde(default)]
-    call:        CallMeta,
-    #[serde(default)]
-    react:       ReactMeta,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct CallMeta {
-    args_schema:   Option<String>,
-    output_schema: Option<String>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct ReactMeta {
-    max_steps: Option<usize>,
-    #[serde(default)]
-    terminal:  bool,
-}
-
-// ── Trigger matching ──────────────────────────────────────────────────────────
-
-fn prompt_matches_triggers(prompt: &str, triggers: &[String]) -> bool {
-    if triggers.is_empty() {
-        return true;
-    }
-    let lower = prompt.to_lowercase();
-    triggers.iter().any(|t| lower.contains(&t.to_lowercase()))
-}
-
-// ── System prompt ─────────────────────────────────────────────────────────────
-
-fn system_prompt(user_prompt: &str) -> String {
-    let skills = build_skills_prompt(user_prompt);
-    format!(
-r#"You are ARIA, a personal assistant and governed agent runtime.
-
-== PERSONALITY ==
-- Answer in the fewest words that fully address the question
-- Never use headers, bullet points, or markdown unless explicitly asked
-- Never open with filler ("Sure!", "Of course!", "Great question!")
-- If context is missing, ask ONE short question — not multiple
-- Never apologize or reverse a correct answer unless the user explains why you are wrong
-- If challenged without a reason, ask why — do not cave
-- Never narrate your reasoning in chat responses — save that for thought steps
-- Always confirm before destructive or irreversible actions
-
-== WHEN TO USE TOOLS ==
-Use tools ONLY when the user explicitly wants to interact with files, data, or the system.
-- "search for X", "find info on Y", "look up Z" → use search.web skill
-- "read my resume", "find files", "rate this document" → use file skills
-- "hi", "how are you", "explain X", "what is Y" → just reply normally, NO tools
-
-== TOOL USE FORMAT ==
-When you need tools, respond ONLY with a JSON object on a single line. No other text.
-
-To think before acting:
-{{"type":"thought","content":"your reasoning here"}}
-
-To call a skill (use the exact args schema shown per skill below):
-{{"type":"action","skill":"skill_name","args":{{...}}}}
-
-To ask the user for confirmation or clarification:
-{{"type":"ask","content":"your question here"}}
-
-To give the final answer after all tool steps:
-{{"type":"final","content":"your response here"}}
-
-For normal conversation (no tools needed):
-{{"type":"chat","content":"your response here"}}
-
-{}
-
-== RULES ==
-- Always emit a thought before every action
-- Use the exact args schema defined per skill — do not invent keys
-- After receiving an observation, either act again or emit final
-- Keep thoughts short and practical
-- Final answers should be friendly and summarize what was done"#, skills)
-}
-
-// ── Skills prompt builder ─────────────────────────────────────────────────────
-
-fn skill_dir_root() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let mut root = exe.parent().unwrap_or(std::path::Path::new("."));
-    if root.ends_with("debug") || root.ends_with("release") {
-        if let Some(p) = root.parent() {
-            if p.ends_with("target") {
-                root = p.parent().unwrap_or(root);
-            }
-        }
-    }
-    root.join("skills")
-}
-
-fn load_all_skills() -> Vec<SkillMeta> {
-    let mut skills = Vec::new();
-    let skills_dir = skill_dir_root();
-    if let Ok(categories) = std::fs::read_dir(&skills_dir) {
-        for cat in categories.flatten() {
-            if !cat.path().is_dir() { continue; }
-            if let Ok(entries) = std::fs::read_dir(cat.path()) {
-                for entry in entries.flatten() {
-                    let manifest_path = entry.path().join("manifest.toml");
-                    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-                        if let Ok(m) = toml::from_str::<SkillMeta>(&text) {
-                            skills.push(m);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    skills
-}
-
-fn build_skills_prompt(user_prompt: &str) -> String {
-    let all_skills = load_all_skills();
-
-    let lines: Vec<String> = all_skills.iter().map(|m| {
-        if prompt_matches_triggers(user_prompt, &m.triggers) {
-            format_skill_block(m)
-        } else {
-            format!("- {}: {}", m.name, m.description)
-        }
-    }).collect();
-
-    format!("== AVAILABLE SKILLS ==\n{}", lines.join("\n\n"))
-}
-
-fn format_skill_block(m: &SkillMeta) -> String {
-    let args_example = m.call.args_schema.as_deref()
-        .unwrap_or(r#"{"key":"value"}"#);
-    let call_line = format!(
-        r#"  call:   {{"type":"action","skill":"{}","args":{}}}"#,
-        m.name, args_example
-    );
-
-    let mut lines = vec![
-        format!("- {}: {}", m.name, m.description),
-        call_line,
-    ];
-
-    if let Some(out) = &m.call.output_schema {
-        lines.push(format!("  output: {}", out));
-    }
-
-    if m.react.terminal {
-        lines.push("  note:   result is returned directly as the final answer".to_string());
-    }
-    if let Some(n) = m.react.max_steps {
-        lines.push(format!("  note:   may fire at most {} time(s) per turn", n));
-    }
-
-    lines.join("\n")
-}
-
-// ── Agent event / response types ──────────────────────────────────────────────
-
-enum AgentEvent {
-    Thought(String),
-    Action { skill: String, args: serde_json::Value },
-    Observation(String),
-    Ask(String),
-    Final(String),
-    Chat(String),
-    Error(String),
-    Done,
-}
-
-enum AgentResponseKind {
-    Chat(String),
-    Thought(String),
-    Action { skill: String, args: serde_json::Value },
-    Ask(String),
-    Final(String),
-}
-
-// ── REPL entry point ──────────────────────────────────────────────────────────
 
 pub async fn run(
     db: &Db,
@@ -234,15 +46,15 @@ pub async fn run(
 
         let mut cmd = String::new();
         match stdin.lock().read_line(&mut cmd) {
-            Ok(0) => break,
+            Ok(0) => break Ok(()),
             Ok(_) => {}
-            Err(e) => { eprintln!("Input error: {}", e); break; }
+            Err(e) => { eprintln!("Input error: {}", e); break Ok(()); }
         }
         let cmd = cmd.trim().to_string();
         if cmd.is_empty() { continue; }
 
         match cmd.as_str() {
-            "/quit" | "/exit" | "/q" => break,
+            "/quit" | "/exit" | "/q" => break Ok(()),
             "/help" | "/h" => {
                 println!("  /help    — show this message");
                 println!("  /quit    — exit ARIA");
@@ -268,7 +80,8 @@ pub async fn run(
         db.save_message(AGENT_DID, "sent", &cmd).ok();
         llm_history.push(json!({ "role": "user", "content": cmd.clone() }));
 
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
+        // Large channel — JSON responses can be 50-100 tokens; 32 caused deadlock.
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
         let key = api_key.clone();
         let history_snap = llm_history.clone();
         let s_url = searxng_url.clone();
@@ -280,24 +93,95 @@ pub async fn run(
             run_react_loop(key, history_snap, s_url, b_key, sm, tx, user_prompt).await;
         });
 
+        let mut token_buf = String::new();
+        let mut prefix_printed = false;
+        // None = undecided, Some(true) = JSON, Some(false) = chat
+        let mut response_kind: Option<bool> = None;
+
         while let Some(event) = rx.recv().await {
             match event {
-                AgentEvent::Done => break,
-                AgentEvent::Error(e) => eprintln!("✗ error:  {}", e),
-                AgentEvent::Thought(t) => println!("💭  {}", t),
-                AgentEvent::Action { skill, args } => {
-                    let readable = crate::skills::describe_action(&skill, &args);
-                    println!("⚡  {}", readable);
+                AgentEvent::Token(t) => {
+                    token_buf.push_str(&t);
+
+                    // Wait for 8 chars before deciding — first token may be just `{`
+                    if response_kind.is_none() && token_buf.len() >= 8 {
+                        let is_json = token_buf.trim_start().starts_with('{');
+                        response_kind = Some(is_json);
+                        if !is_json {
+                            // Flush buffered chars now that we know it's chat
+                            println!();
+                            print!("◂ Aria: {}", token_buf);
+                            io::stdout().flush().ok();
+                            prefix_printed = true;
+                        }
+                    } else if response_kind == Some(false) {
+                        // Chat confirmed — stream token live
+                        print!("{}", t);
+                        io::stdout().flush().ok();
+                    }
+                    // response_kind == Some(true): JSON — stay silent, let structured events handle output
                 }
-                AgentEvent::Observation(o) => println!("📋  {}", o),
-                AgentEvent::Ask(q) => { println!(); println!("◂ Aria: {}", q); }
+
+                AgentEvent::Chat(content) => {
+                    if !prefix_printed {
+                        println!();
+                        println!("◂ Aria: {}", content);
+                    } else {
+                        println!();
+                    }
+                    token_buf.clear();
+                    db.save_message(AGENT_DID, "received", &content).ok();
+                    llm_history.push(json!({ "role": "assistant", "content": content }));
+                }
+
                 AgentEvent::Final(f) => {
+                    if !prefix_printed {
+                        println!();
+                        println!("◂ Aria: {}", f);
+                    } else {
+                        println!();
+                    }
+                    token_buf.clear();
                     db.save_message(AGENT_DID, "received", &f).ok();
                     llm_history.push(json!({ "role": "assistant", "content": f }));
                 }
-                AgentEvent::Chat(c) => {
-                    db.save_message(AGENT_DID, "received", &c).ok();
-                    llm_history.push(json!({ "role": "assistant", "content": c }));
+
+                AgentEvent::Ask(q) => {
+                    token_buf.clear();
+                    println!();
+                    println!("◂ Aria: {}", q);
+                }
+
+                AgentEvent::Thought(t) => {
+                    token_buf.clear();
+                    println!("💭  {}", t);
+                }
+
+                AgentEvent::Action { skill, args } => {
+                    token_buf.clear();
+                    let readable = crate::skills::describe_action(&skill, &args);
+                    println!("⚡  {}", readable);
+                }
+
+                AgentEvent::Observation(o) => {
+                    println!("📋  {}", o);
+                }
+
+                AgentEvent::Error(e) => {
+                    token_buf.clear();
+                    eprintln!("✗ error:  {}", e);
+                }
+
+                AgentEvent::Done => {
+                    // Fallback: undecided or chat with <8 chars total
+                    if !token_buf.is_empty() && !prefix_printed {
+                        println!();
+                        println!("◂ Aria: {}", token_buf.trim());
+                        db.save_message(AGENT_DID, "received", token_buf.trim()).ok();
+                        llm_history.push(json!({ "role": "assistant", "content": token_buf.trim() }));
+                        token_buf.clear();
+                    }
+                    break;
                 }
             }
         }
@@ -305,223 +189,4 @@ pub async fn run(
         handle.await.ok();
         println!();
     }
-
-    println!("Goodbye.");
-    Ok(())
-}
-
-// ── ReAct loop ────────────────────────────────────────────────────────────────
-
-async fn run_react_loop(
-    api_key: String,
-    mut history: Vec<serde_json::Value>,
-    searxng_url: String,
-    brave_api_key: Option<String>,
-    skills: std::sync::Arc<crate::skills::SkillManager>,
-    tx: mpsc::Sender<AgentEvent>,
-    user_prompt: String,
-) {
-    let sys_prompt = system_prompt(&user_prompt);
-    let mut skill_fire_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for _ in 0..MAX_REACT_STEPS {
-        let raw = match call_llm(&api_key, &sys_prompt, &history).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.send(AgentEvent::Error(format!("LLM error: {}", e))).await;
-                let _ = tx.send(AgentEvent::Done).await;
-                return;
-            }
-        };
-
-        let parsed = parse_agent_responses(&raw);
-
-        if parsed.is_empty() {
-            let display = extract_content_field(&raw).unwrap_or(raw.clone());
-            let _ = tx.send(AgentEvent::Chat(display)).await;
-            let _ = tx.send(AgentEvent::Done).await;
-            return;
-        }
-
-        let mut should_continue = true;
-
-        for kind in parsed {
-            match kind {
-                AgentResponseKind::Chat(content) => {
-                    let _ = tx.send(AgentEvent::Chat(content)).await;
-                    should_continue = false;
-                }
-                AgentResponseKind::Thought(thought) => {
-                    let _ = tx.send(AgentEvent::Thought(thought)).await;
-                }
-                AgentResponseKind::Action { skill, args } => {
-                    let react_meta = load_react_meta(&skill);
-                    if let Some(max) = react_meta.max_steps {
-                        let count = skill_fire_counts.entry(skill.clone()).or_insert(0);
-                        if *count >= max {
-                            let _ = tx.send(AgentEvent::Error(format!(
-                                "Skill '{}' exceeded its max_steps limit of {}",
-                                skill, max
-                            ))).await;
-                            should_continue = false;
-                            break;
-                        }
-                        *count += 1;
-                    }
-
-                    let _ = tx.send(AgentEvent::Action { skill: skill.clone(), args: args.clone() }).await;
-
-                    let mut enriched = args.clone();
-                    if let Some(obj) = enriched.as_object_mut() {
-                        obj.insert("searxng_url".to_string(), json!(searxng_url));
-                        if let Some(ref key) = brave_api_key {
-                            obj.insert("brave_api_key".to_string(), json!(key));
-                        }
-                    }
-
-                    let (observation, is_error) = match skills.run_skill_raw(&skill, &enriched).await {
-                        Ok(val) => (val.to_string(), false),
-                        Err(e)  => (e.to_string(), true),
-                    };
-                    let _ = tx.send(AgentEvent::Observation(observation.clone())).await;
-
-                    if react_meta.terminal && !is_error {
-                        let _ = tx.send(AgentEvent::Final(observation)).await;
-                        should_continue = false;
-                        break;
-                    }
-
-                    history.push(json!({ "role": "assistant", "content": raw }));
-                    let label = if is_error { "Error from" } else { "Observation from" };
-                    history.push(json!({
-                        "role": "user",
-                        "content": format!("{} {}: {}. If this is an error, consider retrying with corrected args, trying a different skill, or telling the user it failed.", label, skill, observation)
-                    }));
-                }
-                AgentResponseKind::Ask(question) => {
-                    let _ = tx.send(AgentEvent::Ask(question)).await;
-                    should_continue = false;
-                }
-                AgentResponseKind::Final(answer) => {
-                    let _ = tx.send(AgentEvent::Final(answer)).await;
-                    should_continue = false;
-                }
-            }
-        }
-
-        if !should_continue {
-            let _ = tx.send(AgentEvent::Done).await;
-            return;
-        }
-    }
-
-    let _ = tx.send(AgentEvent::Error("Max steps reached without a final answer.".into())).await;
-    let _ = tx.send(AgentEvent::Done).await;
-}
-
-fn load_react_meta(skill: &str) -> ReactMeta {
-    let parts: Vec<&str> = skill.splitn(2, '.').collect();
-    if parts.len() != 2 { return ReactMeta::default(); }
-    let (action, category) = (parts[0], parts[1]);
-    let dir = skill_dir_root().join(category).join(format!("{}.{}", action, category));
-
-    std::fs::read_to_string(dir.join("manifest.toml")).ok()
-        .and_then(|text| toml::from_str::<SkillMeta>(&text).ok())
-        .map(|m| m.react)
-        .unwrap_or_default()
-}
-
-// ── Parsing ───────────────────────────────────────────────────────────────────
-
-fn parse_single(line: &str) -> Option<AgentResponseKind> {
-    let cleaned = line.trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let v: serde_json::Value = serde_json::from_str(cleaned).ok()?;
-
-    match v["type"].as_str()? {
-        "chat"    => Some(AgentResponseKind::Chat(v["content"].as_str()?.to_string())),
-        "thought" => Some(AgentResponseKind::Thought(v["content"].as_str()?.to_string())),
-        "ask"     => Some(AgentResponseKind::Ask(v["content"].as_str()?.to_string())),
-        "final"   => Some(AgentResponseKind::Final(v["content"].as_str()?.to_string())),
-        "action"  => Some(AgentResponseKind::Action {
-            skill: v["skill"].as_str()?.to_string(),
-            args:  v["args"].clone(),
-        }),
-        _ => None,
-    }
-}
-
-fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
-    raw.replace("}{", "}\n{")
-        .lines()
-        .filter_map(|line| parse_single(line.trim()))
-        .collect()
-}
-
-fn extract_content_field(s: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(s.trim()).ok()?;
-    v["content"].as_str().map(|c| c.to_string())
-}
-
-// ── LLM call ──────────────────────────────────────────────────────────────────
-
-async fn call_llm(api_key: &str, sys_prompt: &str, history: &[serde_json::Value]) -> anyhow::Result<String> {
-    let client = reqwest::Client::new();
-
-    let mut messages = vec![json!({ "role": "system", "content": sys_prompt })];
-    messages.extend_from_slice(history);
-
-    let body = json!({
-        "model": CONFIG.default_model,
-        "messages": messages,
-        "stream": true
-    });
-
-    let resp = client
-        .post(CONFIG.openrouter_url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("OpenRouter error {}: {}", status, text);
-    }
-
-    let mut stream = resp.bytes_stream();
-    let mut full_content = String::new();
-    let mut buffer = String::new();
-    print!("\n◂ Aria: ");
-    io::stdout().flush().ok();
-
-    while let Some(chunk) = stream.next().await {
-    let chunk = chunk?;
-    buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(newline_pos) = buffer.find('\n') {
-            let line = buffer[..newline_pos].trim().to_string();
-            buffer = buffer[newline_pos + 1..].to_string();
-
-            if line.is_empty() || line == "data: [DONE]" { continue; }
-
-            let json_str = line.strip_prefix("data: ").unwrap_or(&line);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
-                    print!("{}", token);
-                    io::stdout().flush().ok();
-                    full_content.push_str(token);
-                }
-            }
-        }
-    }
-
-    println!();
-    Ok(full_content)
 }

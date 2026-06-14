@@ -1,0 +1,18 @@
+name        = "write.fs"
+version     = "0.1.0"
+description = "Write or overwrite a text file on the local filesystem"
+
+triggers = ["save this to", "write this to a file", "create a file", "save to disk", "write to file"]
+
+[display]
+action = "Writing {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","content":"string","mode":"overwrite|append"}'
+output_schema = '{"path":"string","bytes_written":"number"}'
+
+[react]
+max_steps = 1

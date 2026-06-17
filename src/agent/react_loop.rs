@@ -3,6 +3,8 @@
 //! SkillManager, and enforces per-skill max_steps / terminal behavior from
 //! each skill's manifest.
 
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -44,8 +46,7 @@ enum AgentResponseKind {
 pub async fn run_react_loop(
     api_key: String,
     mut history: Vec<serde_json::Value>,
-    searxng_url: String,
-    brave_api_key: Option<String>,
+    injected_config: HashMap<String, HashMap<String, String>>,
     skills: std::sync::Arc<crate::skills::SkillManager>,
     tx: mpsc::Sender<AgentEvent>,
     user_prompt: String,
@@ -108,9 +109,10 @@ pub async fn run_react_loop(
 
                     let mut enriched = args.clone();
                     if let Some(obj) = enriched.as_object_mut() {
-                        obj.insert("searxng_url".to_string(), json!(searxng_url));
-                        if let Some(ref key) = brave_api_key {
-                            obj.insert("brave_api_key".to_string(), json!(key));
+                        if let Some(skill_config) = injected_config.get(&skill) {
+                            for (k, v) in skill_config {
+                                obj.insert(k.clone(), json!(v));
+                            }
                         }
                     }
 

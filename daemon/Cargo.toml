@@ -3,7 +3,10 @@ members = [
     ".",
     "skills/web/search.web",
     "skills/web/scrape.web",
-
+    "skills/fs/find.fs",
+    "skills/fs/list.fs",
+    "skills/fs/read.fs",
+    "skills/fs/write.fs",
 ]
 
 [package]

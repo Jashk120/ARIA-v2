@@ -2,7 +2,15 @@ name        = "find.fs"
 version     = "0.1.0"
 description = "Search for files by name pattern or by content match within a directory tree"
 
-triggers = ["find a file", "find the file", "search my files", "search for file", "locate file", "which file contains", "grep"]
+triggers = [
+    "find file", "find files", "find the file", "find a file",
+    "search my files", "search for file", "search files",
+    "locate file", "locate files",
+    "which file contains", "grep",
+    "where is", "look for file",
+    "find on my local", "files on my local",
+    "look up file", "search directory",
+]
 
 [display]
 action = "Searching for \"{query}\" in {path}"
@@ -15,4 +23,24 @@ args_schema   = '{"path":"string","query":"string","mode":"name|content","max_re
 output_schema = '{"matches":[{"path":"string","preview":"string"}],"truncated":"bool"}'
 
 [react]
-max_steps = 1
+max_steps = 3
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+secret  = false
+
+[config.fs_mode]
+default = "blacklist"
+inject  = true
+secret  = false
+
+[config.fs_allow]
+default = ""
+inject  = true
+secret  = false
+
+[config.fs_deny]
+default = ".git;node_modules;target;__pycache__"
+inject  = true
+secret  = false

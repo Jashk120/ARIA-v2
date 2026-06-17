@@ -37,8 +37,7 @@ pub async fn run(
 
     let stdin = io::stdin();
     let api_key = api_key.to_string();
-    let searxng_url = cfg.searxng_url.clone();
-    let brave_api_key = cfg.brave_api_key.clone();
+    let injected_config = cfg.injected_config.clone();
 
     loop {
         print!("▸ You: ");
@@ -70,8 +69,19 @@ pub async fn run(
                 continue;
             }
             "/config" => {
-                println!("  searxng_url:   {}", searxng_url);
-                println!("  brave_api_key: {}", if brave_api_key.is_some() { "set" } else { "not set" });
+                println!("  Injected config keys:");
+                for (skill_name, configs) in &injected_config {
+                    println!("    [ {} ]", skill_name);
+                    for (k, v) in configs {
+                        // Mask secrets (keys containing "key", "secret", "token")
+                        let display = if k.contains("key") || k.contains("secret") || k.contains("token") {
+                            if v.is_empty() { "(not set)".to_string() } else { "(set)".to_string() }
+                        } else {
+                            v.clone()
+                        };
+                        println!("      {}: {}", k, display);
+                    }
+                }
                 continue;
             }
             _ => {}
@@ -84,13 +94,12 @@ pub async fn run(
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
         let key = api_key.clone();
         let history_snap = llm_history.clone();
-        let s_url = searxng_url.clone();
-        let b_key = brave_api_key.clone();
+        let ic = injected_config.clone();
         let user_prompt = cmd.clone();
 
         let sm = std::sync::Arc::clone(&skills);
         let handle = tokio::spawn(async move {
-            run_react_loop(key, history_snap, s_url, b_key, sm, tx, user_prompt).await;
+            run_react_loop(key, history_snap, ic, sm, tx, user_prompt).await;
         });
 
         let mut token_buf = String::new();

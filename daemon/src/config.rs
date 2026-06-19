@@ -1,13 +1,25 @@
 use std::collections::HashMap;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Provider {
+    Ollama,
+    OpenRouter,
+}
+
 pub struct AppConfig {
+    pub use_provider: Provider,
     pub openrouter_url: &'static str,
-    pub default_model: &'static str,
+    pub ollama_url: &'static str,
+    pub openrouter_model: &'static str,
+    pub ollama_model: &'static str,
 }
 
 pub const CONFIG: AppConfig = AppConfig {
+    use_provider: Provider::Ollama,
     openrouter_url: "https://openrouter.ai/api/v1/chat/completions",
-    default_model: "google/gemma-4-26b-a4b-it:free",
+    ollama_url: "http://localhost:11434/v1/chat/completions",
+    openrouter_model: "google/gemma-4-26b-a4b-it:free",
+    ollama_model: "qwen3.5:9b",
 };
 
 /// Loaded once at startup from db + skill manifests, lives in memory for the
@@ -37,7 +49,8 @@ impl RuntimeConfig {
                 if !entry.inject {
                     continue;
                 }
-                let value = db.get_config(key)
+                let value = db
+                    .get_config(key)
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| entry.default.clone());
@@ -49,11 +62,13 @@ impl RuntimeConfig {
         }
 
         // 2. Extract well-known keys for backward-compat display.
-        let searxng_url = injected.get("search.web")
+        let searxng_url = injected
+            .get("search.web")
             .and_then(|c| c.get("searxng_url"))
             .cloned()
             .unwrap_or_else(|| "https://searx.be".to_string());
-        let brave_api_key = injected.get("search.web")
+        let brave_api_key = injected
+            .get("search.web")
             .and_then(|c| c.get("brave_api_key"))
             .cloned()
             .filter(|k| !k.is_empty());

@@ -3,7 +3,7 @@
 //! Compiled to WASM. All filesystem I/O goes through host_fs_find.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 
@@ -12,9 +12,12 @@ unsafe extern "C" {
     /// host_fs_find(path_ptr, path_len, query_ptr, query_len, mode_ptr, mode_len)
     ///   -> packed(ptr, len) of JSON array bytes, or 0 on error
     fn host_fs_find(
-        path_ptr: *const u8, path_len: usize,
-        query_ptr: *const u8, query_len: usize,
-        mode_ptr: *const u8, mode_len: usize,
+        path_ptr: *const u8,
+        path_len: usize,
+        query_ptr: *const u8,
+        query_len: usize,
+        mode_ptr: *const u8,
+        mode_len: usize,
     ) -> u64;
 }
 
@@ -36,7 +39,7 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
     };
 
     let output = match execute(input) {
-        Ok(v)  => v.to_string(),
+        Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     };
 
@@ -61,20 +64,23 @@ struct Input {
     max_results: usize,
 }
 
-fn default_mode() -> String { "name".to_string() }
-fn default_max() -> usize { 20 }
+fn default_mode() -> String {
+    "name".to_string()
+}
+fn default_max() -> usize {
+    20
+}
 
 #[derive(Serialize)]
 struct Match {
-    path:    String,
+    path: String,
     preview: String,
 }
 
 // ── Logic ─────────────────────────────────────────────────────────────────────
 
 fn execute(input: &str) -> Result<Value, String> {
-    let args: Input = serde_json::from_str(input)
-        .map_err(|e| format!("Invalid input: {}", e))?;
+    let args: Input = serde_json::from_str(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let mode = match args.mode.as_str() {
         "name" | "content" => args.mode.as_str(),
@@ -89,10 +95,11 @@ fn execute(input: &str) -> Result<Value, String> {
     let max = args.max_results.min(100);
     let truncated = all.len() > max;
 
-    let matches: Vec<Match> = all.into_iter()
+    let matches: Vec<Match> = all
+        .into_iter()
         .take(max)
         .map(|entry| Match {
-            path:    entry["path"].as_str().unwrap_or("").to_string(),
+            path: entry["path"].as_str().unwrap_or("").to_string(),
             preview: entry["preview"].as_str().unwrap_or("").to_string(),
         })
         .collect();
@@ -118,9 +125,12 @@ fn fs_find(path: &str, query: &str, mode: &str) -> Result<String, String> {
         let q = query.as_bytes();
         let m = mode.as_bytes();
         host_fs_find(
-            p.as_ptr(), p.len(),
-            q.as_ptr(), q.len(),
-            m.as_ptr(), m.len(),
+            p.as_ptr(),
+            p.len(),
+            q.as_ptr(),
+            q.len(),
+            m.as_ptr(),
+            m.len(),
         )
     };
 

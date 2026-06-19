@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
-use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
 
 use super::fs_sandbox::FsSandbox;
 use super::manifest::SkillManifest;
@@ -24,8 +24,8 @@ const MAX_FS_READ_SIZE: usize = 5 * 1024 * 1024; // 5MB limit per file read
 
 pub struct HostState {
     http_client: reqwest::Client,
-    fs_sandbox:  Option<FsSandbox>,
-    wasi:        WasiP1Ctx,
+    fs_sandbox: Option<FsSandbox>,
+    wasi: WasiP1Ctx,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ pub async fn run_wasm_instance_async(
         wasi,
     };
 
-    let mut store  = Store::new(engine, state);
+    let mut store = Store::new(engine, state);
     let mut linker: Linker<HostState> = Linker::new(engine);
 
     p1::add_to_linker_async(&mut linker, |s| &mut s.wasi)?;
@@ -64,12 +64,16 @@ pub async fn run_wasm_instance_async(
         wire_fs(&mut linker)?;
     }
 
-    linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {
-        // No-op for now as we use a fixed buffer, but prevents skill crash
-    })?;
+    linker.func_wrap(
+        "aria",
+        "host_free",
+        |_: Caller<'_, HostState>, _ptr: i32| {
+            // No-op for now as we use a fixed buffer, but prevents skill crash
+        },
+    )?;
 
     let instance = linker.instantiate_async(&mut store, &module).await?;
-    let memory   = instance
+    let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow!("Skill has no exported memory"))?;
 
@@ -83,7 +87,10 @@ pub async fn run_wasm_instance_async(
 
     let run_fn = instance.get_typed_func::<(i32, i32), i64>(&mut store, "run")?;
     let packed_result = run_fn
-        .call_async(&mut store, (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32))
+        .call_async(
+            &mut store,
+            (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32),
+        )
         .await?;
 
     if packed_result == 0 {
@@ -92,8 +99,15 @@ pub async fn run_wasm_instance_async(
 
     let (result_ptr, result_len) = unpack_ptr_len(packed_result);
     let data = memory.data(&store);
-    let json_bytes = data.get(result_ptr..result_ptr + result_len)
-        .ok_or_else(|| anyhow!("Skill result memory out of bounds (ptr: {}, len: {})", result_ptr, result_len))?;
+    let json_bytes = data
+        .get(result_ptr..result_ptr + result_len)
+        .ok_or_else(|| {
+            anyhow!(
+                "Skill result memory out of bounds (ptr: {}, len: {})",
+                result_ptr,
+                result_len
+            )
+        })?;
 
     let result_str = std::str::from_utf8(json_bytes)
         .map_err(|e| anyhow!("Skill returned invalid UTF-8: {}", e))?;
@@ -119,16 +133,25 @@ fn wire_http(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             Box::new(async move {
                 let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_http_get] failed to read url: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_http_get] failed to read url: {}", e);
+                        return 0;
+                    }
                 };
                 let headers_json = match read_wasm_str(&mut caller, headers_ptr, headers_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_http_get] failed to read headers: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_http_get] failed to read headers: {}", e);
+                        return 0;
+                    }
                 };
 
                 match do_http_get(&caller.data().http_client, &url, &headers_json).await {
                     Ok(body) => write_wasm_bytes(&mut caller, &body).await.unwrap_or(0),
-                    Err(e) => { eprintln!("[host_http_get] FAILED: {}", e); 0 }
+                    Err(e) => {
+                        eprintln!("[host_http_get] FAILED: {}", e);
+                        0
+                    }
                 }
             })
         },
@@ -182,12 +205,18 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             Box::new(async move {
                 let path = match read_wasm_str(&mut caller, path_ptr, path_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_read] failed to read path arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_read] failed to read path arg: {}", e);
+                        return 0;
+                    }
                 };
 
                 let resolved = match resolve_sandboxed(&caller, &path, true) {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[host_fs_read] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_read] {}", e);
+                        return 0;
+                    }
                 };
 
                 match std::fs::read(&resolved) {
@@ -197,7 +226,10 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         }
                         write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
                     }
-                    Err(e) => { eprintln!("[host_fs_read] read failed: {}", e); 0 }
+                    Err(e) => {
+                        eprintln!("[host_fs_read] read failed: {}", e);
+                        0
+                    }
                 }
             })
         },
@@ -208,27 +240,46 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "aria",
         "host_fs_write",
         |mut caller: Caller<'_, HostState>,
-         (path_ptr, path_len, content_ptr, content_len, mode_ptr, mode_len): (i32, i32, i32, i32, i32, i32)| {
+         (path_ptr, path_len, content_ptr, content_len, mode_ptr, mode_len): (
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        )| {
             Box::new(async move {
                 let path = match read_wasm_str(&mut caller, path_ptr, path_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_write] failed to read path arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_write] failed to read path arg: {}", e);
+                        return 0;
+                    }
                 };
                 let content = match read_wasm_str(&mut caller, content_ptr, content_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_write] failed to read content arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_write] failed to read content arg: {}", e);
+                        return 0;
+                    }
                 };
-                let mode = read_wasm_str(&mut caller, mode_ptr, mode_len).unwrap_or_else(|_| "overwrite".to_string());
+                let mode = read_wasm_str(&mut caller, mode_ptr, mode_len)
+                    .unwrap_or_else(|_| "overwrite".to_string());
 
                 let resolved = match resolve_sandboxed(&caller, &path, false) {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[host_fs_write] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_write] {}", e);
+                        return 0;
+                    }
                 };
 
                 let result = if mode == "append" {
                     use std::io::Write as _;
                     std::fs::OpenOptions::new()
-                        .create(true).append(true).open(&resolved)
+                        .create(true)
+                        .append(true)
+                        .open(&resolved)
                         .and_then(|mut f| f.write_all(content.as_bytes()))
                 } else {
                     std::fs::write(&resolved, content.as_bytes())
@@ -236,7 +287,10 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 match result {
                     Ok(()) => 1,
-                    Err(e) => { eprintln!("[host_fs_write] write failed: {}", e); 0 }
+                    Err(e) => {
+                        eprintln!("[host_fs_write] write failed: {}", e);
+                        0
+                    }
                 }
             })
         },
@@ -251,17 +305,26 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             Box::new(async move {
                 let path = match read_wasm_str(&mut caller, path_ptr, path_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_list] failed to read path arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_list] failed to read path arg: {}", e);
+                        return 0;
+                    }
                 };
 
                 let resolved = match resolve_sandboxed(&caller, &path, true) {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[host_fs_list] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_list] {}", e);
+                        return 0;
+                    }
                 };
 
                 let entries = match list_dir(&resolved) {
                     Ok(v) => v,
-                    Err(e) => { eprintln!("[host_fs_list] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_list] {}", e);
+                        return 0;
+                    }
                 };
 
                 let bytes = serde_json::to_vec(&entries).unwrap_or_default();
@@ -276,27 +339,47 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "aria",
         "host_fs_find",
         |mut caller: Caller<'_, HostState>,
-         (path_ptr, path_len, query_ptr, query_len, mode_ptr, mode_len): (i32, i32, i32, i32, i32, i32)| {
+         (path_ptr, path_len, query_ptr, query_len, mode_ptr, mode_len): (
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        )| {
             Box::new(async move {
                 let path = match read_wasm_str(&mut caller, path_ptr, path_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_find] failed to read path arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_find] failed to read path arg: {}", e);
+                        return 0;
+                    }
                 };
                 let query = match read_wasm_str(&mut caller, query_ptr, query_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_fs_find] failed to read query arg: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_find] failed to read query arg: {}", e);
+                        return 0;
+                    }
                 };
-                let mode = read_wasm_str(&mut caller, mode_ptr, mode_len).unwrap_or_else(|_| "name".to_string());
+                let mode = read_wasm_str(&mut caller, mode_ptr, mode_len)
+                    .unwrap_or_else(|_| "name".to_string());
 
                 let resolved = match resolve_sandboxed(&caller, &path, true) {
                     Ok(p) => p,
-                    Err(e) => { eprintln!("[host_fs_find] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_find] {}", e);
+                        return 0;
+                    }
                 };
 
                 let sandbox = caller.data().fs_sandbox.clone();
                 let matches = match find_matches(&resolved, &query, &mode, sandbox.as_ref()) {
                     Ok(v) => v,
-                    Err(e) => { eprintln!("[host_fs_find] {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_fs_find] {}", e);
+                        return 0;
+                    }
                 };
 
                 let bytes = serde_json::to_vec(&matches).unwrap_or_default();
@@ -309,8 +392,15 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 }
 
 /// Resolve a guest-supplied path through this skill's FsSandbox.
-fn resolve_sandboxed(caller: &Caller<'_, HostState>, path: &str, must_exist: bool) -> anyhow::Result<PathBuf> {
-    caller.data().fs_sandbox.as_ref()
+fn resolve_sandboxed(
+    caller: &Caller<'_, HostState>,
+    path: &str,
+    must_exist: bool,
+) -> anyhow::Result<PathBuf> {
+    caller
+        .data()
+        .fs_sandbox
+        .as_ref()
         .ok_or_else(|| anyhow!("fs capability not enabled for this skill"))?
         .resolve(path, must_exist)
 }
@@ -334,7 +424,12 @@ fn list_dir(dir: &std::path::Path) -> anyhow::Result<Vec<Value>> {
 
 /// `mode`: "name" matches file/dir names (case-insensitive substring), recursively.
 ///         "content" greps file contents for `query` (text files only, best-effort).
-fn find_matches(root: &std::path::Path, query: &str, mode: &str, sandbox: Option<&FsSandbox>) -> anyhow::Result<Vec<Value>> {
+fn find_matches(
+    root: &std::path::Path,
+    query: &str,
+    mode: &str,
+    sandbox: Option<&FsSandbox>,
+) -> anyhow::Result<Vec<Value>> {
     let query_lower = query.to_lowercase();
     let mut out = Vec::new();
     const MAX_RESULTS: usize = 50;
@@ -355,14 +450,20 @@ fn find_matches(root: &std::path::Path, query: &str, mode: &str, sandbox: Option
             return Ok(());
         }
         for entry in std::fs::read_dir(dir)? {
-            if out.len() >= max_results { break; }
+            if out.len() >= max_results {
+                break;
+            }
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_lowercase();
 
             // Per-entry sandbox check, so blacklisted subdirs are skipped entirely.
             if let Some(sb) = sandbox {
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
                 if sb.resolve(&rel, true).is_err() {
                     continue;
                 }
@@ -372,15 +473,32 @@ fn find_matches(root: &std::path::Path, query: &str, mode: &str, sandbox: Option
                 if mode == "name" && name.contains(query_lower) {
                     out.push(serde_json::json!({ "path": path.to_string_lossy(), "preview": "" }));
                 }
-                walk(&path, query_lower, mode, depth + 1, out, max_results, max_depth, root, sandbox)?;
+                walk(
+                    &path,
+                    query_lower,
+                    mode,
+                    depth + 1,
+                    out,
+                    max_results,
+                    max_depth,
+                    root,
+                    sandbox,
+                )?;
             } else {
                 match mode {
                     "content" => {
                         if let Ok(text) = std::fs::read_to_string(&path) {
                             if let Some(pos) = text.to_lowercase().find(query_lower) {
                                 let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
-                                let preview = text[start..end].trim().chars().take(200).collect::<String>();
+                                let end = text[pos..]
+                                    .find('\n')
+                                    .map(|i| pos + i)
+                                    .unwrap_or(text.len());
+                                let preview = text[start..end]
+                                    .trim()
+                                    .chars()
+                                    .take(200)
+                                    .collect::<String>();
                                 out.push(serde_json::json!({ "path": path.to_string_lossy(), "preview": preview }));
                             }
                         }
@@ -396,7 +514,17 @@ fn find_matches(root: &std::path::Path, query: &str, mode: &str, sandbox: Option
         Ok(())
     }
 
-    walk(root, &query_lower, mode, 0, &mut out, MAX_RESULTS, MAX_DEPTH, root, sandbox)?;
+    walk(
+        root,
+        &query_lower,
+        mode,
+        0,
+        &mut out,
+        MAX_RESULTS,
+        MAX_DEPTH,
+        root,
+        sandbox,
+    )?;
     Ok(out)
 }
 
@@ -407,7 +535,7 @@ fn read_wasm_str(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> anyh
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or_else(|| anyhow!("No memory export"))?;
-    let data  = memory.data(caller);
+    let data = memory.data(caller);
     let slice = data
         .get(ptr as usize..(ptr + len) as usize)
         .ok_or_else(|| anyhow!("Memory read out of bounds"))?;
@@ -428,7 +556,8 @@ async fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> a
                 let total_len = bytes.len() as i32;
                 let allocated_ptr = alloc_fn.call_async(&mut *caller, total_len).await?;
 
-                let memory = caller.get_export("memory")
+                let memory = caller
+                    .get_export("memory")
                     .and_then(|e| e.into_memory())
                     .ok_or_else(|| anyhow!("No memory export found"))?;
 

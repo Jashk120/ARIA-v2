@@ -21,10 +21,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct FsSandbox {
-    root:  PathBuf,
-    mode:  FsMode,
+    root: PathBuf,
+    mode: FsMode,
     allow: Vec<String>,
-    deny:  Vec<String>,
+    deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,24 +53,28 @@ impl FsSandbox {
         // Ensure the root exists so canonicalize() below doesn't fail for fresh installs.
         std::fs::create_dir_all(&root)
             .map_err(|e| anyhow!("Could not create fs_root '{}': {}", root.display(), e))?;
-        let root = root.canonicalize()
+        let root = root
+            .canonicalize()
             .map_err(|e| anyhow!("Could not resolve fs_root '{}': {}", root.display(), e))?;
 
         let mode = match get("fs_mode", "whitelist").as_str() {
             "whitelist" => FsMode::Whitelist,
             "blacklist" => FsMode::Blacklist,
-            _           => FsMode::Invalid,
+            _ => FsMode::Invalid,
         };
 
         let split = |s: String| -> Vec<String> {
-            s.split(';').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+            s.split(';')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
         };
 
         Ok(Self {
             root,
             mode,
             allow: split(get("fs_allow", "")),
-            deny:  split(get("fs_deny", "")),
+            deny: split(get("fs_deny", "")),
         })
     }
 
@@ -89,18 +93,26 @@ impl FsSandbox {
         };
 
         let canonical = if must_exist {
-            candidate.canonicalize()
-                .map_err(|e| anyhow!("Path '{}' does not exist or is unreadable: {}", requested, e))?
+            candidate.canonicalize().map_err(|e| {
+                anyhow!(
+                    "Path '{}' does not exist or is unreadable: {}",
+                    requested,
+                    e
+                )
+            })?
         } else {
             // For write targets, canonicalize the parent and rejoin the filename —
             // the file itself may not exist yet.
-            let parent = candidate.parent()
+            let parent = candidate
+                .parent()
                 .ok_or_else(|| anyhow!("Invalid path '{}'", requested))?;
-            let file_name = candidate.file_name()
+            let file_name = candidate
+                .file_name()
                 .ok_or_else(|| anyhow!("Invalid path '{}' — no file name", requested))?;
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("Cannot create directory '{}': {}", parent.display(), e))?;
-            parent.canonicalize()
+            parent
+                .canonicalize()
                 .map_err(|e| anyhow!("Cannot resolve directory '{}': {}", parent.display(), e))?
                 .join(file_name)
         };
@@ -109,7 +121,8 @@ impl FsSandbox {
         if !canonical.starts_with(&self.root) {
             bail!(
                 "Access denied: '{}' resolves outside the allowed workspace ({})",
-                requested, self.root.display()
+                requested,
+                self.root.display()
             );
         }
 
@@ -164,7 +177,7 @@ fn expand_home(path: &str) -> PathBuf {
 fn glob_match(pattern: &str, input: &str) -> bool {
     // Normalize Windows separators just in case.
     let pattern = pattern.replace('\\', "/");
-    let input   = input.replace('\\', "/");
+    let input = input.replace('\\', "/");
     glob_match_inner(pattern.as_bytes(), input.as_bytes())
 }
 
@@ -177,14 +190,22 @@ fn glob_match_inner(pat: &[u8], s: &[u8]) -> bool {
             if pat.get(1) == Some(&b'*') {
                 let rest = &pat[2..];
                 // '**' matches zero or more of anything, including '/'
-                if glob_match_inner(rest, s) { return true; }
-                if !s.is_empty() { return glob_match_inner(pat, &s[1..]); }
+                if glob_match_inner(rest, s) {
+                    return true;
+                }
+                if !s.is_empty() {
+                    return glob_match_inner(pat, &s[1..]);
+                }
                 false
             } else {
                 let rest = &pat[1..];
                 // single '*' matches zero or more non-'/' chars
-                if glob_match_inner(rest, s) { return true; }
-                if !s.is_empty() && s[0] != b'/' { return glob_match_inner(pat, &s[1..]); }
+                if glob_match_inner(rest, s) {
+                    return true;
+                }
+                if !s.is_empty() && s[0] != b'/' {
+                    return glob_match_inner(pat, &s[1..]);
+                }
                 false
             }
         }

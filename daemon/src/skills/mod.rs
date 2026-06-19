@@ -2,9 +2,9 @@
 //! Loads WASM skill binaries, wires host functions, executes them.
 //! Skills are fully self-describing via manifest.toml — core never hardcodes skill logic.
 
+pub mod fs_sandbox;
 pub mod manifest;
 pub mod paths;
-pub mod fs_sandbox;
 mod wasm_runtime;
 
 use anyhow::{anyhow, bail};
@@ -14,8 +14,6 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use wasmtime::{Engine, Module};
 
-
-
 use crate::db::Db;
 use manifest::load_manifest;
 use paths::{skill_dir, wasm_path};
@@ -24,7 +22,7 @@ use wasm_runtime::run_wasm_instance_async;
 // ── Skill Manager ─────────────────────────────────────────────────────────────
 
 pub struct SkillManager {
-    engine:  Engine,
+    engine: Engine,
     modules: RwLock<HashMap<String, Arc<Module>>>,
 }
 
@@ -75,10 +73,10 @@ impl SkillManager {
             );
         }
 
-        let dir      = skill_dir(name)?;
+        let dir = skill_dir(name)?;
         let manifest = load_manifest(&dir)?;
-        let module   = self.get_module(name, &path)?;
-        let engine   = self.engine.clone();
+        let module = self.get_module(name, &path)?;
+        let engine = self.engine.clone();
 
         run_wasm_instance_async(&engine, module, args, &manifest).await
     }
@@ -90,17 +88,19 @@ impl SkillManager {
 /// This covers both runtime-config values (searxng_url, fs_root, ...) used by host
 /// functions, and any values the skill itself reads from its args.
 fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
-    let dir      = skill_dir(skill)?;
+    let dir = skill_dir(skill)?;
     let manifest = load_manifest(&dir)?;
 
-    let obj = args.as_object_mut()
+    let obj = args
+        .as_object_mut()
         .ok_or_else(|| anyhow!("Args must be a JSON object to enrich keys"))?;
 
     for (key, entry) in &manifest.config {
         if !entry.inject {
             continue;
         }
-        let value = db.get_config(key)
+        let value = db
+            .get_config(key)
             .ok()
             .flatten()
             .unwrap_or_else(|| entry.default.clone());
@@ -132,7 +132,7 @@ fn render_template(template: &str, args: &Value) -> String {
             let value = match v {
                 Value::String(s) => s.clone(),
                 Value::Number(n) => n.to_string(),
-                Value::Bool(b)   => b.to_string(),
+                Value::Bool(b) => b.to_string(),
                 _ => "...".to_string(),
             };
             result = result.replace(&placeholder, &value);

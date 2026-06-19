@@ -24,7 +24,9 @@ pub fn get_daemon_root() -> anyhow::Result<PathBuf> {
             return Ok(parent.to_path_buf());
         }
         curr = parent;
-        if curr.as_os_str().is_empty() || curr.parent().is_none() { break; }
+        if curr.as_os_str().is_empty() || curr.parent().is_none() {
+            break;
+        }
     }
 
     // Fallback: one level up from wherever we are
@@ -38,7 +40,10 @@ pub fn get_daemon_root() -> anyhow::Result<PathBuf> {
 pub fn split_skill_name(name: &str) -> anyhow::Result<(&str, &str)> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     if parts.len() != 2 {
-        bail!("Invalid skill name '{}' — expected format: action.category", name);
+        bail!(
+            "Invalid skill name '{}' — expected format: action.category",
+            name
+        );
     }
     Ok((parts[0], parts[1]))
 }

@@ -1,10 +1,10 @@
-use std::io::{self, BufRead, Write};
 use serde_json::json;
+use std::io::{self, BufRead, Write};
 use tokio::sync::mpsc;
 
+use crate::agent::react_loop::{AgentEvent, run_react_loop};
 use crate::config::RuntimeConfig;
 use crate::db::Db;
-use crate::agent::react_loop::{run_react_loop, AgentEvent};
 
 const AGENT_DID: &str = "did:aria:jayesh";
 
@@ -47,10 +47,15 @@ pub async fn run(
         match stdin.lock().read_line(&mut cmd) {
             Ok(0) => break Ok(()),
             Ok(_) => {}
-            Err(e) => { eprintln!("Input error: {}", e); break Ok(()); }
+            Err(e) => {
+                eprintln!("Input error: {}", e);
+                break Ok(());
+            }
         }
         let cmd = cmd.trim().to_string();
-        if cmd.is_empty() { continue; }
+        if cmd.is_empty() {
+            continue;
+        }
 
         match cmd.as_str() {
             "/quit" | "/exit" | "/q" => break Ok(()),
@@ -62,10 +67,18 @@ pub async fn run(
                 println!("  /config  — show runtime config");
                 continue;
             }
-            "/clear" => { print!("\x1B[2J\x1B[H"); io::stdout().flush()?; continue; }
+            "/clear" => {
+                print!("\x1B[2J\x1B[H");
+                io::stdout().flush()?;
+                continue;
+            }
             "/key" => {
                 let end = api_key.len().saturating_sub(4);
-                println!("  Key: {}...{}", &api_key[..4.min(api_key.len())], &api_key[end..]);
+                println!(
+                    "  Key: {}...{}",
+                    &api_key[..4.min(api_key.len())],
+                    &api_key[end..]
+                );
                 continue;
             }
             "/config" => {
@@ -74,11 +87,16 @@ pub async fn run(
                     println!("    [ {} ]", skill_name);
                     for (k, v) in configs {
                         // Mask secrets (keys containing "key", "secret", "token")
-                        let display = if k.contains("key") || k.contains("secret") || k.contains("token") {
-                            if v.is_empty() { "(not set)".to_string() } else { "(set)".to_string() }
-                        } else {
-                            v.clone()
-                        };
+                        let display =
+                            if k.contains("key") || k.contains("secret") || k.contains("token") {
+                                if v.is_empty() {
+                                    "(not set)".to_string()
+                                } else {
+                                    "(set)".to_string()
+                                }
+                            } else {
+                                v.clone()
+                            };
                         println!("      {}: {}", k, display);
                     }
                 }
@@ -186,8 +204,10 @@ pub async fn run(
                     if !token_buf.is_empty() && !prefix_printed {
                         println!();
                         println!("◂ Aria: {}", token_buf.trim());
-                        db.save_message(AGENT_DID, "received", token_buf.trim()).ok();
-                        llm_history.push(json!({ "role": "assistant", "content": token_buf.trim() }));
+                        db.save_message(AGENT_DID, "received", token_buf.trim())
+                            .ok();
+                        llm_history
+                            .push(json!({ "role": "assistant", "content": token_buf.trim() }));
                         token_buf.clear();
                     }
                     break;

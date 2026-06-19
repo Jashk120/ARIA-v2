@@ -5,15 +5,17 @@
 //! Compiled to WASM. All HTTP goes through host_http_get.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 
 #[link(wasm_import_module = "aria")]
 unsafe extern "C" {
     fn host_http_get(
-        url_ptr: *const u8, url_len: usize,
-        headers_ptr: *const u8, headers_len: usize,
+        url_ptr: *const u8,
+        url_len: usize,
+        headers_ptr: *const u8,
+        headers_len: usize,
     ) -> u64;
 }
 
@@ -35,7 +37,7 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
     };
 
     let output = match execute(input) {
-        Ok(v)  => v.to_string(),
+        Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     };
 
@@ -59,21 +61,24 @@ struct Input {
     brave_api_key: String,
 }
 
-fn default_max() -> u8 { 5 }
-fn default_searxng_url() -> String { "https://searx.be".to_string() }
+fn default_max() -> u8 {
+    5
+}
+fn default_searxng_url() -> String {
+    "https://searx.be".to_string()
+}
 
 #[derive(Serialize)]
 struct SearchResult {
-    title:   String,
-    url:     String,
+    title: String,
+    url: String,
     snippet: String,
 }
 
 // ── Logic ─────────────────────────────────────────────────────────────────────
 
 fn execute(input: &str) -> Result<Value, String> {
-    let args: Input = serde_json::from_str(input)
-        .map_err(|e| format!("Invalid input: {}", e))?;
+    let args: Input = serde_json::from_str(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let max = args.max_results.min(10);
 
@@ -96,12 +101,13 @@ fn search_searxng(query: &str, max: u8, base_url: &str) -> Result<Value, String>
     let headers = json!({
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (compatible; ARIA-agent/0.5)",
-    }).to_string();
+    })
+    .to_string();
 
     let body = http_get(&url, &headers)?;
 
-    let raw: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Bad JSON from SearXNG: {}", e))?;
+    let raw: Value =
+        serde_json::from_str(&body).map_err(|e| format!("Bad JSON from SearXNG: {}", e))?;
 
     let results: Vec<SearchResult> = raw["results"]
         .as_array()
@@ -109,8 +115,8 @@ fn search_searxng(query: &str, max: u8, base_url: &str) -> Result<Value, String>
         .iter()
         .take(max as usize)
         .map(|r| SearchResult {
-            title:   r["title"].as_str().unwrap_or("").to_string(),
-            url:     r["url"].as_str().unwrap_or("").to_string(),
+            title: r["title"].as_str().unwrap_or("").to_string(),
+            url: r["url"].as_str().unwrap_or("").to_string(),
             snippet: r["content"].as_str().unwrap_or("").to_string(),
         })
         .collect();
@@ -134,12 +140,13 @@ fn search_brave(query: &str, max: u8, api_key: &str) -> Result<Value, String> {
     let headers = json!({
         "Accept": "application/json",
         "X-Subscription-Token": api_key,
-    }).to_string();
+    })
+    .to_string();
 
     let body = http_get(&url, &headers)?;
 
-    let raw: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Bad JSON from Brave: {}", e))?;
+    let raw: Value =
+        serde_json::from_str(&body).map_err(|e| format!("Bad JSON from Brave: {}", e))?;
 
     let results: Vec<SearchResult> = raw["web"]["results"]
         .as_array()
@@ -147,8 +154,8 @@ fn search_brave(query: &str, max: u8, api_key: &str) -> Result<Value, String> {
         .iter()
         .take(max as usize)
         .map(|r| SearchResult {
-            title:   r["title"].as_str().unwrap_or("").to_string(),
-            url:     r["url"].as_str().unwrap_or("").to_string(),
+            title: r["title"].as_str().unwrap_or("").to_string(),
+            url: r["url"].as_str().unwrap_or("").to_string(),
             snippet: r["description"].as_str().unwrap_or("").to_string(),
         })
         .collect();
@@ -182,11 +189,13 @@ fn unpack_ptr_len(packed: u64) -> (usize, usize) {
 }
 
 fn url_encode(s: &str) -> String {
-    s.chars().map(|c| match c {
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-        ' ' => "+".to_string(),
-        c   => format!("%{:02X}", c as u32),
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            c => format!("%{:02X}", c as u32),
+        })
+        .collect()
 }
 
 fn to_wasm_ptr(s: String) -> *mut u8 {

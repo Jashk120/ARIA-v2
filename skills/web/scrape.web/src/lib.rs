@@ -2,15 +2,17 @@
 //! No external deps — HTML stripping done manually
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 
 #[link(wasm_import_module = "aria")]
 unsafe extern "C" {
     fn host_http_get(
-        url_ptr: *const u8, url_len: usize,
-        headers_ptr: *const u8, headers_len: usize,
+        url_ptr: *const u8,
+        url_len: usize,
+        headers_ptr: *const u8,
+        headers_len: usize,
     ) -> u64;
 
     fn host_free(ptr: *mut u8);
@@ -34,7 +36,7 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
     };
 
     let output = match execute(input) {
-        Ok(v)  => v.to_string(),
+        Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     };
 
@@ -53,20 +55,22 @@ struct Input {
     max_chars: usize,
 }
 
-fn default_max_chars() -> usize { 4000 }
+fn default_max_chars() -> usize {
+    4000
+}
 
 // ── Logic ─────────────────────────────────────────────────────────────────────
 
 fn execute(input: &str) -> Result<Value, String> {
-    let args: Input = serde_json::from_str(input)
-        .map_err(|e| format!("Invalid input: {}", e))?;
+    let args: Input = serde_json::from_str(input).map_err(|e| format!("Invalid input: {}", e))?;
 
     let max_chars = args.max_chars.min(10000);
 
     let headers = json!({
         "User-Agent": "Mozilla/5.0 (compatible; ARIA-agent/0.5)",
         "Accept": "text/html,application/xhtml+xml",
-    }).to_string();
+    })
+    .to_string();
 
     let html = http_get(&args.url, &headers)?;
     let text = extract_text(&html, max_chars);
@@ -93,14 +97,19 @@ fn extract_text(html: &str, max_chars: usize) -> String {
     let html = remove_blocks(&html, "header");
 
     // 2. Strip remaining tags
-    let mut out   = String::new();
+    let mut out = String::new();
     let mut in_tag = false;
     let mut last_was_space = false;
 
     for c in html.chars() {
         match c {
-            '<' => { in_tag = true; out.push(' '); }
-            '>' => { in_tag = false; }
+            '<' => {
+                in_tag = true;
+                out.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+            }
             _ if in_tag => {}
             '\n' | '\r' | '\t' => {
                 if !last_was_space {
@@ -123,9 +132,9 @@ fn extract_text(html: &str, max_chars: usize) -> String {
 
     // 3. Decode entities
     let out = out
-        .replace("&amp;",  "&")
-        .replace("&lt;",   "<")
-        .replace("&gt;",   ">")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#x27;", "'")
         .replace("&nbsp;", " ");
@@ -146,11 +155,11 @@ fn extract_text(html: &str, max_chars: usize) -> String {
 }
 
 fn remove_blocks(html: &str, tag: &str) -> String {
-    let open  = format!("<{}", tag);
+    let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
     let mut out = String::new();
     let mut pos = 0;
-    let lower   = html.to_lowercase();
+    let lower = html.to_lowercase();
 
     while pos < html.len() {
         if let Some(start) = lower[pos..].find(&open).map(|i| i + pos) {

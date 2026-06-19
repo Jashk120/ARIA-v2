@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::CONFIG;
-use crate::skills::manifest::{load_manifest, ReactConfig};
+use crate::skills::manifest::{ReactConfig, load_manifest};
 use crate::skills::paths::skill_dir;
 
 use super::prompt::system_prompt;
@@ -21,7 +21,10 @@ pub const MAX_REACT_STEPS: usize = 8;
 
 pub enum AgentEvent {
     Thought(String),
-    Action { skill: String, args: serde_json::Value },
+    Action {
+        skill: String,
+        args: serde_json::Value,
+    },
     Observation(String),
     Ask(String),
     /// Streamed token — print immediately, no newline
@@ -36,7 +39,10 @@ pub enum AgentEvent {
 enum AgentResponseKind {
     Chat(String),
     Thought(String),
-    Action { skill: String, args: serde_json::Value },
+    Action {
+        skill: String,
+        args: serde_json::Value,
+    },
     Ask(String),
     Final(String),
 }
@@ -52,7 +58,8 @@ pub async fn run_react_loop(
     user_prompt: String,
 ) {
     let sys_prompt = system_prompt(&user_prompt);
-    let mut skill_fire_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut skill_fire_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     for _ in 0..MAX_REACT_STEPS {
         // Stream the LLM response, emitting Token events as tokens arrive.
@@ -60,7 +67,9 @@ pub async fn run_react_loop(
         let raw = match call_llm_streaming(&api_key, &sys_prompt, &history, &tx).await {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.send(AgentEvent::Error(format!("LLM error: {}", e))).await;
+                let _ = tx
+                    .send(AgentEvent::Error(format!("LLM error: {}", e)))
+                    .await;
                 let _ = tx.send(AgentEvent::Done).await;
                 return;
             }
@@ -95,17 +104,24 @@ pub async fn run_react_loop(
                     if let Some(max) = react_meta.max_steps {
                         let count = skill_fire_counts.entry(skill.clone()).or_insert(0);
                         if *count >= max {
-                            let _ = tx.send(AgentEvent::Error(format!(
-                                "Skill '{}' exceeded its max_steps limit of {}",
-                                skill, max
-                            ))).await;
+                            let _ = tx
+                                .send(AgentEvent::Error(format!(
+                                    "Skill '{}' exceeded its max_steps limit of {}",
+                                    skill, max
+                                )))
+                                .await;
                             should_continue = false;
                             break;
                         }
                         *count += 1;
                     }
 
-                    let _ = tx.send(AgentEvent::Action { skill: skill.clone(), args: args.clone() }).await;
+                    let _ = tx
+                        .send(AgentEvent::Action {
+                            skill: skill.clone(),
+                            args: args.clone(),
+                        })
+                        .await;
 
                     let mut enriched = args.clone();
                     if let Some(obj) = enriched.as_object_mut() {
@@ -116,10 +132,11 @@ pub async fn run_react_loop(
                         }
                     }
 
-                    let (observation, is_error): (String, bool) = match skills.run_skill_raw(&skill, &enriched).await {
-                        Ok(val) => (val.to_string(), false),
-                        Err(e)  => (e.to_string(), true),
-                    };
+                    let (observation, is_error): (String, bool) =
+                        match skills.run_skill_raw(&skill, &enriched).await {
+                            Ok(val) => (val.to_string(), false),
+                            Err(e) => (e.to_string(), true),
+                        };
                     let _ = tx.send(AgentEvent::Observation(observation.clone())).await;
 
                     if react_meta.terminal && !is_error {
@@ -129,7 +146,11 @@ pub async fn run_react_loop(
                     }
 
                     history.push(json!({ "role": "assistant", "content": raw }));
-                    let label = if is_error { "Error from" } else { "Observation from" };
+                    let label = if is_error {
+                        "Error from"
+                    } else {
+                        "Observation from"
+                    };
                     history.push(json!({
                         "role": "user",
                         "content": format!("{} {}: {}. If this is an error, consider retrying with corrected args, trying a different skill, or telling the user it failed.", label, skill, observation)
@@ -152,12 +173,17 @@ pub async fn run_react_loop(
         }
     }
 
-    let _ = tx.send(AgentEvent::Error("Max steps reached without a final answer.".into())).await;
+    let _ = tx
+        .send(AgentEvent::Error(
+            "Max steps reached without a final answer.".into(),
+        ))
+        .await;
     let _ = tx.send(AgentEvent::Done).await;
 }
 
 fn load_react_meta(skill: &str) -> ReactConfig {
-    skill_dir(skill).ok()
+    skill_dir(skill)
+        .ok()
         .and_then(|dir| load_manifest(&dir).ok())
         .map(|m| m.react)
         .unwrap_or_default()
@@ -166,7 +192,8 @@ fn load_react_meta(skill: &str) -> ReactConfig {
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
 fn parse_single(line: &str) -> Option<AgentResponseKind> {
-    let cleaned = line.trim()
+    let cleaned = line
+        .trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
@@ -175,13 +202,15 @@ fn parse_single(line: &str) -> Option<AgentResponseKind> {
     let v: serde_json::Value = serde_json::from_str(cleaned).ok()?;
 
     match v["type"].as_str()? {
-        "chat"    => Some(AgentResponseKind::Chat(v["content"].as_str()?.to_string())),
-        "thought" => Some(AgentResponseKind::Thought(v["content"].as_str()?.to_string())),
-        "ask"     => Some(AgentResponseKind::Ask(v["content"].as_str()?.to_string())),
-        "final"   => Some(AgentResponseKind::Final(v["content"].as_str()?.to_string())),
-        "action"  => Some(AgentResponseKind::Action {
+        "chat" => Some(AgentResponseKind::Chat(v["content"].as_str()?.to_string())),
+        "thought" => Some(AgentResponseKind::Thought(
+            v["content"].as_str()?.to_string(),
+        )),
+        "ask" => Some(AgentResponseKind::Ask(v["content"].as_str()?.to_string())),
+        "final" => Some(AgentResponseKind::Final(v["content"].as_str()?.to_string())),
+        "action" => Some(AgentResponseKind::Action {
             skill: v["skill"].as_str()?.to_string(),
-            args:  v["args"].clone(),
+            args: v["args"].clone(),
         }),
         _ => None,
     }
@@ -208,10 +237,14 @@ fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
             in_string = !in_string;
             continue;
         }
-        if in_string { continue; }
+        if in_string {
+            continue;
+        }
 
         if ch == '{' {
-            if depth == 0 { start = Some(i); }
+            if depth == 0 {
+                start = Some(i);
+            }
             depth += 1;
         } else if ch == '}' {
             depth -= 1;
@@ -251,14 +284,19 @@ async fn call_llm_streaming(
     let mut messages = vec![json!({ "role": "system", "content": sys_prompt })];
     messages.extend_from_slice(history);
 
+    let (url, model, provider_name) = match CONFIG.use_provider {
+        crate::config::Provider::OpenRouter => (CONFIG.openrouter_url, CONFIG.openrouter_model, "OpenRouter"),
+        crate::config::Provider::Ollama => (CONFIG.ollama_url, CONFIG.ollama_model, "Ollama"),
+    };
+
     let body = json!({
-        "model": CONFIG.default_model,
+        "model": model,
         "messages": messages,
         "stream": true,
     });
 
     let resp = client
-        .post(CONFIG.openrouter_url)
+        .post(url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -268,7 +306,7 @@ async fn call_llm_streaming(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("OpenRouter error {}: {}", status, text);
+        anyhow::bail!("{} error {}: {}", provider_name, status, text);
     }
 
     let mut stream = resp.bytes_stream();
@@ -283,7 +321,9 @@ async fn call_llm_streaming(
             let line = buffer[..newline_pos].trim().to_string();
             buffer = buffer[newline_pos + 1..].to_string();
 
-            if line.is_empty() || line == "data: [DONE]" { continue; }
+            if line.is_empty() || line == "data: [DONE]" {
+                continue;
+            }
 
             let json_str = line.strip_prefix("data: ").unwrap_or(&line);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {

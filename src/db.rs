@@ -10,7 +10,8 @@ pub struct Db {
 
 impl Db {
     pub fn new() -> anyhow::Result<Self> {
-        let mut db_path = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        let mut db_path =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
         db_path.push(".aria");
         fs::create_dir_all(&db_path)?;
         db_path.push("daemon.db");
@@ -26,7 +27,8 @@ impl Db {
     }
 
     fn has_table(&self, name: &str) -> anyhow::Result<bool> {
-        let mut statement = self.conn
+        let mut statement = self
+            .conn
             .prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")?;
         statement.bind((1, name))?;
         if let State::Row = statement.next()? {
@@ -47,7 +49,7 @@ impl Db {
                 "CREATE TABLE IF NOT EXISTS config (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );"
+                );",
             )?;
         }
         Ok(())
@@ -61,7 +63,7 @@ impl Db {
                     version      TEXT NOT NULL,
                     wasm_path    TEXT NOT NULL,
                     installed_at TEXT DEFAULT CURRENT_TIMESTAMP
-                );"
+                );",
             )?;
         }
         Ok(())
@@ -70,7 +72,9 @@ impl Db {
     // ── Config ────────────────────────────────────────────────────────────────
 
     pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let mut statement = self.conn.prepare("SELECT value FROM config WHERE key = ?")?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT value FROM config WHERE key = ?")?;
         statement.bind((1, key))?;
         if let State::Row = statement.next()? {
             return Ok(Some(statement.read::<String, _>(0)?));
@@ -79,7 +83,8 @@ impl Db {
     }
 
     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let mut statement = self.conn
+        let mut statement = self
+            .conn
             .prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")?;
         statement.bind((1, key))?;
         statement.bind((2, value))?;
@@ -90,7 +95,8 @@ impl Db {
     // ── Skills ────────────────────────────────────────────────────────────────
 
     pub fn install_skill(&self, name: &str, version: &str, wasm_path: &str) -> anyhow::Result<()> {
-        let mut statement = self.conn
+        let mut statement = self
+            .conn
             .prepare("INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)")?;
         statement.bind((1, name))?;
         statement.bind((2, version))?;
@@ -100,7 +106,8 @@ impl Db {
     }
 
     pub fn get_skill(&self, name: &str) -> anyhow::Result<Option<String>> {
-        let mut statement = self.conn
+        let mut statement = self
+            .conn
             .prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
         statement.bind((1, name))?;
         if let State::Row = statement.next()? {
@@ -110,7 +117,8 @@ impl Db {
     }
 
     pub fn list_skills(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let mut statement = self.conn
+        let mut statement = self
+            .conn
             .prepare("SELECT name, version FROM skills ORDER BY name")?;
         let mut skills = Vec::new();
         while let State::Row = statement.next()? {
@@ -139,7 +147,7 @@ impl Db {
                 info!("No identity found. Creating stub identity for Phase 1...");
                 self.conn.execute(
                     "INSERT INTO identity (did, public_key, private_key, manifest_path)
-                     VALUES ('did:aria:jayesh', 'stub_pub', 'stub_priv', '~/.aria/manifest.json')"
+                     VALUES ('did:aria:jayesh', 'stub_pub', 'stub_priv', '~/.aria/manifest.json')",
                 )?;
             }
         }
@@ -148,10 +156,15 @@ impl Db {
 
     // ── Messages ──────────────────────────────────────────────────────────────
 
-    pub fn save_message(&self, agent_did: &str, direction: &str, content: &str) -> anyhow::Result<()> {
-        let mut statement = self.conn.prepare(
-            "INSERT INTO messages (agent_did, direction, content) VALUES (?, ?, ?)"
-        )?;
+    pub fn save_message(
+        &self,
+        agent_did: &str,
+        direction: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let mut statement = self
+            .conn
+            .prepare("INSERT INTO messages (agent_did, direction, content) VALUES (?, ?, ?)")?;
         statement.bind((1, agent_did))?;
         statement.bind((2, direction))?;
         statement.bind((3, content))?;
@@ -159,7 +172,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_history(&self, agent_did: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+    pub fn get_history(
+        &self,
+        agent_did: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut statement = self.conn.prepare(
             "SELECT direction, content FROM messages WHERE agent_did = ? ORDER BY timestamp DESC LIMIT ?"
         )?;

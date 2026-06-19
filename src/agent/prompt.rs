@@ -5,7 +5,7 @@
 //! even on off-trigger phrasing). Skills whose `triggers` match the current
 //! user prompt additionally get their full call/output schema + react notes.
 
-use crate::skills::manifest::{load_manifest, SkillManifest};
+use crate::skills::manifest::{SkillManifest, load_manifest};
 use crate::skills::paths::get_daemon_root;
 
 // ── Trigger matching ──────────────────────────────────────────────────────────
@@ -22,7 +22,8 @@ pub fn prompt_matches_triggers(prompt: &str, triggers: &[String]) -> bool {
 
 pub fn system_prompt(user_prompt: &str) -> String {
     let skills = build_skills_prompt(user_prompt);
-    format!(r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
+    format!(
+        r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
 
 You decide whether a user message needs tool use or is just a conversation.
 
@@ -57,7 +58,9 @@ For normal conversation (no tools needed):
 - Use the exact args schema defined per skill — do not invent keys
 - After receiving an observation, either act again or emit final
 - Keep thoughts short and practical
-- Final answers should be friendly and summarize what was done"#, skills)
+- Final answers should be friendly and summarize what was done"#,
+        skills
+    )
 }
 
 // ── Skills index builder ───────────────────────────────────────────────────────
@@ -71,7 +74,9 @@ pub fn load_all_skills() -> Vec<SkillManifest> {
 
     if let Ok(categories) = std::fs::read_dir(&skills_dir) {
         for cat in categories.flatten() {
-            if !cat.path().is_dir() { continue; }
+            if !cat.path().is_dir() {
+                continue;
+            }
             if let Ok(entries) = std::fs::read_dir(cat.path()) {
                 for entry in entries.flatten() {
                     if let Ok(m) = load_manifest(&entry.path()) {
@@ -87,29 +92,32 @@ pub fn load_all_skills() -> Vec<SkillManifest> {
 fn build_skills_prompt(user_prompt: &str) -> String {
     let all_skills = load_all_skills();
 
-    let lines: Vec<String> = all_skills.iter().map(|m| {
-        if prompt_matches_triggers(user_prompt, &m.triggers) {
-            format_skill_block(m)
-        } else {
-            format!("- {}: {}", m.name, m.description)
-        }
-    }).collect();
+    let lines: Vec<String> = all_skills
+        .iter()
+        .map(|m| {
+            if prompt_matches_triggers(user_prompt, &m.triggers) {
+                format_skill_block(m)
+            } else {
+                format!("- {}: {}", m.name, m.description)
+            }
+        })
+        .collect();
 
     format!("== AVAILABLE SKILLS ==\n{}", lines.join("\n\n"))
 }
 
 fn format_skill_block(m: &SkillManifest) -> String {
-    let args_example = m.call.args_schema.as_deref()
+    let args_example = m
+        .call
+        .args_schema
+        .as_deref()
         .unwrap_or(r#"{"key":"value"}"#);
     let call_line = format!(
         r#"  call:   {{"type":"action","skill":"{}","args":{}}}"#,
         m.name, args_example
     );
 
-    let mut lines = vec![
-        format!("- {}: {}", m.name, m.description),
-        call_line,
-    ];
+    let mut lines = vec![format!("- {}: {}", m.name, m.description), call_line];
 
     if let Some(out) = &m.call.output_schema {
         lines.push(format!("  output: {}", out));

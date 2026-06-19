@@ -9,23 +9,23 @@ use std::path::Path;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct SkillManifest {
-    pub name:         String,
-    pub version:      String,
-    pub description:  String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
     /// Substring triggers used by the agent prompt builder to decide whether
     /// to show this skill's full call/output schema. Empty = always shown in full.
     #[serde(default)]
-    pub triggers:     Vec<String>,
+    pub triggers: Vec<String>,
     #[serde(default)]
-    pub display:      DisplayConfig,
+    pub display: DisplayConfig,
     #[serde(default)]
     pub capabilities: Capabilities,
     #[serde(default)]
-    pub call:         CallConfig,
+    pub call: CallConfig,
     #[serde(default)]
-    pub react:        ReactConfig,
+    pub react: ReactConfig,
     #[serde(default)]
-    pub config:       HashMap<String, ConfigEntry>,
+    pub config: HashMap<String, ConfigEntry>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -40,13 +40,13 @@ pub struct Capabilities {
     #[serde(default)]
     pub http: bool,
     #[serde(default)]
-    pub fs:   bool,
+    pub fs: bool,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
 pub struct CallConfig {
     /// JSON shape the LLM should pass as args — shown verbatim in prompt
-    pub args_schema:   Option<String>,
+    pub args_schema: Option<String>,
     /// JSON shape the skill returns — so LLM can reason about observations
     pub output_schema: Option<String>,
 }
@@ -57,7 +57,7 @@ pub struct ReactConfig {
     pub max_steps: Option<usize>,
     /// If true, skill output is the final answer — skip LLM synthesis pass
     #[serde(default)]
-    pub terminal:  bool,
+    pub terminal: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -17,13 +17,14 @@ pub struct AppConfig {
 pub const CONFIG: AppConfig = AppConfig {
     use_provider: Provider::Ollama,
     openrouter_url: "https://openrouter.ai/api/v1/chat/completions",
-    ollama_url: "http://localhost:11434/v1/chat/completions",
+    ollama_url: "http://0.0.0.0:8000/v1/chat/completions",//"http://localhost:11434/v1/chat/completions",
     openrouter_model: "google/gemma-4-26b-a4b-it:free",
-    ollama_model: "qwen3.5:9b",
+    ollama_model: "gemma-4-31b-it",
 };
 
 /// Loaded once at startup from db + skill manifests, lives in memory for the
 /// process lifetime. Never hits db again after init.
+#[derive(Clone)]
 pub struct RuntimeConfig {
     /// Backward-compat convenience accessors
     pub searxng_url: String,

@@ -2,7 +2,7 @@ name        = "read.fs"
 version     = "0.1.0"
 description = "Read the contents of a text file from the local filesystem"
 
-triggers = ["read my file", "open this file", "read the file", "show me the contents of", "what's in this file", "read my notes", "cat "]
+triggers = ["fs"]
 
 [display]
 action = "Reading {path}"
@@ -16,3 +16,19 @@ output_schema = '{"path":"string","text":"string","chars":"number","truncated":"
 
 [react]
 max_steps = 3
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

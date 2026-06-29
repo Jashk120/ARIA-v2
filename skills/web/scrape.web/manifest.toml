@@ -1,7 +1,7 @@
 name        = "scrape.web"
 version     = "0.1.0"
 description = "Fetch and extract text content from a URL"
-triggers = ["read this url", "scrape", "fetch this page", "open this link", "summarize this page", "what's on this page", "http://", "https://"]
+triggers = ["web"]
 
 [display]
 action = "Reading {url}"

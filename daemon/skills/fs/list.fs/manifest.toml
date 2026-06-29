@@ -2,7 +2,7 @@ name        = "list.fs"
 version     = "0.1.0"
 description = "List files and directories inside a given directory"
 
-triggers = ["list files", "what's in this folder", "what's in this directory", "show me the files in", "ls "]
+triggers = ["fs"]
 
 [display]
 action = "Listing {path}"
@@ -16,3 +16,19 @@ output_schema = '{"path":"string","entries":[{"name":"string","is_dir":"bool","s
 
 [react]
 max_steps = 3
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

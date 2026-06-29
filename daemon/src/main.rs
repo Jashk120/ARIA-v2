@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -9,20 +10,26 @@ mod agent;
 mod config;
 mod crypto;
 mod db;
-mod repl;
 mod skills;
 
 use crate::config::RuntimeConfig;
 use crate::db::Db;
+use crate::skills::SkillManager;
+
+#[derive(serde::Deserialize)]
+struct DaemonRequest {
+    task: String,
+    #[serde(rename = "Type")]
+    skills_type: Option<String>,
+}
 
 fn print_help() {
-    println!("ARIA — Governed Agent Runtime v0.5");
+    println!("ARIA — Governed Agent Runtime v0.6");
     println!();
     println!("Usage: aria [COMMAND]");
     println!();
     println!("Commands:");
-    println!("  (none)    Start interactive chat REPL");
-    println!("  daemon    Run headless in background (for systemd)");
+    println!("  daemon    Run headless TCP service (default)");
     println!("  install   Install systemd user service for auto-start");
     println!("  help      Show this help");
     println!();
@@ -115,18 +122,127 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    let _db = bootstrap_db()?;
-    info!("ARIA Daemon running headless...");
+    let db = std::sync::Arc::new(bootstrap_db()?);
+    let api_key = prompt_api_key(&db)?;
+    let runtime_cfg = RuntimeConfig::load(&db);
+    let skills = std::sync::Arc::new(SkillManager::new()?);
 
-    tokio::select! {
-        _ = async {
-            loop {
-                info!("Daemon heartbeat: waiting for triggers...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:5005").await?;
+    info!("ARIA Daemon listening on 127.0.0.1:5005");
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (mut socket, addr) = result?;
+                info!("New connection from {}", addr);
+
+                let api_key = api_key.clone();
+                let runtime_cfg = runtime_cfg.clone();
+                let skills = skills.clone();
+
+                tokio::spawn(async move {
+                    let db = match Db::new() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let _ = socket.write_all(format!("DB Connect Error: {}\n", e).as_bytes()).await;
+                            return;
+                        }
+                    };
+                    let mut buffer = [0u8; 4096];
+                    let n = match socket.read(&mut buffer).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+
+                    let req: DaemonRequest = match serde_json::from_slice(&buffer[..n]) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = socket.write_all(format!("Invalid JSON: {}\n", e).as_bytes()).await;
+                            return;
+                        }
+                    };
+
+                    info!("Received task: {}", req.task);
+
+                    // Create task in db
+                    let task_id: String = match db.create_task("did:aria:jayesh", "tcp", &req.task) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            let _ = socket.write_all(format!("DB Error: {}\n", e).as_bytes()).await;
+                            return;
+                        }
+                    };
+
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+                    let history = vec![serde_json::json!({ "role": "user", "content": req.task.clone() })];
+
+                    tokio::spawn(async move {
+                        crate::agent::react_loop::run_react_loop(
+                            api_key,
+                            history,
+                            runtime_cfg.injected_config,
+                            skills,
+                            tx,
+                            req.task,
+                            req.skills_type,
+                        ).await;
+                    });
+
+                    let mut last_action: Option<(String, serde_json::Value)> = None;
+
+                    while let Some(event) = rx.recv().await {
+                        // Log actions and observations to the task chain
+                        match &event {
+                            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+                                last_action = Some((skill.clone(), args.clone()));
+                            }
+                            crate::agent::react_loop::AgentEvent::Observation { content } => {
+                                if let Some((skill, args)) = last_action.take() {
+                                    if let Ok(db) = Db::new() {
+                                        let _ = db.log_task_step(
+                                            &task_id,
+                                            "did:aria:jayesh",
+                                            &skill,
+                                            &args.to_string(),
+                                            content,
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::agent::react_loop::AgentEvent::Error { content } => {
+                                if let Some((skill, args)) = last_action.take() {
+                                    if let Ok(db) = Db::new() {
+                                        let _ = db.log_task_step(
+                                            &task_id,
+                                            "did:aria:jayesh",
+                                            &skill,
+                                            &args.to_string(),
+                                            content,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    // Seal task
+                    if let Ok(db) = Db::new() {
+                        let _ = db.seal_task(&task_id, crate::db::TaskStatus::Done);
+                    }
+                });
             }
-        } => {},
-        _ = signal::ctrl_c() => {
-            info!("Shutdown signal received. Closing ARIA Daemon...");
+            _ = signal::ctrl_c() => {
+                info!("Shutdown signal received. Closing ARIA Daemon...");
+                break;
+            }
         }
     }
     Ok(())
@@ -135,7 +251,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let command = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
 
     match command {
         "install" => return install_service(),
@@ -150,12 +266,12 @@ async fn main() -> anyhow::Result<()> {
             print_help();
             return Ok(());
         }
-        _ => {}
+        _ => {
+            tracing_subscriber::registry()
+                .with(fmt::layer())
+                .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+                .init();
+            return run_daemon().await;
+        }
     }
-
-    let db = bootstrap_db()?;
-    let api_key = prompt_api_key(&db)?;
-    let runtime_cfg = RuntimeConfig::load(&db);
-    let skills = std::sync::Arc::new(crate::skills::SkillManager::new()?);
-    repl::run(&db, &api_key, runtime_cfg, skills).await
 }

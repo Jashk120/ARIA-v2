@@ -19,20 +19,36 @@ pub const MAX_REACT_STEPS: usize = 8;
 
 // ── Agent event / response types ──────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum AgentEvent {
-    Thought(String),
+    Thought {
+        content: String,
+    },
     Action {
         skill: String,
         args: serde_json::Value,
     },
-    Observation(String),
-    Ask(String),
+    Observation {
+        content: String,
+    },
+    Ask {
+        content: String,
+    },
     /// Streamed token — print immediately, no newline
-    Token(String),
+    Token {
+        content: String,
+    },
     /// Full assembled text after streaming completes (Chat or Final)
-    Final(String),
-    Chat(String),
-    Error(String),
+    Final {
+        content: String,
+    },
+    Chat {
+        content: String,
+    },
+    Error {
+        content: String,
+    },
     Done,
 }
 
@@ -56,8 +72,10 @@ pub async fn run_react_loop(
     skills: std::sync::Arc<crate::skills::SkillManager>,
     tx: mpsc::Sender<AgentEvent>,
     user_prompt: String,
+    skills_type: Option<String>,
 ) {
-    let sys_prompt = system_prompt(&user_prompt);
+    let sys_prompt = system_prompt(&user_prompt, skills_type);
+    tracing::info!("System Prompt sent to LLM: \n{}", sys_prompt);
     let mut skill_fire_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
@@ -68,13 +86,15 @@ pub async fn run_react_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = tx
-                    .send(AgentEvent::Error(format!("LLM error: {}", e)))
+                    .send(AgentEvent::Error { content: format!("LLM error: {}", e) })
                     .await;
                 let _ = tx.send(AgentEvent::Done).await;
                 return;
             }
         };
-
+ 
+        tracing::info!("LLM Raw Response: '{}'", raw);
+ 
         let parsed = parse_agent_responses(&raw);
 
         if parsed.is_empty() {
@@ -93,11 +113,11 @@ pub async fn run_react_loop(
         for kind in parsed {
             match kind {
                 AgentResponseKind::Chat(content) => {
-                    let _ = tx.send(AgentEvent::Chat(content)).await;
+                    let _ = tx.send(AgentEvent::Chat { content }).await;
                     should_continue = false;
                 }
                 AgentResponseKind::Thought(thought) => {
-                    let _ = tx.send(AgentEvent::Thought(thought)).await;
+                    let _ = tx.send(AgentEvent::Thought { content: thought }).await;
                 }
                 AgentResponseKind::Action { skill, args } => {
                     let react_meta = load_react_meta(&skill);
@@ -105,10 +125,12 @@ pub async fn run_react_loop(
                         let count = skill_fire_counts.entry(skill.clone()).or_insert(0);
                         if *count >= max {
                             let _ = tx
-                                .send(AgentEvent::Error(format!(
-                                    "Skill '{}' exceeded its max_steps limit of {}",
-                                    skill, max
-                                )))
+                                .send(AgentEvent::Error {
+                                    content: format!(
+                                        "Skill '{}' exceeded its max_steps limit of {}",
+                                        skill, max
+                                    ),
+                                })
                                 .await;
                             should_continue = false;
                             break;
@@ -137,10 +159,10 @@ pub async fn run_react_loop(
                             Ok(val) => (val.to_string(), false),
                             Err(e) => (e.to_string(), true),
                         };
-                    let _ = tx.send(AgentEvent::Observation(observation.clone())).await;
+                    let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
 
                     if react_meta.terminal && !is_error {
-                        let _ = tx.send(AgentEvent::Final(observation)).await;
+                        let _ = tx.send(AgentEvent::Final { content: observation }).await;
                         should_continue = false;
                         break;
                     }
@@ -157,11 +179,11 @@ pub async fn run_react_loop(
                     }));
                 }
                 AgentResponseKind::Ask(question) => {
-                    let _ = tx.send(AgentEvent::Ask(question)).await;
+                    let _ = tx.send(AgentEvent::Ask { content: question }).await;
                     should_continue = false;
                 }
                 AgentResponseKind::Final(answer) => {
-                    let _ = tx.send(AgentEvent::Final(answer)).await;
+                    let _ = tx.send(AgentEvent::Final { content: answer }).await;
                     should_continue = false;
                 }
             }
@@ -174,9 +196,9 @@ pub async fn run_react_loop(
     }
 
     let _ = tx
-        .send(AgentEvent::Error(
-            "Max steps reached without a final answer.".into(),
-        ))
+        .send(AgentEvent::Error {
+            content: "Max steps reached without a final answer.".into(),
+        })
         .await;
     let _ = tx.send(AgentEvent::Done).await;
 }
@@ -288,7 +310,9 @@ async fn call_llm_streaming(
         crate::config::Provider::OpenRouter => (CONFIG.openrouter_url, CONFIG.openrouter_model, "OpenRouter"),
         crate::config::Provider::Ollama => (CONFIG.ollama_url, CONFIG.ollama_model, "Ollama"),
     };
-
+ 
+    tracing::info!("LLM Call: provider={}, model={}, url={}", provider_name, model, url);
+ 
     let body = json!({
         "model": model,
         "messages": messages,
@@ -302,7 +326,9 @@ async fn call_llm_streaming(
         .json(&body)
         .send()
         .await?;
-
+ 
+    tracing::info!("LLM Response Status: {}", resp.status());
+ 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -330,11 +356,15 @@ async fn call_llm_streaming(
                 if let Some(token) = v["choices"][0]["delta"]["content"].as_str() {
                     full_content.push_str(token);
                     // Send token — receiver decides whether to print it
-                    let _ = tx.send(AgentEvent::Token(token.to_string())).await;
+                    let _ = tx.send(AgentEvent::Token { content: token.to_string() }).await;
                 }
             }
         }
     }
 
+    if full_content.is_empty() {
+        tracing::warn!("LLM returned a successful response but NO tokens were found in the stream.");
+    }
+ 
     Ok(full_content)
 }

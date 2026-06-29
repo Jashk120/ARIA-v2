@@ -10,18 +10,23 @@ use crate::skills::paths::get_daemon_root;
 
 // ── Trigger matching ──────────────────────────────────────────────────────────
 
-pub fn prompt_matches_triggers(prompt: &str, triggers: &[String]) -> bool {
+pub fn prompt_matches_triggers(prompt: &str, triggers: &[String], skills_type: &Option<String>) -> bool {
     if triggers.is_empty() {
         return true;
     }
-    let lower = prompt.to_lowercase();
-    triggers.iter().any(|t| lower.contains(&t.to_lowercase()))
+    let lower_prompt = prompt.to_lowercase();
+    let lower_type = skills_type.clone().unwrap_or_default().to_lowercase();
+    
+    triggers.iter().any(|t| {
+        let t_lower = t.to_lowercase();
+        lower_prompt.contains(&t_lower) || lower_type.contains(&t_lower)
+    })
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-pub fn system_prompt(user_prompt: &str) -> String {
-    let skills = build_skills_prompt(user_prompt);
+pub fn system_prompt(user_prompt: &str, skills_type: Option<String>) -> String {
+    let skills = build_skills_prompt(user_prompt, &skills_type);
     format!(
         r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
 
@@ -89,13 +94,13 @@ pub fn load_all_skills() -> Vec<SkillManifest> {
     skills
 }
 
-fn build_skills_prompt(user_prompt: &str) -> String {
+fn build_skills_prompt(user_prompt: &str, skills_type: &Option<String>) -> String {
     let all_skills = load_all_skills();
-
+ 
     let lines: Vec<String> = all_skills
         .iter()
         .map(|m| {
-            if prompt_matches_triggers(user_prompt, &m.triggers) {
+            if prompt_matches_triggers(user_prompt, &m.triggers, skills_type) {
                 format_skill_block(m)
             } else {
                 format!("- {}: {}", m.name, m.description)

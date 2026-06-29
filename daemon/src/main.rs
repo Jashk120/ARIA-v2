@@ -1,19 +1,23 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod agent;
 mod config;
 mod crypto;
 mod db;
+mod identity;
 mod skills;
 
 use crate::config::RuntimeConfig;
 use crate::db::Db;
+use crate::identity::IdentityVault;
+use crate::identity::file::FileVault;
 use crate::skills::SkillManager;
 
 #[derive(serde::Deserialize)]
@@ -46,13 +50,11 @@ fn install_service() -> anyhow::Result<()> {
     match os {
         "linux" => {
             let exe_path = env::current_exe()?;
-            let user_home =
-                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            let user_home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
             let systemd_dir = user_home.join(".config/systemd/user");
             fs::create_dir_all(&systemd_dir)?;
 
-            let service_content = format!(
-                r#"[Unit]
+            let service_content = format!(r#"[Unit]
 Description=ARIA Governed Agent Daemon
 After=network.target
 
@@ -63,9 +65,7 @@ Environment=RUST_LOG=info
 
 [Install]
 WantedBy=default.target
-"#,
-                exe_path.display()
-            );
+"#, exe_path.display());
 
             let service_path = systemd_dir.join("aria-daemon.service");
             fs::write(&service_path, service_content)?;
@@ -74,33 +74,23 @@ WantedBy=default.target
             println!("  Run this to enable and start:");
             println!("  systemctl --user enable --now aria-daemon");
         }
-        "windows" => {
-            println!("Windows auto-start not yet implemented.");
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported OS for auto-start installation"
-            ));
-        }
+        "windows" => { println!("Windows auto-start not yet implemented."); }
+        _ => { return Err(anyhow::anyhow!("Unsupported OS for auto-start installation")); }
     }
     Ok(())
 }
 
 fn bootstrap_db() -> anyhow::Result<Db> {
     let db = Db::new()?;
-    // Phase 2: generate real Ed25519 keypair on first run (no-op if already exists)
+    // Generate identity if missing
     db.ensure_identity("did:aria:jayesh")?;
     Ok(db)
 }
 
 fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
     if crate::config::CONFIG.use_provider == crate::config::Provider::Ollama {
-        return Ok(db
-            .get_config("openrouter_api_key")
-            .unwrap_or_default()
-            .unwrap_or_default());
+        return Ok(db.get_config("openrouter_api_key").unwrap_or_default().unwrap_or_default());
     }
-
     match db.get_config("openrouter_api_key") {
         Ok(Some(key)) => Ok(key),
         Ok(None) => {
@@ -110,9 +100,7 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
             let mut api_key = String::new();
             io::stdin().read_line(&mut api_key)?;
             let api_key = api_key.trim().to_string();
-            if api_key.is_empty() {
-                anyhow::bail!("API key cannot be empty");
-            }
+            if api_key.is_empty() { anyhow::bail!("API key cannot be empty"); }
             db.set_config("openrouter_api_key", &api_key)?;
             println!("✓ API key saved.");
             Ok(api_key)
@@ -122,10 +110,15 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    let db = std::sync::Arc::new(bootstrap_db()?);
+    let db = Arc::new(bootstrap_db()?);
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
-    let skills = std::sync::Arc::new(SkillManager::new()?);
+    let skills = Arc::new(SkillManager::new()?);
+
+    // Initialize HAL Vault with auto-probing
+    let (did, pub_key) = db.get_identity()?.ok_or_else(|| anyhow::anyhow!("Identity missing from DB"))?;
+    let (vault, level) = crate::identity::initialize_vault(did, pub_key).await?;
+    info!("Identity HAL initialized (Mode: {:?})", level);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:5005").await?;
     info!("ARIA Daemon listening on 127.0.0.1:5005");
@@ -139,15 +132,9 @@ async fn run_daemon() -> anyhow::Result<()> {
                 let api_key = api_key.clone();
                 let runtime_cfg = runtime_cfg.clone();
                 let skills = skills.clone();
+                let vault = vault.clone();
 
                 tokio::spawn(async move {
-                    let db = match Db::new() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = socket.write_all(format!("DB Connect Error: {}\n", e).as_bytes()).await;
-                            return;
-                        }
-                    };
                     let mut buffer = [0u8; 4096];
                     let n = match socket.read(&mut buffer).await {
                         Ok(n) if n > 0 => n,
@@ -164,8 +151,22 @@ async fn run_daemon() -> anyhow::Result<()> {
 
                     info!("Received task: {}", req.task);
 
-                    // Create task in db
-                    let task_id: String = match db.create_task("did:aria:jayesh", "tcp", &req.task) {
+                    let db = match Db::new() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let _ = socket.write_all(format!("DB Connect Error: {}\n", e).as_bytes()).await;
+                            return;
+                        }
+                    };
+
+                    // Sign the global task chain link via Vault HAL
+                    let (link_hash, _) = match db.get_task_link_info("temp_id", &req.task) {
+                        Ok(info) => info,
+                        Err(_) => ("".to_string(), "".to_string()),
+                    };
+                    let task_chain_sig = vault.sign(link_hash.as_bytes()).await.unwrap_or_default();
+
+                    let task_id: String = match db.create_task(&vault.did(), "tcp", &req.task, &task_chain_sig) {
                         Ok(id) => id,
                         Err(e) => {
                             let _ = socket.write_all(format!("DB Error: {}\n", e).as_bytes()).await;
@@ -178,49 +179,33 @@ async fn run_daemon() -> anyhow::Result<()> {
 
                     tokio::spawn(async move {
                         crate::agent::react_loop::run_react_loop(
-                            api_key,
-                            history,
-                            runtime_cfg.injected_config,
-                            skills,
-                            tx,
-                            req.task,
-                            req.skills_type,
+                            api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
                         ).await;
                     });
 
                     let mut last_action: Option<(String, serde_json::Value)> = None;
 
                     while let Some(event) = rx.recv().await {
-                        // Log actions and observations to the task chain
                         match &event {
                             crate::agent::react_loop::AgentEvent::Action { skill, args } => {
                                 last_action = Some((skill.clone(), args.clone()));
                             }
-                            crate::agent::react_loop::AgentEvent::Observation { content } => {
-                                if let Some((skill, args)) = last_action.take() {
-                                    if let Ok(db) = Db::new() {
-                                        let _ = db.log_task_step(
-                                            &task_id,
-                                            "did:aria:jayesh",
-                                            &skill,
-                                            &args.to_string(),
-                                            content,
-                                            true,
-                                        );
-                                    }
-                                }
-                            }
+                            crate::agent::react_loop::AgentEvent::Observation { content } |
                             crate::agent::react_loop::AgentEvent::Error { content } => {
+                                let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
                                 if let Some((skill, args)) = last_action.take() {
-                                    if let Ok(db) = Db::new() {
-                                        let _ = db.log_task_step(
-                                            &task_id,
-                                            "did:aria:jayesh",
-                                            &skill,
-                                            &args.to_string(),
-                                            content,
-                                            false,
-                                        );
+                                    // Compute and sign audit entry via Vault HAL
+                                    if let Ok((step, prev_hash, timestamp)) = db.get_next_step_info(&task_id) {
+                                        let input_hash = crypto::sha256_hex_str(&args.to_string());
+                                        let result_hash = crypto::sha256_hex_str(content);
+                                        let chain_hash = crypto::compute_chain_hash(&prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp);
+                                        
+                                        match vault.sign(chain_hash.as_bytes()).await {
+                                            Ok(sig) => {
+                                                let _ = db.log_task_step(&task_id, &vault.did(), &skill, &args.to_string(), content, success, &sig);
+                                            },
+                                            Err(e) => warn!("HAL Signing failed: {}", e),
+                                        }
                                     }
                                 }
                             }
@@ -228,15 +213,10 @@ async fn run_daemon() -> anyhow::Result<()> {
                         }
 
                         let json = serde_json::to_string(&event).unwrap_or_default();
-                        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
-                            break;
-                        }
+                        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() { break; }
                     }
 
-                    // Seal task
-                    if let Ok(db) = Db::new() {
-                        let _ = db.seal_task(&task_id, crate::db::TaskStatus::Done);
-                    }
+                    let _ = db.seal_task(&task_id, crate::db::TaskStatus::Done);
                 });
             }
             _ = signal::ctrl_c() => {
@@ -256,22 +236,29 @@ async fn main() -> anyhow::Result<()> {
     match command {
         "install" => return install_service(),
         "daemon" => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let log_dir = home.join(".aria");
+            std::fs::create_dir_all(&log_dir).ok();
+
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "daemon.log");
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
             tracing_subscriber::registry()
                 .with(fmt::layer())
+                .with(fmt::layer().with_writer(non_blocking))
                 .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
                 .init();
+
+            info!("Logging initialized. Logs saved to: {:?}", log_dir.join("daemon.log"));
             return run_daemon().await;
         }
-        "help" | "--help" | "-h" => {
-            print_help();
-            return Ok(());
-        }
+        "help" | "--help" | "-h" => { print_help(); Ok(()) }
         _ => {
             tracing_subscriber::registry()
                 .with(fmt::layer())
                 .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
                 .init();
-            return run_daemon().await;
+            run_daemon().await
         }
     }
 }

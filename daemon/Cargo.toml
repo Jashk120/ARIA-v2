@@ -29,7 +29,7 @@ wasmtime-wasi = { version = "45.0.1" }
 wasmtime = { version = "45.0.1", features = ["async"] }
 
 # SQLite
-sqlite = "0.37"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -57,10 +57,12 @@ hex = "0.4"
 # Error handling
 anyhow = "1"
 thiserror = "1"
+async-trait = "0.1"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # PDF extraction (for read_pdf host function)
 pdf-extract = "0.7"

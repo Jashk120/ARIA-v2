@@ -136,15 +136,21 @@ pub fn decrypt_key_bytes(hex_blob: &str, aes_key: &[u8; 32]) -> anyhow::Result<Z
 
 // ── Identity ──────────────────────────────────────────────────────────────────
 
+fn identity_key_path() -> anyhow::Result<PathBuf> {
+    let mut p = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+    p.push(".aria");
+    p.push("id.key");
+    Ok(p)
+}
+
 pub struct Identity {
     pub did: String,
     /// Multibase base58btc encoded (starts with 'z')
     pub public_key_multibase: String,
-    /// Hex-encoded AES-GCM encrypted Ed25519 signing key bytes
-    pub encrypted_private_key_hex: String,
 }
 
-/// Generate a fresh Ed25519 keypair, encrypt the private key, return an `Identity`.
+/// Generate a fresh Ed25519 keypair, encrypt the private key, and save it to `~/.aria/id.key`.
+/// Returns the public parts as an `Identity`.
 /// `did` — the full DID string, e.g. "did:aria:jayesh"
 pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
     let device_secret = load_or_create_device_secret()?;
@@ -156,21 +162,34 @@ pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
     let pub_multibase = multibase_encode(verifying_key.as_bytes());
     let priv_hex = encrypt_key_bytes(signing_key.as_bytes(), &aes_key)?;
 
+    // Persist private key to separate file with 0600 permissions
+    let path = identity_key_path()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&path, &priv_hex)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    fs::write(&path, &priv_hex)?;
+
     Ok(Identity {
         did: did.to_string(),
         public_key_multibase: pub_multibase,
-        encrypted_private_key_hex: priv_hex,
     })
 }
 
-/// Load the signing key from the DB-stored encrypted blob.
-pub fn load_signing_key(
-    did: &str,
-    encrypted_private_key_hex: &str,
-) -> anyhow::Result<SigningKey> {
+/// Load the signing key from the `~/.aria/id.key` file.
+pub fn load_signing_key(did: &str) -> anyhow::Result<SigningKey> {
+    let path = identity_key_path()?;
+    if !path.exists() {
+        anyhow::bail!("Identity key file not found at {:?}", path);
+    }
+    let encrypted_hex = fs::read_to_string(path).context("reading id.key")?;
+
     let device_secret = load_or_create_device_secret()?;
     let aes_key = derive_aes_key(&device_secret, did.as_bytes())?;
-    let raw = decrypt_key_bytes(encrypted_private_key_hex, &aes_key)?;
+    let raw = decrypt_key_bytes(encrypted_hex.trim(), &aes_key)?;
     if raw.len() != 32 {
         anyhow::bail!("decrypted signing key has wrong length: {}", raw.len());
     }

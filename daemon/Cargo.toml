@@ -28,7 +28,6 @@ tokio = { version = "1", features = ["full"] }
 wasmtime-wasi = { version = "45.0.1" }
 wasmtime = { version = "45.0.1", features = ["async"] }
 
-
 # SQLite
 sqlite = "0.37"
 
@@ -65,6 +64,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # PDF extraction (for read_pdf host function)
 pdf-extract = "0.7"
+
+# Crypto layer (Phase 2)
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+aes-gcm = "0.10"
+rand = "0.8"
+argon2 = "0.5"
+bs58 = "0.5"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

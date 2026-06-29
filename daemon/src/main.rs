@@ -7,6 +7,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod agent;
 mod config;
+mod crypto;
 mod db;
 mod repl;
 mod skills;
@@ -80,7 +81,8 @@ WantedBy=default.target
 
 fn bootstrap_db() -> anyhow::Result<Db> {
     let db = Db::new()?;
-    db.ensure_stub_identity()?;
+    // Phase 2: generate real Ed25519 keypair on first run (no-op if already exists)
+    db.ensure_identity("did:aria:jayesh")?;
     Ok(db)
 }
 

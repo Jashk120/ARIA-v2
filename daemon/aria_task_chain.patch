@@ -1,0 +1,1312 @@
+diff --git a/src/db.rs b/src/db.rs
+index 9304b1f..fb261f3 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -2,12 +2,111 @@ use sqlite::{Connection, State};
+ use std::fs;
+ use tracing::info;
+ 
+-static SCHEMA: &str = include_str!("../../db/db.sql");
++use crate::crypto;
++
++// ── Schema ────────────────────────────────────────────────────────────────────
++//
++// tasks      — one row per agentic task received from a client (MCP, webhook, etc.)
++// audit_log  — one row per skill invocation, chained within its task
++// tasks_chain— lightweight global chain over the tasks table itself, so deleted
++//              tasks are detectable even though per-task chains are isolated
++// identity   — one row: this daemon's Ed25519 DID
++// skills     — installed WASM skill binaries
++// config     — key/value store for runtime config (api keys etc.)
++// cached_manifests — Phase 3: remote DID manifest cache
++
++static SCHEMA: &str = "
++-- Core identity. One row per daemon instance.
++CREATE TABLE IF NOT EXISTS identity (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    did             TEXT UNIQUE NOT NULL,
++    public_key      TEXT NOT NULL,          -- multibase base58btc Ed25519 verifying key
++    private_key     TEXT NOT NULL,          -- AES-256-GCM encrypted at rest
++    manifest_path   TEXT NOT NULL,
++    vc              TEXT,                   -- NULL Phase 2, signed VC JSON Phase 3
++    created_at      TEXT DEFAULT CURRENT_TIMESTAMP
++);
++
++-- One row per agentic task. Sealed on completion with the final audit chain hash.
++CREATE TABLE IF NOT EXISTS tasks (
++    task_id         TEXT PRIMARY KEY,       -- UUIDv4
++    agent_did       TEXT NOT NULL,
++    source          TEXT NOT NULL,          -- 'mcp' | 'cli' | 'webhook'
++    prompt_hash     TEXT NOT NULL,          -- SHA-256 of the raw prompt (plaintext never stored)
++    status          TEXT NOT NULL DEFAULT 'running', -- 'running' | 'done' | 'failed'
++    step_count      INTEGER NOT NULL DEFAULT 0,
++    final_hash      TEXT,                   -- chain_hash of last audit entry; NULL until sealed
++    task_chain_prev TEXT,                   -- hash of previous tasks row (global task chain)
++    task_chain_sig  TEXT,                   -- Ed25519 signature over task_chain_prev
++    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
++    sealed_at       TEXT
++);
++
++-- One row per skill invocation. Chained within task_id only.
++CREATE TABLE IF NOT EXISTS audit_log (
++    id              INTEGER PRIMARY KEY AUTOINCREMENT,
++    task_id         TEXT NOT NULL REFERENCES tasks(task_id),
++    agent_did       TEXT NOT NULL,
++    step            INTEGER NOT NULL,       -- 1-based step index within this task
++    skill_called    TEXT NOT NULL,
++    input_hash      TEXT NOT NULL,          -- SHA-256 of skill args JSON
++    result_hash     TEXT NOT NULL,          -- SHA-256 of skill output JSON
++    success         INTEGER NOT NULL DEFAULT 1,
++    prev_hash       TEXT NOT NULL,          -- chain_hash of previous step (empty string = genesis)
++    chain_hash      TEXT NOT NULL,          -- SHA-256(prev_hash|step|skill|input_hash|result_hash|timestamp)
++    signature       TEXT NOT NULL,          -- Ed25519(signing_key, chain_hash)
++    timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
++);
++
++-- Installed WASM skills.
++CREATE TABLE IF NOT EXISTS skills (
++    name            TEXT PRIMARY KEY,       -- 'search.web'
++    version         TEXT NOT NULL,
++    wasm_path       TEXT NOT NULL,
++    manifest        TEXT,
++    installed_at    TEXT DEFAULT CURRENT_TIMESTAMP
++);
++
++-- Runtime config (API keys, provider settings).
++CREATE TABLE IF NOT EXISTS config (
++    key             TEXT PRIMARY KEY,
++    value           TEXT NOT NULL
++);
++
++-- Phase 3: cached manifests from remote DIDs for verification.
++CREATE TABLE IF NOT EXISTS cached_manifests (
++    did             TEXT PRIMARY KEY,
++    manifest        TEXT NOT NULL,
++    verified        INTEGER DEFAULT 0,
++    cached_at       TEXT DEFAULT CURRENT_TIMESTAMP,
++    expires_at      TEXT
++);
++";
+ 
+ pub struct Db {
+     conn: Connection,
+ }
+ 
++// ── Task status ───────────────────────────────────────────────────────────────
++
++pub enum TaskStatus {
++    Running,
++    Done,
++    Failed,
++}
++
++impl TaskStatus {
++    fn as_str(&self) -> &'static str {
++        match self {
++            TaskStatus::Running => "running",
++            TaskStatus::Done    => "done",
++            TaskStatus::Failed  => "failed",
++        }
++    }
++}
++
++// ── Db impl ───────────────────────────────────────────────────────────────────
++
+ impl Db {
+     pub fn new() -> anyhow::Result<Self> {
+         let mut db_path =
+@@ -17,178 +116,481 @@ impl Db {
+         db_path.push("daemon.db");
+ 
+         let conn = sqlite::open(&db_path)?;
++        // Enable WAL for concurrent reads during long tasks
++        conn.execute("PRAGMA journal_mode=WAL;")?;
++        conn.execute("PRAGMA foreign_keys=ON;")?;
++
+         let db = Self { conn };
+-        if !db.has_table("identity")? {
+-            db.run_migration()?;
+-        }
+-        db.ensure_config_table()?;
+-        db.ensure_skills_table()?;
++        db.run_migration()?;
+         Ok(db)
+     }
+ 
++    fn run_migration(&self) -> anyhow::Result<()> {
++        self.conn.execute(SCHEMA)?;
++        Ok(())
++    }
++
+     fn has_table(&self, name: &str) -> anyhow::Result<bool> {
+-        let mut statement = self
++        let mut stmt = self
+             .conn
+             .prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")?;
+-        statement.bind((1, name))?;
+-        if let State::Row = statement.next()? {
+-            let count: i64 = statement.read(0)?;
++        stmt.bind((1, name))?;
++        if let State::Row = stmt.next()? {
++            let count: i64 = stmt.read(0)?;
+             return Ok(count > 0);
+         }
+         Ok(false)
+     }
+ 
+-    fn run_migration(&self) -> anyhow::Result<()> {
+-        self.conn.execute(SCHEMA)?;
++    // ── Identity ──────────────────────────────────────────────────────────────
++
++    /// Generate and store a real Ed25519 identity on first run. No-op if one exists.
++    pub fn ensure_identity(&self, did: &str) -> anyhow::Result<()> {
++        let mut stmt = self.conn.prepare("SELECT count(*) FROM identity")?;
++        if let State::Row = stmt.next()? {
++            if stmt.read::<i64, _>(0)? > 0 {
++                return Ok(());
++            }
++        }
++
++        info!("No identity found — generating Ed25519 keypair for {}", did);
++        let identity = crypto::generate_identity(did)?;
++
++        let mut stmt = self.conn.prepare(
++            "INSERT INTO identity (did, public_key, private_key, manifest_path)
++             VALUES (?, ?, ?, ?)",
++        )?;
++        stmt.bind((1, identity.did.as_str()))?;
++        stmt.bind((2, identity.public_key_multibase.as_str()))?;
++        stmt.bind((3, identity.encrypted_private_key_hex.as_str()))?;
++        stmt.bind((4, "~/.aria/manifest.toml"))?;
++        stmt.next()?;
++
++        info!("Identity created — DID: {}", identity.did);
+         Ok(())
+     }
+ 
+-    fn ensure_config_table(&self) -> anyhow::Result<()> {
+-        if !self.has_table("config")? {
+-            self.conn.execute(
+-                "CREATE TABLE IF NOT EXISTS config (
+-                    key TEXT PRIMARY KEY,
+-                    value TEXT NOT NULL
+-                );",
+-            )?;
++    /// Returns (did, public_key_multibase, encrypted_private_key_hex).
++    pub fn get_identity(&self) -> anyhow::Result<Option<(String, String, String)>> {
++        let mut stmt = self
++            .conn
++            .prepare("SELECT did, public_key, private_key FROM identity LIMIT 1")?;
++        if let State::Row = stmt.next()? {
++            return Ok(Some((
++                stmt.read(0)?,
++                stmt.read(1)?,
++                stmt.read(2)?,
++            )));
+         }
++        Ok(None)
++    }
++
++    // ── Tasks ─────────────────────────────────────────────────────────────────
++
++    /// Open a new task. Returns the task_id (UUIDv4).
++    /// `prompt` — the raw prompt string; only its SHA-256 is stored.
++    /// `source` — "mcp" | "cli" | "webhook"
++    pub fn create_task(
++        &self,
++        agent_did: &str,
++        source: &str,
++        prompt: &str,
++    ) -> anyhow::Result<String> {
++        let task_id = new_uuid();
++        let prompt_hash = crypto::sha256_hex_str(prompt);
++        let now = now_iso8601();
++
++        // Global task chain: hash over the previous task's chain entry
++        let (task_chain_prev, task_chain_sig) =
++            self.compute_task_chain_link(agent_did, &task_id, &prompt_hash, &now)?;
++
++        let mut stmt = self.conn.prepare(
++            "INSERT INTO tasks
++               (task_id, agent_did, source, prompt_hash, status,
++                task_chain_prev, task_chain_sig, created_at)
++             VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
++        )?;
++        stmt.bind((1, task_id.as_str()))?;
++        stmt.bind((2, agent_did))?;
++        stmt.bind((3, source))?;
++        stmt.bind((4, prompt_hash.as_str()))?;
++        stmt.bind((5, task_chain_prev.as_str()))?;
++        stmt.bind((6, task_chain_sig.as_str()))?;
++        stmt.bind((7, now.as_str()))?;
++        stmt.next()?;
++
++        info!("Task created: {} (source={})", task_id, source);
++        Ok(task_id)
++    }
++
++    /// Seal a task on completion. Stores final_hash (last audit chain_hash) and status.
++    pub fn seal_task(
++        &self,
++        task_id: &str,
++        status: TaskStatus,
++    ) -> anyhow::Result<()> {
++        // Get the chain_hash of the last audit step for this task
++        let final_hash = self.get_last_step_hash(task_id)?;
++        let now = now_iso8601();
++
++        let mut stmt = self.conn.prepare(
++            "UPDATE tasks SET status=?, final_hash=?, sealed_at=?,
++             step_count=(SELECT count(*) FROM audit_log WHERE task_id=?)
++             WHERE task_id=?",
++        )?;
++        stmt.bind((1, status.as_str()))?;
++        stmt.bind((2, final_hash.as_str()))?;
++        stmt.bind((3, now.as_str()))?;
++        stmt.bind((4, task_id))?;
++        stmt.bind((5, task_id))?;
++        stmt.next()?;
++
++        info!("Task sealed: {} → {}", task_id, status.as_str());
+         Ok(())
+     }
+ 
+-    fn ensure_skills_table(&self) -> anyhow::Result<()> {
+-        if !self.has_table("skills")? {
+-            self.conn.execute(
+-                "CREATE TABLE IF NOT EXISTS skills (
+-                    name         TEXT PRIMARY KEY,
+-                    version      TEXT NOT NULL,
+-                    wasm_path    TEXT NOT NULL,
+-                    installed_at TEXT DEFAULT CURRENT_TIMESTAMP
+-                );",
+-            )?;
++    /// Returns (task_id, source, status, step_count, created_at, sealed_at) for recent tasks.
++    pub fn list_tasks(&self, limit: usize) -> anyhow::Result<Vec<(String, String, String, i64, String, String)>> {
++        let mut stmt = self.conn.prepare(
++            "SELECT task_id, source, status, step_count, created_at, COALESCE(sealed_at, '')
++             FROM tasks ORDER BY created_at DESC LIMIT ?",
++        )?;
++        stmt.bind((1, limit as i64))?;
++        let mut rows = Vec::new();
++        while let State::Row = stmt.next()? {
++            rows.push((
++                stmt.read(0)?,
++                stmt.read(1)?,
++                stmt.read(2)?,
++                stmt.read(3)?,
++                stmt.read(4)?,
++                stmt.read(5)?,
++            ));
+         }
++        Ok(rows)
++    }
++
++    // ── Audit Log ─────────────────────────────────────────────────────────────
++
++    /// Append a signed, hash-chained audit entry for a task step.
++    /// Chain is scoped to task_id — each task has its own genesis.
++    pub fn log_task_step(
++        &self,
++        task_id: &str,
++        agent_did: &str,
++        skill_called: &str,
++        input_json: &str,
++        result_json: &str,
++        success: bool,
++    ) -> anyhow::Result<()> {
++        let input_hash  = crypto::sha256_hex_str(input_json);
++        let result_hash = crypto::sha256_hex_str(result_json);
++        let timestamp   = now_iso8601();
++
++        // Step index within this task
++        let step = self.next_step_index(task_id)?;
++
++        // Per-task chain: prev_hash is the chain_hash of the previous step in THIS task
++        let prev_hash = self.get_last_step_hash(task_id)?;
++
++        let chain_hash = crypto::compute_chain_hash(
++            &prev_hash,
++            &step.to_string(),
++            skill_called,
++            &input_hash,
++            &result_hash,
++            &timestamp,
++        );
++
++        let signature = self.sign_for_agent(agent_did, &chain_hash)?;
++
++        let mut stmt = self.conn.prepare(
++            "INSERT INTO audit_log
++               (task_id, agent_did, step, skill_called,
++                input_hash, result_hash, success,
++                prev_hash, chain_hash, signature, timestamp)
++             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++        )?;
++        stmt.bind((1,  task_id))?;
++        stmt.bind((2,  agent_did))?;
++        stmt.bind((3,  step as i64))?;
++        stmt.bind((4,  skill_called))?;
++        stmt.bind((5,  input_hash.as_str()))?;
++        stmt.bind((6,  result_hash.as_str()))?;
++        stmt.bind((7,  success as i64))?;
++        stmt.bind((8,  prev_hash.as_str()))?;
++        stmt.bind((9,  chain_hash.as_str()))?;
++        stmt.bind((10, signature.as_str()))?;
++        stmt.bind((11, timestamp.as_str()))?;
++        stmt.next()?;
++
+         Ok(())
+     }
+ 
++    /// Verify the audit chain for a single task.
++    /// Returns Ok(step_count) or Err at the first broken link / bad signature.
++    pub fn verify_task_chain(&self, task_id: &str) -> anyhow::Result<usize> {
++        let pub_key = match self.get_identity()? {
++            Some((_, pub_key, _)) => pub_key,
++            None => anyhow::bail!("No identity found"),
++        };
++
++        // Also check the sealed final_hash matches the last audit row
++        let (expected_final, db_status) = self.get_task_seal(task_id)?;
++
++        let mut stmt = self.conn.prepare(
++            "SELECT step, skill_called, input_hash, result_hash,
++                    prev_hash, chain_hash, signature, timestamp
++             FROM audit_log WHERE task_id = ? ORDER BY step ASC",
++        )?;
++        stmt.bind((1, task_id))?;
++
++        let mut expected_prev = String::new();
++        let mut count = 0usize;
++        let mut last_chain_hash = String::new();
++
++        while let State::Row = stmt.next()? {
++            let step:        i64    = stmt.read(0)?;
++            let skill:       String = stmt.read(1)?;
++            let input_hash:  String = stmt.read(2)?;
++            let result_hash: String = stmt.read(3)?;
++            let prev_hash:   String = stmt.read(4)?;
++            let chain_hash:  String = stmt.read(5)?;
++            let signature:   String = stmt.read(6)?;
++            let timestamp:   String = stmt.read(7)?;
++
++            // 1. prev_hash must match previous step's chain_hash
++            if prev_hash != expected_prev {
++                anyhow::bail!(
++                    "Chain broken at step {} — prev_hash mismatch", step
++                );
++            }
++
++            // 2. Recompute chain_hash
++            let recomputed = crypto::compute_chain_hash(
++                &prev_hash,
++                &step.to_string(),
++                &skill,
++                &input_hash,
++                &result_hash,
++                &timestamp,
++            );
++            if recomputed != chain_hash {
++                anyhow::bail!(
++                    "Chain broken at step {} — chain_hash mismatch", step
++                );
++            }
++
++            // 3. Verify signature
++            crypto::verify_signature(&pub_key, chain_hash.as_bytes(), &signature)
++                .map_err(|e| anyhow::anyhow!("Bad signature at step {}: {}", step, e))?;
++
++            expected_prev   = chain_hash.clone();
++            last_chain_hash = chain_hash;
++            count += 1;
++        }
++
++        // 4. If task is sealed, final_hash must match last step's chain_hash
++        if db_status != "running" {
++            if let Some(fh) = expected_final {
++                if fh != last_chain_hash {
++                    anyhow::bail!(
++                        "Seal broken — tasks.final_hash does not match last audit step"
++                    );
++                }
++            }
++        }
++
++        Ok(count)
++    }
++
+     // ── Config ────────────────────────────────────────────────────────────────
+ 
+     pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
+-        let mut statement = self
+-            .conn
+-            .prepare("SELECT value FROM config WHERE key = ?")?;
+-        statement.bind((1, key))?;
+-        if let State::Row = statement.next()? {
+-            return Ok(Some(statement.read::<String, _>(0)?));
++        let mut stmt = self.conn.prepare("SELECT value FROM config WHERE key = ?")?;
++        stmt.bind((1, key))?;
++        if let State::Row = stmt.next()? {
++            return Ok(Some(stmt.read(0)?));
+         }
+         Ok(None)
+     }
+ 
+     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
+-        let mut statement = self
++        let mut stmt = self
+             .conn
+             .prepare("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)")?;
+-        statement.bind((1, key))?;
+-        statement.bind((2, value))?;
+-        statement.next()?;
++        stmt.bind((1, key))?;
++        stmt.bind((2, value))?;
++        stmt.next()?;
+         Ok(())
+     }
+ 
+     // ── Skills ────────────────────────────────────────────────────────────────
+ 
+     pub fn install_skill(&self, name: &str, version: &str, wasm_path: &str) -> anyhow::Result<()> {
+-        let mut statement = self
+-            .conn
+-            .prepare("INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)")?;
+-        statement.bind((1, name))?;
+-        statement.bind((2, version))?;
+-        statement.bind((3, wasm_path))?;
+-        statement.next()?;
++        let mut stmt = self.conn.prepare(
++            "INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)",
++        )?;
++        stmt.bind((1, name))?;
++        stmt.bind((2, version))?;
++        stmt.bind((3, wasm_path))?;
++        stmt.next()?;
+         Ok(())
+     }
+ 
+     pub fn get_skill(&self, name: &str) -> anyhow::Result<Option<String>> {
+-        let mut statement = self
+-            .conn
+-            .prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
+-        statement.bind((1, name))?;
+-        if let State::Row = statement.next()? {
+-            return Ok(Some(statement.read::<String, _>(0)?));
++        let mut stmt = self.conn.prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
++        stmt.bind((1, name))?;
++        if let State::Row = stmt.next()? {
++            return Ok(Some(stmt.read(0)?));
+         }
+         Ok(None)
+     }
+ 
+     pub fn list_skills(&self) -> anyhow::Result<Vec<(String, String)>> {
+-        let mut statement = self
+-            .conn
+-            .prepare("SELECT name, version FROM skills ORDER BY name")?;
++        let mut stmt = self.conn.prepare("SELECT name, version FROM skills ORDER BY name")?;
+         let mut skills = Vec::new();
+-        while let State::Row = statement.next()? {
+-            skills.push((
+-                statement.read::<String, _>(0)?,
+-                statement.read::<String, _>(1)?,
+-            ));
++        while let State::Row = stmt.next()? {
++            skills.push((stmt.read(0)?, stmt.read(1)?));
+         }
+         Ok(skills)
+     }
+ 
+     pub fn remove_skill(&self, name: &str) -> anyhow::Result<()> {
+-        let mut statement = self.conn.prepare("DELETE FROM skills WHERE name = ?")?;
+-        statement.bind((1, name))?;
+-        statement.next()?;
++        let mut stmt = self.conn.prepare("DELETE FROM skills WHERE name = ?")?;
++        stmt.bind((1, name))?;
++        stmt.next()?;
+         Ok(())
+     }
+ 
+-    // ── Identity ──────────────────────────────────────────────────────────────
++    // ── Private helpers ───────────────────────────────────────────────────────
+ 
+-    pub fn ensure_stub_identity(&self) -> anyhow::Result<()> {
+-        let mut statement = self.conn.prepare("SELECT count(*) FROM identity")?;
+-        if let State::Row = statement.next()? {
+-            let count: i64 = statement.read(0)?;
+-            if count == 0 {
+-                info!("No identity found. Creating stub identity for Phase 1...");
+-                self.conn.execute(
+-                    "INSERT INTO identity (did, public_key, private_key, manifest_path)
+-                     VALUES ('did:aria:jayesh', 'stub_pub', 'stub_priv', '~/.aria/manifest.json')",
+-                )?;
+-            }
++    /// Next 1-based step index for a task.
++    fn next_step_index(&self, task_id: &str) -> anyhow::Result<usize> {
++        let mut stmt = self
++            .conn
++            .prepare("SELECT count(*) FROM audit_log WHERE task_id = ?")?;
++        stmt.bind((1, task_id))?;
++        if let State::Row = stmt.next()? {
++            let n: i64 = stmt.read(0)?;
++            return Ok((n + 1) as usize);
+         }
+-        Ok(())
++        Ok(1)
+     }
+ 
+-    // ── Messages ──────────────────────────────────────────────────────────────
++    /// chain_hash of the last audit step for a task, or "" if no steps yet.
++    fn get_last_step_hash(&self, task_id: &str) -> anyhow::Result<String> {
++        let mut stmt = self.conn.prepare(
++            "SELECT chain_hash FROM audit_log WHERE task_id = ? ORDER BY step DESC LIMIT 1",
++        )?;
++        stmt.bind((1, task_id))?;
++        if let State::Row = stmt.next()? {
++            return Ok(stmt.read(0)?);
++        }
++        Ok(String::new())
++    }
+ 
+-    pub fn save_message(
+-        &self,
+-        agent_did: &str,
+-        direction: &str,
+-        content: &str,
+-    ) -> anyhow::Result<()> {
+-        let mut statement = self
++    /// (final_hash, status) for a task row.
++    fn get_task_seal(&self, task_id: &str) -> anyhow::Result<(Option<String>, String)> {
++        let mut stmt = self
+             .conn
+-            .prepare("INSERT INTO messages (agent_did, direction, content) VALUES (?, ?, ?)")?;
+-        statement.bind((1, agent_did))?;
+-        statement.bind((2, direction))?;
+-        statement.bind((3, content))?;
+-        statement.next()?;
+-        Ok(())
++            .prepare("SELECT final_hash, status FROM tasks WHERE task_id = ?")?;
++        stmt.bind((1, task_id))?;
++        if let State::Row = stmt.next()? {
++            let fh: Option<String> = stmt.read::<String, _>(0).ok().filter(|s| !s.is_empty());
++            let status: String = stmt.read(1)?;
++            return Ok((fh, status));
++        }
++        anyhow::bail!("Task not found: {}", task_id)
+     }
+ 
+-    pub fn get_history(
++    /// Sign `data` with this daemon's identity key. Returns hex signature.
++    fn sign_for_agent(&self, agent_did: &str, data: &str) -> anyhow::Result<String> {
++        match self.get_identity()? {
++            Some((did, _, enc_priv)) if did == agent_did => {
++                match crypto::load_signing_key(&did, &enc_priv) {
++                    Ok(key) => Ok(crypto::sign_bytes(&key, data.as_bytes())),
++                    Err(e) => {
++                        tracing::warn!("Could not load signing key: {}", e);
++                        Ok(String::new())
++                    }
++                }
++            }
++            _ => Ok(String::new()),
++        }
++    }
++
++    /// Compute the global task chain link for a new task row.
++    /// Returns (task_chain_prev_hash, task_chain_sig).
++    fn compute_task_chain_link(
+         &self,
+         agent_did: &str,
+-        limit: usize,
+-    ) -> anyhow::Result<Vec<(String, String)>> {
+-        let mut statement = self.conn.prepare(
+-            "SELECT direction, content FROM messages WHERE agent_did = ? ORDER BY timestamp DESC LIMIT ?"
+-        )?;
+-        statement.bind((1, agent_did))?;
+-        statement.bind((2, limit as i64))?;
+-
+-        let mut history = Vec::new();
+-        while let State::Row = statement.next()? {
+-            let direction: String = statement.read(0)?;
+-            let content: String = statement.read(1)?;
+-            history.push((direction, content));
+-        }
+-        Ok(history)
++        task_id: &str,
++        prompt_hash: &str,
++        created_at: &str,
++    ) -> anyhow::Result<(String, String)> {
++        // Get the previous task's chain hash to link against
++        let prev = {
++            let mut stmt = self.conn.prepare(
++                "SELECT task_chain_prev FROM tasks ORDER BY created_at DESC LIMIT 1",
++            )?;
++            if let State::Row = stmt.next()? {
++                stmt.read::<String, _>(0).unwrap_or_default()
++            } else {
++                String::new() // genesis
++            }
++        };
++
++        let link_hash = crypto::sha256_hex_str(
++            &format!("{}|{}|{}|{}", prev, task_id, prompt_hash, created_at)
++        );
++        let sig = self.sign_for_agent(agent_did, &link_hash)?;
++        Ok((link_hash, sig))
+     }
+ }
++
++// ── Helpers ───────────────────────────────────────────────────────────────────
++
++fn now_iso8601() -> String {
++    use std::time::{SystemTime, UNIX_EPOCH};
++    let secs = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs();
++    let sec  = secs % 60;
++    let min  = (secs / 60) % 60;
++    let hour = (secs / 3600) % 24;
++    let days = secs / 86400;
++    let z    = days + 719468;
++    let era  = z / 146097;
++    let doe  = z % 146097;
++    let yoe  = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++    let y    = yoe + era * 400;
++    let doy  = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp   = (5 * doy + 2) / 153;
++    let d    = doy - (153 * mp + 2) / 5 + 1;
++    let m    = if mp < 10 { mp + 3 } else { mp - 9 };
++    let y    = if m <= 2 { y + 1 } else { y };
++    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hour, min, sec)
++}
++
++/// Generate a UUIDv4 using rand (no uuid crate needed).
++fn new_uuid() -> String {
++    use rand::RngCore;
++    let mut b = [0u8; 16];
++    rand::rngs::OsRng.fill_bytes(&mut b);
++    b[6] = (b[6] & 0x0f) | 0x40; // version 4
++    b[8] = (b[8] & 0x3f) | 0x80; // variant bits
++    format!(
++        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
++        u32::from_be_bytes(b[0..4].try_into().unwrap()),
++        u16::from_be_bytes(b[4..6].try_into().unwrap()),
++        u16::from_be_bytes(b[6..8].try_into().unwrap()),
++        u16::from_be_bytes(b[8..10].try_into().unwrap()),
++        {
++            let mut arr = [0u8; 8];
++            arr[2..].copy_from_slice(&b[10..16]);
++            u64::from_be_bytes(arr)
++        }
++    )
++}
+diff --git a/src/repl.rs b/src/repl.rs
+index 173fbf5..fbb7b87 100644
+--- a/src/repl.rs
++++ b/src/repl.rs
+@@ -1,10 +1,14 @@
++//! CLI REPL — thin client for local developer use only.
++//! Production callers go through the daemon's MCP/HTTP interface.
++//! Users do NOT talk to the daemon through this; it's a dev tool.
++
+ use serde_json::json;
+ use std::io::{self, BufRead, Write};
+ use tokio::sync::mpsc;
+ 
+ use crate::agent::react_loop::{AgentEvent, run_react_loop};
+ use crate::config::RuntimeConfig;
+-use crate::db::Db;
++use crate::db::{Db, TaskStatus};
+ 
+ const AGENT_DID: &str = "did:aria:jayesh";
+ 
+@@ -14,33 +18,22 @@ pub async fn run(
+     cfg: RuntimeConfig,
+     skills: std::sync::Arc<crate::skills::SkillManager>,
+ ) -> anyhow::Result<()> {
+-    let history = db.get_history(AGENT_DID, 50)?;
+-    let mut history_reversed = history.clone();
+-    history_reversed.reverse();
+-
+-    let mut llm_history: Vec<serde_json::Value> = history_reversed
+-        .iter()
+-        .map(|(dir, content)| {
+-            let role = if dir == "sent" { "user" } else { "assistant" };
+-            json!({ "role": role, "content": content })
+-        })
+-        .collect();
+-
+-    println!("ARIA v0.5 — Governed Agent Runtime");
++    println!("ARIA v0.6 — Governed Agent Runtime");
+     if cfg.brave_api_key.is_some() {
+         println!("Search: Brave API + SearXNG fallback");
+     } else {
+         println!("Search: SearXNG ({})", cfg.searxng_url);
+     }
+-    println!("Type a message, or /help for commands. Ctrl+C or /quit to exit.");
++    println!("Dev REPL — tasks are logged and audited. /help for commands.");
+     println!();
+ 
+     let stdin = io::stdin();
+     let api_key = api_key.to_string();
+     let injected_config = cfg.injected_config.clone();
++    let mut llm_history: Vec<serde_json::Value> = Vec::new();
+ 
+     loop {
+-        print!("▸ You: ");
++        print!("▸ Task: ");
+         io::stdout().flush()?;
+ 
+         let mut cmd = String::new();
+@@ -65,6 +58,7 @@ pub async fn run(
+                 println!("  /clear   — clear screen");
+                 println!("  /key     — show redacted API key");
+                 println!("  /config  — show runtime config");
++                println!("  /tasks   — list recent tasks");
+                 continue;
+             }
+             "/clear" => {
+@@ -86,14 +80,9 @@ pub async fn run(
+                 for (skill_name, configs) in &injected_config {
+                     println!("    [ {} ]", skill_name);
+                     for (k, v) in configs {
+-                        // Mask secrets (keys containing "key", "secret", "token")
+                         let display =
+                             if k.contains("key") || k.contains("secret") || k.contains("token") {
+-                                if v.is_empty() {
+-                                    "(not set)".to_string()
+-                                } else {
+-                                    "(set)".to_string()
+-                                }
++                                if v.is_empty() { "(not set)".to_string() } else { "(set)".to_string() }
+                             } else {
+                                 v.clone()
+                             };
+@@ -102,74 +91,85 @@ pub async fn run(
+                 }
+                 continue;
+             }
++            "/tasks" => {
++                match db.list_tasks(10) {
++                    Ok(tasks) => {
++                        println!("  Recent tasks:");
++                        for (id, source, status, steps, created, sealed) in tasks {
++                            println!(
++                                "  [{}] {} | {} steps | {} → {}{}",
++                                &id[..8], source, steps, created,
++                                status,
++                                if sealed.is_empty() { String::new() } else { format!(" (sealed {})", &sealed[..16]) }
++                            );
++                        }
++                    }
++                    Err(e) => eprintln!("Failed to list tasks: {}", e),
++                }
++                continue;
++            }
+             _ => {}
+         }
+ 
+-        db.save_message(AGENT_DID, "sent", &cmd).ok();
++        // Open a new audited task for this prompt
++        let task_id = match db.create_task(AGENT_DID, "cli", &cmd) {
++            Ok(id) => id,
++            Err(e) => {
++                eprintln!("Failed to create task: {}", e);
++                continue;
++            }
++        };
++        println!("  task {}", &task_id[..8]);
++
+         llm_history.push(json!({ "role": "user", "content": cmd.clone() }));
+ 
+-        // Large channel — JSON responses can be 50-100 tokens; 32 caused deadlock.
+         let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
+         let key = api_key.clone();
+         let history_snap = llm_history.clone();
+         let ic = injected_config.clone();
+         let user_prompt = cmd.clone();
+-
+         let sm = std::sync::Arc::clone(&skills);
++
+         let handle = tokio::spawn(async move {
+             run_react_loop(key, history_snap, ic, sm, tx, user_prompt).await;
+         });
+ 
+         let mut token_buf = String::new();
+         let mut prefix_printed = false;
+-        // None = undecided, Some(true) = JSON, Some(false) = chat
+         let mut response_kind: Option<bool> = None;
++        let mut last_action: Option<(String, serde_json::Value)> = None;
++        let mut task_failed = false;
+ 
+         while let Some(event) = rx.recv().await {
+             match event {
+                 AgentEvent::Token(t) => {
+                     token_buf.push_str(&t);
+-
+-                    // Wait for 8 chars before deciding — first token may be just `{`
+                     if response_kind.is_none() && token_buf.len() >= 8 {
+                         let is_json = token_buf.trim_start().starts_with('{');
+                         response_kind = Some(is_json);
+                         if !is_json {
+-                            // Flush buffered chars now that we know it's chat
+                             println!();
+                             print!("◂ Aria: {}", token_buf);
+                             io::stdout().flush().ok();
+                             prefix_printed = true;
+                         }
+                     } else if response_kind == Some(false) {
+-                        // Chat confirmed — stream token live
+                         print!("{}", t);
+                         io::stdout().flush().ok();
+                     }
+-                    // response_kind == Some(true): JSON — stay silent, let structured events handle output
+                 }
+ 
+                 AgentEvent::Chat(content) => {
+-                    if !prefix_printed {
+-                        println!();
+-                        println!("◂ Aria: {}", content);
+-                    } else {
+-                        println!();
+-                    }
++                    if !prefix_printed { println!(); println!("◂ Aria: {}", content); }
++                    else { println!(); }
+                     token_buf.clear();
+-                    db.save_message(AGENT_DID, "received", &content).ok();
+                     llm_history.push(json!({ "role": "assistant", "content": content }));
+                 }
+ 
+                 AgentEvent::Final(f) => {
+-                    if !prefix_printed {
+-                        println!();
+-                        println!("◂ Aria: {}", f);
+-                    } else {
+-                        println!();
+-                    }
++                    if !prefix_printed { println!(); println!("◂ Aria: {}", f); }
++                    else { println!(); }
+                     token_buf.clear();
+-                    db.save_message(AGENT_DID, "received", &f).ok();
+                     llm_history.push(json!({ "role": "assistant", "content": f }));
+                 }
+ 
+@@ -188,26 +188,45 @@ pub async fn run(
+                     token_buf.clear();
+                     let readable = crate::skills::describe_action(&skill, &args);
+                     println!("⚡  {}", readable);
++                    last_action = Some((skill, args));
+                 }
+ 
+                 AgentEvent::Observation(o) => {
+                     println!("📋  {}", o);
++                    if let Some((skill, args)) = last_action.take() {
++                        db.log_task_step(
++                            &task_id,
++                            AGENT_DID,
++                            &skill,
++                            &args.to_string(),
++                            &o,
++                            true,
++                        ).ok();
++                    }
+                 }
+ 
+                 AgentEvent::Error(e) => {
+                     token_buf.clear();
++                    task_failed = true;
++                    // Log the failed step if we have a pending action
++                    if let Some((skill, args)) = last_action.take() {
++                        db.log_task_step(
++                            &task_id,
++                            AGENT_DID,
++                            &skill,
++                            &args.to_string(),
++                            &e,
++                            false,
++                        ).ok();
++                    }
+                     eprintln!("✗ error:  {}", e);
+                 }
+ 
+                 AgentEvent::Done => {
+-                    // Fallback: undecided or chat with <8 chars total
+                     if !token_buf.is_empty() && !prefix_printed {
+                         println!();
+                         println!("◂ Aria: {}", token_buf.trim());
+-                        db.save_message(AGENT_DID, "received", token_buf.trim())
+-                            .ok();
+-                        llm_history
+-                            .push(json!({ "role": "assistant", "content": token_buf.trim() }));
++                        llm_history.push(json!({ "role": "assistant", "content": token_buf.trim() }));
+                         token_buf.clear();
+                     }
+                     break;
+@@ -216,6 +235,11 @@ pub async fn run(
+         }
+ 
+         handle.await.ok();
++
++        // Seal the task
++        let status = if task_failed { TaskStatus::Failed } else { TaskStatus::Done };
++        db.seal_task(&task_id, status).ok();
++
+         println!();
+     }
+ }
+
+diff --git a/src/crypto.rs b/src/crypto.rs
+new file mode 100644
+--- /dev/null
++++ b/src/crypto.rs
+@@ -0,0 +1,347 @@
++//! ARIA Cryptographic Identity Layer — Phase 2
++//!
++//! Responsibilities:
++//!   1. Ed25519 keypair generation for DIDs
++//!   2. Private key encryption at rest (AES-256-GCM, Argon2id key derivation)
++//!   3. Ed25519 signing / verification of audit log entries
++//!   4. SHA-256 hashing for input/result/chain digests
++//!   5. Multibase (base58btc) encode/decode for public keys in DID documents
++//!
++//! Key derivation for at-rest encryption:
++//!   - The encryption key is derived from a device secret (a 32-byte random
++//!     file at ~/.aria/device.key, generated once on first run).
++//!   - Argon2id(device_secret || did_salt) → 32-byte AES key
++//!   - Each encrypted blob is: nonce(12) || ciphertext || tag
++//!
++//! Audit chain:
++//!   prev_hash = SHA-256(prev_hash || timestamp || skill_called || input_hash || result_hash)
++//!   signature  = Ed25519(agent_signing_key, prev_hash_of_this_entry)
++//!
++//! The chain means you can't rewrite any entry without invalidating every
++//! subsequent signature, even if you have the key for those later entries.
++
++use aes_gcm::{
++    Aes256Gcm, Key, Nonce,
++    aead::{Aead, KeyInit, OsRng as AeadOsRng},
++};
++use anyhow::{Context, anyhow};
++use argon2::{Argon2, Params, Version, Algorithm};
++use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
++use rand::{RngCore, rngs::OsRng};
++use sha2::{Digest, Sha256};
++use std::{fs, path::PathBuf};
++use zeroize::Zeroizing;
++
++// ── Device secret ─────────────────────────────────────────────────────────────
++
++/// Path to the 32-byte random device secret used as Argon2 input.
++/// Created once; never transmitted; only meaningful on this machine.
++fn device_key_path() -> anyhow::Result<PathBuf> {
++    let mut p = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
++    p.push(".aria");
++    p.push("device.key");
++    Ok(p)
++}
++
++/// Read the device secret, generating it on first use.
++pub fn load_or_create_device_secret() -> anyhow::Result<Zeroizing<Vec<u8>>> {
++    let path = device_key_path()?;
++    if path.exists() {
++        let bytes = fs::read(&path).context("reading device.key")?;
++        if bytes.len() != 32 {
++            anyhow::bail!("device.key is corrupt (wrong length)");
++        }
++        return Ok(Zeroizing::new(bytes));
++    }
++
++    // First run — generate and persist
++    let dir = path.parent().unwrap();
++    fs::create_dir_all(dir)?;
++
++    let mut secret = Zeroizing::new(vec![0u8; 32]);
++    OsRng.fill_bytes(&mut secret);
++
++    // 0600 permissions on Linux
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        fs::write(&path, secret.as_slice())?;
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
++    }
++    #[cfg(not(unix))]
++    fs::write(&path, secret.as_slice())?;
++
++    Ok(secret)
++}
++
++// ── Key derivation ────────────────────────────────────────────────────────────
++
++/// Derive a 32-byte AES key from device_secret + a per-identity salt (the DID string bytes).
++/// Uses Argon2id with modest parameters — this only runs at key generation and unlock,
++/// not per-request.
++fn derive_aes_key(device_secret: &[u8], did_salt: &[u8]) -> anyhow::Result<Zeroizing<[u8; 32]>> {
++    let params = Params::new(
++        64 * 1024, // 64 MiB memory
++        3,         // 3 iterations
++        1,         // 1 thread (we're single-threaded here)
++        Some(32),  // 32-byte output
++    )
++    .map_err(|e| anyhow!("argon2 params: {}", e))?;
++
++    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
++    let mut key = Zeroizing::new([0u8; 32]);
++    argon2
++        .hash_password_into(device_secret, did_salt, key.as_mut())
++        .map_err(|e| anyhow!("argon2 hash: {}", e))?;
++    Ok(key)
++}
++
++// ── Encryption / decryption ───────────────────────────────────────────────────
++
++/// Encrypt `plaintext` with AES-256-GCM.
++/// Returns `nonce(12 bytes) || ciphertext+tag` as a hex string.
++pub fn encrypt_key_bytes(plaintext: &[u8], aes_key: &[u8; 32]) -> anyhow::Result<String> {
++    let key = Key::<Aes256Gcm>::from_slice(aes_key);
++    let cipher = Aes256Gcm::new(key);
++
++    let mut nonce_bytes = [0u8; 12];
++    OsRng.fill_bytes(&mut nonce_bytes);
++    let nonce = Nonce::from_slice(&nonce_bytes);
++
++    let ciphertext = cipher
++        .encrypt(nonce, plaintext)
++        .map_err(|e| anyhow!("AES-GCM encrypt: {}", e))?;
++
++    let mut out = Vec::with_capacity(12 + ciphertext.len());
++    out.extend_from_slice(&nonce_bytes);
++    out.extend_from_slice(&ciphertext);
++    Ok(hex::encode(out))
++}
++
++/// Decrypt a hex blob produced by `encrypt_key_bytes`.
++pub fn decrypt_key_bytes(hex_blob: &str, aes_key: &[u8; 32]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
++    let blob = hex::decode(hex_blob).context("hex decode")?;
++    if blob.len() < 12 {
++        anyhow::bail!("encrypted key blob too short");
++    }
++    let (nonce_bytes, ciphertext) = blob.split_at(12);
++    let key = Key::<Aes256Gcm>::from_slice(aes_key);
++    let cipher = Aes256Gcm::new(key);
++    let nonce = Nonce::from_slice(nonce_bytes);
++    let plaintext = cipher
++        .decrypt(nonce, ciphertext)
++        .map_err(|_| anyhow!("AES-GCM decrypt failed — wrong device key or corrupt blob"))?;
++    Ok(Zeroizing::new(plaintext))
++}
++
++// ── Identity ──────────────────────────────────────────────────────────────────
++
++pub struct Identity {
++    pub did: String,
++    /// Multibase base58btc encoded (starts with 'z')
++    pub public_key_multibase: String,
++    /// Hex-encoded AES-GCM encrypted Ed25519 signing key bytes
++    pub encrypted_private_key_hex: String,
++}
++
++/// Generate a fresh Ed25519 keypair, encrypt the private key, return an `Identity`.
++/// `did` — the full DID string, e.g. "did:aria:jayesh"
++pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
++    let device_secret = load_or_create_device_secret()?;
++    let aes_key = derive_aes_key(&device_secret, did.as_bytes())?;
++
++    let signing_key = SigningKey::generate(&mut OsRng);
++    let verifying_key = signing_key.verifying_key();
++
++    let pub_multibase = multibase_encode(verifying_key.as_bytes());
++    let priv_hex = encrypt_key_bytes(signing_key.as_bytes(), &aes_key)?;
++
++    Ok(Identity {
++        did: did.to_string(),
++        public_key_multibase: pub_multibase,
++        encrypted_private_key_hex: priv_hex,
++    })
++}
++
++/// Load the signing key from the DB-stored encrypted blob.
++pub fn load_signing_key(
++    did: &str,
++    encrypted_private_key_hex: &str,
++) -> anyhow::Result<Zeroizing<SigningKey>> {
++    let device_secret = load_or_create_device_secret()?;
++    let aes_key = derive_aes_key(&device_secret, did.as_bytes())?;
++    let raw = decrypt_key_bytes(encrypted_private_key_hex, &aes_key)?;
++    if raw.len() != 32 {
++        anyhow::bail!("decrypted signing key has wrong length: {}", raw.len());
++    }
++    let key_bytes: [u8; 32] = raw[..32].try_into().unwrap();
++    Ok(Zeroizing::new(SigningKey::from_bytes(&key_bytes)))
++}
++
++// ── Multibase (base58btc) ─────────────────────────────────────────────────────
++
++/// Encode bytes as multibase base58btc (prefix 'z').
++/// Used in DID documents: `did:aria:jayesh#key-0` → `"z<base58(pubkey)>"`
++pub fn multibase_encode(bytes: &[u8]) -> String {
++    format!("z{}", bs58::encode(bytes).into_string())
++}
++
++/// Decode a multibase base58btc string (prefix 'z') back to bytes.
++pub fn multibase_decode(s: &str) -> anyhow::Result<Vec<u8>> {
++    let s = s.strip_prefix('z').ok_or_else(|| anyhow!("not a base58btc multibase string"))?;
++    bs58::decode(s).into_vec().context("base58 decode")
++}
++
++// ── Hashing ───────────────────────────────────────────────────────────────────
++
++/// SHA-256 of arbitrary bytes → lowercase hex string.
++pub fn sha256_hex(data: &[u8]) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(data);
++    hex::encode(hasher.finalize())
++}
++
++/// SHA-256 of a UTF-8 string → lowercase hex string.
++pub fn sha256_hex_str(s: &str) -> String {
++    sha256_hex(s.as_bytes())
++}
++
++/// Compute the chain hash for an audit log entry:
++///   SHA-256(prev_hash || timestamp || skill_called || input_hash || result_hash)
++/// Any field may be empty string if not applicable.
++pub fn compute_chain_hash(
++    prev_hash: &str,
++    step: &str,
++    skill_called: &str,
++    input_hash: &str,
++    result_hash: &str,
++    timestamp: &str,
++) -> String {
++    let mut h = Sha256::new();
++    h.update(prev_hash.as_bytes());
++    h.update(b"|");
++    h.update(step.as_bytes());
++    h.update(b"|");
++    h.update(skill_called.as_bytes());
++    h.update(b"|");
++    h.update(input_hash.as_bytes());
++    h.update(b"|");
++    h.update(result_hash.as_bytes());
++    h.update(b"|");
++    h.update(timestamp.as_bytes());
++    hex::encode(h.finalize())
++}
++
++// ── Signing / Verification ────────────────────────────────────────────────────
++
++/// Sign `message` with the Ed25519 signing key → hex-encoded signature.
++pub fn sign_bytes(signing_key: &SigningKey, message: &[u8]) -> String {
++    hex::encode(signing_key.sign(message).to_bytes())
++}
++
++/// Verify an Ed25519 signature.
++/// `public_key_multibase` — the 'z'-prefixed base58btc key from the identity row.
++/// `message` — the bytes that were signed.
++/// `signature_hex` — the hex signature from the audit log.
++pub fn verify_signature(
++    public_key_multibase: &str,
++    message: &[u8],
++    signature_hex: &str,
++) -> anyhow::Result<()> {
++    let pub_bytes = multibase_decode(public_key_multibase)?;
++    let pub_bytes: [u8; 32] = pub_bytes
++        .try_into()
++        .map_err(|_| anyhow!("public key wrong length"))?;
++    let verifying_key = VerifyingKey::from_bytes(&pub_bytes)?;
++
++    let sig_bytes = hex::decode(signature_hex).context("hex decode signature")?;
++    let sig_bytes: [u8; 64] = sig_bytes
++        .try_into()
++        .map_err(|_| anyhow!("signature wrong length"))?;
++    let signature = Signature::from_bytes(&sig_bytes);
++
++    verifying_key
++        .verify(message, &signature)
++        .map_err(|_| anyhow!("signature verification failed"))?;
++    Ok(())
++}
++
++// ── Tests ─────────────────────────────────────────────────────────────────────
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_sha256_round_trip() {
++        let h = sha256_hex_str("hello");
++        assert_eq!(h.len(), 64);
++        // known SHA-256 of "hello"
++        assert_eq!(
++            h,
++            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
++        );
++    }
++
++    #[test]
++    fn test_multibase_round_trip() {
++        let data = b"test_public_key_bytes_32_pad_here";
++        let enc = multibase_encode(data);
++        assert!(enc.starts_with('z'));
++        let dec = multibase_decode(&enc).unwrap();
++        assert_eq!(dec, data);
++    }
++
++    #[test]
++    fn test_sign_verify() {
++        let signing_key = SigningKey::generate(&mut OsRng);
++        let verifying_key = signing_key.verifying_key();
++        let pub_multibase = multibase_encode(verifying_key.as_bytes());
++
++        let msg = b"test audit entry";
++        let sig_hex = sign_bytes(&signing_key, msg);
++
++        verify_signature(&pub_multibase, msg, &sig_hex).expect("signature should verify");
++    }
++
++    #[test]
++    fn test_sign_tamper_detection() {
++        let signing_key = SigningKey::generate(&mut OsRng);
++        let verifying_key = signing_key.verifying_key();
++        let pub_multibase = multibase_encode(verifying_key.as_bytes());
++
++        let sig_hex = sign_bytes(&signing_key, b"original message");
++        let result = verify_signature(&pub_multibase, b"tampered message", &sig_hex);
++        assert!(result.is_err(), "tampered message should not verify");
++    }
++
++    #[test]
++    fn test_aes_gcm_round_trip() {
++        let mut key = [0u8; 32];
++        OsRng.fill_bytes(&mut key);
++        let plaintext = b"ed25519 signing key bytes here!";
++        let enc = encrypt_key_bytes(plaintext, &key).unwrap();
++        let dec = decrypt_key_bytes(&enc, &key).unwrap();
++        assert_eq!(dec.as_slice(), plaintext);
++    }
++
++    #[test]
++    fn test_aes_gcm_wrong_key_fails() {
++        let mut key = [0u8; 32];
++        OsRng.fill_bytes(&mut key);
++        let enc = encrypt_key_bytes(b"secret", &key).unwrap();
++        let mut wrong_key = key;
++        wrong_key[0] ^= 0xff;
++        let result = decrypt_key_bytes(&enc, &wrong_key);
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn test_chain_hash_deterministic() {
++        let h1 = compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
++        let h2 = compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
++        assert_eq!(h1, h2);
++        let h3 = compute_chain_hash("prev", "1", "search.web", "abc", "DIFFERENT", "2026-01-01T00:00:00Z");
++        assert_ne!(h1, h3);
++    }
++}

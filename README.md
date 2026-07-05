@@ -8,24 +8,40 @@ The ARIA Daemon is the core host component of the **Agentic Interface for AI (AR
 - **LLM Provider Support**: Flexible configuration routes AI inference natively handling both **Ollama** (`http://localhost:11434`) and **OpenRouter** APIs. 
 - **SQLite Persistence**: Maintains crucial connection configurations and runtime data seamlessly by wrapping local SQLite bindings for immediate local access.
 - **Headless Runtime & Auto-Start**: Includes native CLI options to install and run itself as a headless background `systemd` user service across Linux environments.
-- **REPL Interface**: Provides direct user-facing interactions via an interactive shell to bootstrap models without needing external wrappers.
+- **Secure Identity HAL**: Pluggable trait-based `IdentityVault` for cryptographic operations, paving the way for TPM and cloud-hosted hardware signing.
+- **Task Chaining & Auditing**: Cryptographically hashes and links execution steps (using the Identity HAL) to maintain a verifiable audit trail of AI actions in SQLite.
 
 ## Core Commands
 
 The `aria-daemon` executable provides the following primary CLI commands:
 
-- `aria` - Start the interactive chat REPL.
-- `aria daemon` - Run the host headless in the background (ideal for instances triggered by `systemd`).
+- `aria` or `aria daemon` - Run the headless TCP service (default).
 - `aria install` - Installs the daemon as an auto-starting systemd user service (`~/.config/systemd/user/aria-daemon.service`).
 - `aria help` - Print usage and exit.
 
+## TCP API Endpoint
+
+When running as a daemon, ARIA exposes a headless TCP endpoint on **`127.0.0.1:5005`**. External clients can communicate with the daemon by sending a JSON request and listening for a stream of JSON-encoded agent events.
+
+**Request Format:**
+```json
+{
+  "task": "Your task description here",
+  "Type": "optional_skill_type"
+}
+```
+
+**Response Format:**
+The daemon will subsequently stream back execution events (such as `Action`, `Observation`, and `Error`) formatted as JSON lines, detailing the steps the agent is taking to resolve the task.
+
 ## Project Structure
 
-- `src/main.rs`: Entry point defining the main process bootstrap, SQLite initializing, and handling subcommands (REPL, Daemon, Install).
+- `src/main.rs`: Entry point defining the main process bootstrap, SQLite initializing, and handling subcommands (Daemon, Install).
 - `src/agent/`: Core LLM integration and the prompt/ReAct interaction loop bridging user goals with available features.
 - `src/config.rs`: Centralized runtime configuration defining URL mappings, target models, and injecting manifest constants into dynamic host environments.
-- `src/db/`: Interacting directly with the SQLite datastore configurations and identities.
-- `src/repl/`: Front-end interactive shell routines for prompt interactions with standard streams.
+- `src/crypto.rs`: Cryptographic utilities for hashing and validating the execution task chain.
+- `src/db.rs`: Interacting directly with the SQLite datastore configurations, task chains, and identities.
+- `src/identity/`: Hardware Abstraction Layer (HAL) for securely managing identity vaults and signing.
 - `src/skills/`: Managing WASM modules, loading skills from `skills/`, parsing `.toml` manifests, enforcing memory offsets, and executing sandbox instructions.
 
 ## Development & Building
@@ -36,7 +52,7 @@ The Daemon relies on its workspace configuration located at `../Cargo.toml`. To 
 cargo build -p aria-daemon
 ```
 
-To run directly via cargo (for the REPL):
+To run directly via cargo:
 
 ```bash
 cargo run -p aria-daemon

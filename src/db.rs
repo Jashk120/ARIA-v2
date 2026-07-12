@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS config (
     value           TEXT NOT NULL
 );
 
+-- Model tool capability cache
+CREATE TABLE IF NOT EXISTS model_capabilities (
+    model_string    TEXT PRIMARY KEY,
+    capability      TEXT NOT NULL,
+    updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Phase 3: cached manifests from remote DIDs for verification.
 CREATE TABLE IF NOT EXISTS cached_manifests (
     did             TEXT PRIMARY KEY,
@@ -91,6 +98,33 @@ impl TaskStatus {
             TaskStatus::Running => "running",
             TaskStatus::Done    => "done",
             TaskStatus::Failed  => "failed",
+        }
+    }
+}
+
+// ── Model Capabilities ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCapability {
+    Native,
+    PromptFallback,
+    Unverified,
+}
+
+impl ToolCapability {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ToolCapability::Native => "native",
+            ToolCapability::PromptFallback => "prompt_fallback",
+            ToolCapability::Unverified => "unverified",
+        }
+    }
+    
+    fn from_str(s: &str) -> Self {
+        match s {
+            "native" => ToolCapability::Native,
+            "prompt_fallback" => ToolCapability::PromptFallback,
+            _ => ToolCapability::Unverified,
         }
     }
 }
@@ -237,6 +271,27 @@ impl Db {
 
     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", params![key, value])?;
+        Ok(())
+    }
+
+    // ── Capabilities ──────────────────────────────────────────────────────────
+    
+    pub fn get_model_capability(&self, model: &str) -> anyhow::Result<ToolCapability> {
+        let mut stmt = self.conn.prepare("SELECT capability FROM model_capabilities WHERE model_string = ?")?;
+        let mut rows = stmt.query_map([model], |row| row.get(0))?;
+        if let Some(res) = rows.next() { 
+            let cap_str: String = res?;
+            return Ok(ToolCapability::from_str(&cap_str));
+        }
+        Ok(ToolCapability::Unverified)
+    }
+
+    pub fn set_model_capability(&self, model: &str, capability: ToolCapability) -> anyhow::Result<()> {
+        let now = now_iso8601();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_capabilities (model_string, capability, updated_at) VALUES (?, ?, ?)",
+            params![model, capability.as_str(), now],
+        )?;
         Ok(())
     }
 

@@ -47,6 +47,8 @@ pub struct Capabilities {
 pub struct CallConfig {
     /// JSON shape the LLM should pass as args — shown verbatim in prompt
     pub args_schema: Option<String>,
+    /// Native JSON schema for tool arguments (OpenAI function parameters shape)
+    pub parameters: Option<serde_json::Value>,
     /// JSON shape the skill returns — so LLM can reason about observations
     pub output_schema: Option<String>,
 }

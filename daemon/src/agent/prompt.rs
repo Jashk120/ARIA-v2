@@ -10,7 +10,21 @@ use crate::skills::paths::get_daemon_root;
 
 // ── Trigger matching ──────────────────────────────────────────────────────────
 
-pub fn prompt_matches_triggers(prompt: &str, triggers: &[String], skills_type: &Option<String>) -> bool {
+pub fn prompt_matches_triggers(
+    prompt: &str,
+    skill_name: &str,
+    triggers: &[String],
+    skills_type: &Option<String>,
+) -> bool {
+    // If the request specified a skills_type (e.g. "web"), forcefully include
+    // all skills whose name starts with that prefix (e.g. "web.") or matches it exactly.
+    if let Some(target_type) = skills_type {
+        let target_prefix = format!("{}.", target_type);
+        if skill_name.starts_with(&target_prefix) || skill_name == target_type {
+            return true;
+        }
+    }
+
     if triggers.is_empty() {
         return true;
     }
@@ -25,7 +39,11 @@ pub fn prompt_matches_triggers(prompt: &str, triggers: &[String], skills_type: &
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-pub fn system_prompt(user_prompt: &str, skills_type: Option<String>) -> String {
+pub fn system_prompt(user_prompt: &str, skills_type: Option<String>, is_native: bool) -> String {
+    if is_native {
+        return "You are a tool-execution agent. Use the tools provided to fulfill the user's request.".to_string();
+    }
+
     let skills = build_skills_prompt(user_prompt, &skills_type);
     format!(
         r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
@@ -100,7 +118,7 @@ fn build_skills_prompt(user_prompt: &str, skills_type: &Option<String>) -> Strin
     let lines: Vec<String> = all_skills
         .iter()
         .map(|m| {
-            if prompt_matches_triggers(user_prompt, &m.triggers, skills_type) {
+            if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
                 format_skill_block(m)
             } else {
                 format!("- {}: {}", m.name, m.description)
@@ -136,4 +154,31 @@ fn format_skill_block(m: &SkillManifest) -> String {
     }
 
     lines.join("\n")
+}
+
+// ── Native tools builder ──────────────────────────────────────────────────────
+
+pub fn build_native_tools(user_prompt: &str, skills_type: &Option<String>) -> Vec<serde_json::Value> {
+    let all_skills = load_all_skills();
+    let mut tools = Vec::new();
+
+    for m in all_skills {
+        if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
+            let parameters = m.call.parameters.clone().unwrap_or_else(|| serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }));
+            
+            tools.push(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": m.name,
+                    "description": m.description,
+                    "parameters": parameters,
+                }
+            }));
+        }
+    }
+
+    tools
 }

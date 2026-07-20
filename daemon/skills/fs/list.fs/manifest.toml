@@ -18,7 +18,7 @@ output_schema = '{"path":"string","entries":[{"name":"string","is_dir":"bool","s
 max_steps = 3
 
 [config.fs_root]
-default = "~/aria-workspace"
+default = "~/"
 inject  = true
 
 [config.fs_mode]

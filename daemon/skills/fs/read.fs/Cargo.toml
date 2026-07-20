@@ -2,10 +2,20 @@
 name = "read_fs"
 version = "0.1.0"
 edition = "2024"
-
 [lib]
 crate-type = ["cdylib"]
-
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# --- new deps for multi-format extraction ---
+# zip/flate2 default to a C (miniz-sys) backend, which will NOT cross-compile
+# to wasm32-unknown-unknown. deflate/rust_backend force the pure-Rust path.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+quick-xml = "0.31"
+# calamine (xlsx/xls/ods) is pure Rust, itself built on zip+quick-xml.
+calamine = "0.24"
+# pdf-extract is pure Rust for text extraction (avoid the "embed_image"
+# feature — that pulls in freetype, which is a C dependency).
+pdf-extract = "0.7"

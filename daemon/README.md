@@ -58,6 +58,8 @@ To run directly via cargo:
 cargo run -p aria-daemon
 ```
 
+cargo build -p read_fs --target wasm32-wasip1 --release
+
 ## Security & Memory Safety
 
 The Daemon conforms strictly to the ARIA security capability model. WASM skills maintain zero access to Host network or filesystem constraints. All requests are marshaled dynamically through Host FFI string-pointers, mapped exclusively down to explicitly authorized `tokio` networking routines. Memory limits and sizes are strictly controlled directly by the Wasmtime engine context.

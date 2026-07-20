@@ -34,11 +34,19 @@ use zeroize::Zeroizing;
 
 // ── Device secret ─────────────────────────────────────────────────────────────
 
+fn aria_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(test_val) = std::env::var("ARIA_TEST_DIR") {
+        return Ok(PathBuf::from(test_val));
+    }
+    let mut p = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+    p.push(".aria");
+    Ok(p)
+}
+
 /// Path to the 32-byte random device secret used as Argon2 input.
 /// Created once; never transmitted; only meaningful on this machine.
 fn device_key_path() -> anyhow::Result<PathBuf> {
-    let mut p = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
-    p.push(".aria");
+    let mut p = aria_dir()?;
     p.push("device.key");
     Ok(p)
 }
@@ -137,8 +145,7 @@ pub fn decrypt_key_bytes(hex_blob: &str, aes_key: &[u8; 32]) -> anyhow::Result<Z
 // ── Identity ──────────────────────────────────────────────────────────────────
 
 fn identity_key_path() -> anyhow::Result<PathBuf> {
-    let mut p = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
-    p.push(".aria");
+    let mut p = aria_dir()?;
     p.push("id.key");
     Ok(p)
 }
@@ -153,6 +160,11 @@ pub struct Identity {
 /// Returns the public parts as an `Identity`.
 /// `did` — the full DID string, e.g. "did:aria:jayesh"
 pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
+    let path = identity_key_path()?;
+    if path.exists() {
+        anyhow::bail!("Identity key file already exists at {:?}", path);
+    }
+
     let device_secret = load_or_create_device_secret()?;
     let aes_key = derive_aes_key(&device_secret, did.as_bytes())?;
 
@@ -163,7 +175,6 @@ pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
     let priv_hex = encrypt_key_bytes(signing_key.as_bytes(), &aes_key)?;
 
     // Persist private key to separate file with 0600 permissions
-    let path = identity_key_path()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -362,5 +373,30 @@ mod tests {
         assert_eq!(h1, h2);
         let h3 = compute_chain_hash("prev", "1", "search.web", "abc", "DIFFERENT", "2026-01-01T00:00:00Z");
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_generate_identity_twice_fails() {
+        let temp_dir = std::env::temp_dir().join(format!("aria-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        unsafe {
+            std::env::set_var("ARIA_TEST_DIR", &temp_dir);
+        }
+
+        let did = "did:aria:test_twice";
+
+        // First call should succeed
+        let id1 = generate_identity(did);
+        assert!(id1.is_ok(), "First call to generate_identity failed: {:?}", id1.err());
+
+        // Second call with same DID should return an error
+        let id2 = generate_identity(did);
+        assert!(id2.is_err(), "Second call to generate_identity should have failed but succeeded");
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("ARIA_TEST_DIR");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

@@ -26,7 +26,7 @@ output_schema = '{"matches":[{"path":"string","preview":"string"}],"truncated":"
 max_steps = 3
 
 [config.fs_root]
-default = "~/aria-workspace"
+default = "~/"
 inject  = true
 secret  = false
 

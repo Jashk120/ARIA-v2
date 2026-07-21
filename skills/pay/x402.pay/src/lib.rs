@@ -31,14 +31,21 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
 
 #[derive(Deserialize)]
 struct Input {
-    url: String,
+    url: Option<String>,
+    /// Injected by the daemon from ARIA_NODE_URL / db config — never set by the LLM directly.
+    node_url: Option<String>,
 }
 
 fn execute(input: &str) -> Result<Value, String> {
     let args: Input = serde_json::from_str(input).map_err(|e| format!("Invalid input: {}", e))?;
 
+    // Resolve target URL: explicit arg wins, then injected node_url, then hard default.
+    let target_url = args.url
+        .or(args.node_url)
+        .unwrap_or_else(|| "http://localhost:3000/protected".to_string());
+
     // 1. First attempt — expect HTTP 402 with payment details in the body
-    let first = http_get(&args.url, "{}")?;
+    let first = http_get(&target_url, "{}")?;
     let payment_req: Value = serde_json::from_str(&first)
         .map_err(|e| format!("Expected 402 payment-required JSON: {}", e))?;
 
@@ -53,7 +60,7 @@ fn execute(input: &str) -> Result<Value, String> {
 
     // 3. Retry with proof of payment
     let headers = json!({ "X-PAYMENT-PROOF": tx_id }).to_string();
-    let unlocked = http_get(&args.url, &headers)?;
+    let unlocked = http_get(&target_url, &headers)?;
     let data: Value = serde_json::from_str(&unlocked).unwrap_or(json!({ "raw": unlocked }));
 
     Ok(json!({

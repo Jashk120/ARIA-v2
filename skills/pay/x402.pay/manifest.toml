@@ -1,0 +1,18 @@
+name        = "pay.x402"
+version     = "0.1.0"
+description = "Pays for a paywalled (HTTP 402) resource via Hedera and returns the unlocked data"
+triggers = ["pay", "paywall", "402", "purchase"]
+
+[display]
+action = "Paying for \"{url}\""
+
+[capabilities]
+http = true
+x402_pay = true
+
+[call]
+args_schema   = '{"url":"string"}'
+output_schema = '{"data":"object","transaction_id":"string","hashscan_url":"string"}'
+
+[react]
+max_steps = 2

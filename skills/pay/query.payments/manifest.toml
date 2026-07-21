@@ -1,0 +1,17 @@
+name        = "query.payments"
+version     = "0.1.0"
+description = "Looks up the agent's own recent Hedera payments"
+triggers = ["paid", "payment", "spent", "transaction"]
+
+[display]
+action = "Checking recent payments"
+
+[capabilities]
+db_query = true
+
+[call]
+args_schema   = '{"days":7}'
+output_schema = '{"payments":[{"recipient":"string","amount_hbar":"number","memo":"string","transaction_id":"string","hashscan_url":"string","status":"string","timestamp":"string"}]}'
+
+[react]
+max_steps = 1

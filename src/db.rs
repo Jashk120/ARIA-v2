@@ -78,10 +78,23 @@ CREATE TABLE IF NOT EXISTS cached_manifests (
     cached_at       TEXT DEFAULT CURRENT_TIMESTAMP,
     expires_at      TEXT
 );
-";
+-- x402 payments made by the agent (Hedera testnet/mainnet).
+CREATE TABLE IF NOT EXISTS payments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT REFERENCES tasks(task_id), -- NULL if triggered outside a task
+    agent_did       TEXT NOT NULL,
+    skill_called    TEXT NOT NULL,           
+    recipient       TEXT NOT NULL,           -- Hedera AccountId
+    amount_hbar     REAL NOT NULL,
+    memo            TEXT,
+    transaction_id  TEXT NOT NULL UNIQUE,
+    hashscan_url    TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
+)";
 
 pub struct Db {
-    conn: Connection,
+    conn: std::sync::Mutex<Connection>,
 }
 
 // ── Task status ───────────────────────────────────────────────────────────────
@@ -109,6 +122,17 @@ pub enum ToolCapability {
     Native,
     PromptFallback,
     Unverified,
+}
+// near TaskStatus/ToolCapability
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaymentRecord {
+    pub recipient: String,
+    pub amount_hbar: f64,
+    pub memo: Option<String>,
+    pub transaction_id: String,
+    pub hashscan_url: String,
+    pub status: String,
+    pub timestamp: String,
 }
 
 impl ToolCapability {
@@ -143,26 +167,28 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let db = Self { conn };
+        let db = Self { conn: std::sync::Mutex::new(conn) };
         db.run_migration()?;
         Ok(db)
     }
 
     fn run_migration(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(SCHEMA)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(SCHEMA)?;
         Ok(())
     }
 
     // ── Identity ──────────────────────────────────────────────────────────────
 
     pub fn ensure_identity(&self, did: &str) -> anyhow::Result<()> {
-        let count: i64 = self.conn.query_row("SELECT count(*) FROM identity", [], |row| row.get(0))?;
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT count(*) FROM identity", [], |row| row.get(0))?;
         if count > 0 {
             return Ok(());
         }
         info!("No identity found in DB — generating fresh Ed25519 identity for {}", did);
         let identity = crypto::generate_identity(did)?;
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO identity (did, public_key, manifest_path) VALUES (?, ?, ?)",
             params![identity.did, identity.public_key_multibase, "~/.aria/manifest.toml"],
         )?;
@@ -170,7 +196,8 @@ impl Db {
     }
 
     pub fn get_identity(&self) -> anyhow::Result<Option<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT did, public_key FROM identity LIMIT 1")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT did, public_key FROM identity LIMIT 1")?;
         let mut rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         if let Some(res) = rows.next() { return Ok(Some(res?)); }
         Ok(None)
@@ -190,7 +217,8 @@ impl Db {
         let now = now_iso8601();
         let task_chain_prev = self.compute_task_chain_link_hash(&task_id, &prompt_hash, &now)?;
 
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT INTO tasks (task_id, agent_did, source, prompt_hash, status, task_chain_prev, task_chain_sig, created_at)
              VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
             params![task_id, agent_did, source, prompt_hash, task_chain_prev, task_chain_sig, now],
@@ -201,7 +229,8 @@ impl Db {
     pub fn seal_task(&self, task_id: &str, status: TaskStatus) -> anyhow::Result<()> {
         let final_hash = self.get_last_step_hash(task_id)?;
         let now = now_iso8601();
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "UPDATE tasks SET status=?, final_hash=?, sealed_at=?,
              step_count=(SELECT count(*) FROM audit_log WHERE task_id=?)
              WHERE task_id=?",
@@ -229,7 +258,8 @@ impl Db {
         let prev_hash = self.get_last_step_hash(task_id)?;
         let chain_hash = crypto::compute_chain_hash(&prev_hash, &step.to_string(), skill_called, &input_hash, &result_hash, &timestamp);
 
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT INTO audit_log (task_id, agent_did, step, skill_called, input_hash, result_hash, success, prev_hash, chain_hash, signature, timestamp)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![task_id, agent_did, step as i64, skill_called, input_hash, result_hash, success as i64, prev_hash, chain_hash, signature, timestamp],
@@ -239,7 +269,8 @@ impl Db {
 
     pub fn verify_task_chain(&self, task_id: &str) -> anyhow::Result<usize> {
         let (_, pub_key) = self.get_identity()?.ok_or_else(|| anyhow::anyhow!("No identity"))?;
-        let mut stmt = self.conn.prepare("SELECT step, skill_called, input_hash, result_hash, prev_hash, chain_hash, signature, timestamp FROM audit_log WHERE task_id = ? ORDER BY step ASC")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT step, skill_called, input_hash, result_hash, prev_hash, chain_hash, signature, timestamp FROM audit_log WHERE task_id = ? ORDER BY step ASC")?;
         let mut rows = stmt.query([task_id])?;
         let mut expected_prev = String::new();
         let mut count = 0;
@@ -263,21 +294,24 @@ impl Db {
     // ── Config ────────────────────────────────────────────────────────────────
 
     pub fn get_config(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM config WHERE key = ?")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM config WHERE key = ?")?;
         let mut rows = stmt.query_map([key], |row| row.get(0))?;
         if let Some(res) = rows.next() { return Ok(Some(res?)); }
         Ok(None)
     }
 
     pub fn set_config(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", params![key, value])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", params![key, value])?;
         Ok(())
     }
 
     // ── Capabilities ──────────────────────────────────────────────────────────
     
     pub fn get_model_capability(&self, model: &str) -> anyhow::Result<ToolCapability> {
-        let mut stmt = self.conn.prepare("SELECT capability FROM model_capabilities WHERE model_string = ?")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT capability FROM model_capabilities WHERE model_string = ?")?;
         let mut rows = stmt.query_map([model], |row| row.get(0))?;
         if let Some(res) = rows.next() { 
             let cap_str: String = res?;
@@ -288,7 +322,8 @@ impl Db {
 
     pub fn set_model_capability(&self, model: &str, capability: ToolCapability) -> anyhow::Result<()> {
         let now = now_iso8601();
-        self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
             "INSERT OR REPLACE INTO model_capabilities (model_string, capability, updated_at) VALUES (?, ?, ?)",
             params![model, capability.as_str(), now],
         )?;
@@ -298,19 +333,22 @@ impl Db {
     // ── Skills ────────────────────────────────────────────────────────────────
 
     pub fn install_skill(&self, name: &str, version: &str, wasm_path: &str) -> anyhow::Result<()> {
-        self.conn.execute("INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)", params![name, version, wasm_path])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT OR REPLACE INTO skills (name, version, wasm_path) VALUES (?, ?, ?)", params![name, version, wasm_path])?;
         Ok(())
     }
 
     pub fn get_skill(&self, name: &str) -> anyhow::Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT wasm_path FROM skills WHERE name = ?")?;
         let mut rows = stmt.query_map([name], |row| row.get(0))?;
         if let Some(res) = rows.next() { return Ok(Some(res?)); }
         Ok(None)
     }
 
     pub fn list_skills(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT name, version FROM skills ORDER BY name")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name, version FROM skills ORDER BY name")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut res = Vec::new();
         for r in rows { res.push(r?); }
@@ -318,7 +356,8 @@ impl Db {
     }
 
     pub fn remove_skill(&self, name: &str) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM skills WHERE name = ?", [name])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM skills WHERE name = ?", [name])?;
         Ok(())
     }
 
@@ -335,21 +374,84 @@ impl Db {
     }
 
     fn compute_task_chain_link_hash(&self, task_id: &str, prompt_hash: &str, created_at: &str) -> anyhow::Result<String> {
-        let prev: String = self.conn.query_row("SELECT task_chain_prev FROM tasks ORDER BY created_at DESC LIMIT 1", [], |row| row.get(0)).unwrap_or_default();
+        let conn = self.conn.lock().unwrap();
+        let prev: String = conn.query_row("SELECT task_chain_prev FROM tasks ORDER BY created_at DESC LIMIT 1", [], |row| row.get(0)).unwrap_or_default();
         Ok(crypto::sha256_hex_str(&format!("{}|{}|{}|{}", prev, task_id, prompt_hash, created_at)))
     }
 
     fn next_step_index(&self, task_id: &str) -> anyhow::Result<usize> {
-        let n: i64 = self.conn.query_row("SELECT count(*) FROM audit_log WHERE task_id = ?", [task_id], |row| row.get(0))?;
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM audit_log WHERE task_id = ?", [task_id], |row| row.get(0))?;
         Ok((n + 1) as usize)
     }
 
     fn get_last_step_hash(&self, task_id: &str) -> anyhow::Result<String> {
-        let mut stmt = self.conn.prepare("SELECT chain_hash FROM audit_log WHERE task_id = ? ORDER BY step DESC LIMIT 1")?;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT chain_hash FROM audit_log WHERE task_id = ? ORDER BY step DESC LIMIT 1")?;
         let mut rows = stmt.query_map([task_id], |row| row.get(0))?;
         if let Some(res) = rows.next() { return Ok(res?); }
         Ok(String::new())
     }
+
+    //--------------Payment ------------------------------
+    pub fn insert_payment(
+    &self,
+    task_id: Option<&str>,
+    agent_did: &str,
+    skill_called: &str,
+    recipient: &str,
+    amount_hbar: f64,
+    memo: &str,
+    transaction_id: &str,
+    hashscan_url: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    let conn = self.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO payments (task_id, agent_did, skill_called, recipient, amount_hbar, memo, transaction_id, hashscan_url, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![task_id, agent_did, skill_called, recipient, amount_hbar, memo, transaction_id, hashscan_url, status],
+    )?;
+    Ok(())
+}
+
+    pub fn update_payment_status(
+        &self,
+        transaction_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE payments SET status = ?1 WHERE transaction_id = ?2",
+            params![status, transaction_id],
+        )?;
+        Ok(())
+    }
+
+
+/// Payments in the last `days` days, most recent first — used by query.payments skill.
+pub fn list_recent_payments(&self, days: i64) -> anyhow::Result<Vec<PaymentRecord>> {
+    let conn = self.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT recipient, amount_hbar, memo, transaction_id, hashscan_url, status, timestamp
+         FROM payments
+         WHERE timestamp >= datetime('now', ?1)
+         ORDER BY timestamp DESC",
+    )?;
+    let days_modifier = format!("-{} days", days);
+    let rows = stmt.query_map(params![days_modifier], |row| {
+        Ok(PaymentRecord {
+            recipient: row.get(0)?,
+            amount_hbar: row.get(1)?,
+            memo: row.get(2)?,
+            transaction_id: row.get(3)?,
+            hashscan_url: row.get(4)?,
+            status: row.get(5)?,
+            timestamp: row.get(6)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
 }
 
 fn now_iso8601() -> String {

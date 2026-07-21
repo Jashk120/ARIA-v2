@@ -12,6 +12,8 @@ mod config;
 mod crypto;
 mod db;
 mod identity;
+mod payment;
+mod payments;
 mod skills;
 
 use crate::config::RuntimeConfig;
@@ -87,6 +89,41 @@ fn bootstrap_db() -> anyhow::Result<Db> {
     Ok(db)
 }
 
+/// Attempt to build an X402PaymentVault from environment; returns None on any failure.
+/// This lets the daemon start without Hedera credentials — x402 just won't work.
+fn build_x402_vault(db: &Db) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
+    use hiero_sdk::{AccountId, Client, PrivateKey};
+    use std::str::FromStr;
+
+    let account_id_str = std::env::var("HEDERA_ACCOUNT_ID").ok()?;
+    let private_key_str = std::env::var("HEDERA_PRIVATE_KEY").ok()?;
+    if private_key_str.trim().is_empty() { return None; }
+
+    let operator_id = AccountId::from_str(&account_id_str).ok()?;
+    let private_key = PrivateKey::from_str_ecdsa(&private_key_str).ok()?;
+
+    let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
+    let client = match network.as_str() {
+        "mainnet" => Client::for_mainnet(),
+        "previewnet" => Client::for_previewnet(),
+        _ => Client::for_testnet(),
+    };
+    client.set_operator(operator_id, private_key.clone());
+
+    let facilitator_url = std::env::var("X402_FACILITATOR_URL")
+        .unwrap_or_else(|_| "https://x402.org/facilitator".to_string());
+
+    // We can't hold a &Db across the Option boundary easily, so open a fresh Db for the vault.
+    let vault_db = crate::db::Db::new().ok()?;
+    Some(Arc::new(crate::payments::x402_vault::X402PaymentVault::new(
+        client,
+        operator_id,
+        private_key,
+        vault_db,
+        facilitator_url,
+    )))
+}
+
 fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
     if crate::config::CONFIG.use_provider == crate::config::Provider::Ollama {
         return Ok(db.get_config("openrouter_api_key").unwrap_or_default().unwrap_or_default());
@@ -113,6 +150,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(bootstrap_db()?);
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
+    let payment_vault = std::sync::Arc::new(crate::payment::PaymentVault::from_env()?);
+
+    // Build X402PaymentVault if HEDERA credentials are present; otherwise skip.
+    let x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>> =
+        build_x402_vault(&db);
+
     let skills = Arc::new(SkillManager::new()?);
 
     // Initialize HAL Vault with auto-probing
@@ -133,6 +176,8 @@ async fn run_daemon() -> anyhow::Result<()> {
                 let runtime_cfg = runtime_cfg.clone();
                 let skills = skills.clone();
                 let vault = vault.clone();
+                let payment_vault = payment_vault.clone();
+                let x402_vault = x402_vault.clone();
 
                 tokio::spawn(async move {
                     let mut buffer = [0u8; 4096];
@@ -152,7 +197,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                     info!("Received task: {}", req.task);
 
                     let db = match Db::new() {
-                        Ok(d) => d,
+                        Ok(d) => Arc::new(d),
                         Err(e) => {
                             let _ = socket.write_all(format!("DB Connect Error: {}\n", e).as_bytes()).await;
                             return;
@@ -177,9 +222,13 @@ async fn run_daemon() -> anyhow::Result<()> {
                     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
                     let history = vec![serde_json::json!({ "role": "user", "content": req.task.clone() })];
 
+                    let db_for_loop = db.clone();
+                    let did_for_loop = vault.did();
+                    let task_id_for_loop = task_id.clone();
                     tokio::spawn(async move {
                         crate::agent::react_loop::run_react_loop(
                             api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
+                            db_for_loop, payment_vault, x402_vault, did_for_loop, task_id_for_loop
                         ).await;
                     });
 
@@ -230,6 +279,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
 

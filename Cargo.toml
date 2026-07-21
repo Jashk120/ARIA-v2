@@ -9,7 +9,7 @@ members = [
     "skills/fs/write.fs",
     "skills/pay/x402.pay",
     "skills/pay/query.payments",
-    "server",
+
 ]
 
 [package]

@@ -12,7 +12,6 @@ mod config;
 mod crypto;
 mod db;
 mod identity;
-mod payment;
 mod payments;
 mod skills;
 
@@ -156,7 +155,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(bootstrap_db()?);
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
-    let payment_vault = std::sync::Arc::new(crate::payment::PaymentVault::from_env()?);
+    let payment_vault = std::sync::Arc::new(crate::payments::direct::PaymentVault::from_env()?);
 
     // Build X402PaymentVault if HEDERA credentials are present; otherwise skip.
     let x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>> =

@@ -2,7 +2,7 @@
 //! function wiring (HTTP, filesystem) gated by manifest capabilities.
 
 use anyhow::{anyhow, bail};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Caller, Engine, Linker, Module, Store};
@@ -26,6 +26,12 @@ pub struct HostState {
     http_client: reqwest::Client,
     fs_sandbox: Option<FsSandbox>,
     wasi: WasiP1Ctx,
+    payment_vault: Option<Arc<crate::payment::PaymentVault>>,
+    x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    db: Option<Arc<crate::db::Db>>,
+    agent_did: String,
+    skill_name: String,
+    task_id: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -35,6 +41,12 @@ pub async fn run_wasm_instance_async(
     module: Arc<Module>,
     args: &Value,
     manifest: &SkillManifest,
+    db: Option<Arc<crate::db::Db>>,
+    payment_vault: Option<Arc<crate::payment::PaymentVault>>,
+    x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    agent_did: String,
+    skill_name: String,
+    task_id: Option<String>,
 ) -> anyhow::Result<Value> {
     let wasi = WasiCtxBuilder::new().build_p1();
 
@@ -50,6 +62,12 @@ pub async fn run_wasm_instance_async(
             .build()?,
         fs_sandbox,
         wasi,
+        payment_vault,
+        x402_vault,
+        db,
+        agent_did,
+        skill_name,
+        task_id,
     };
 
     let mut store = Store::new(engine, state);
@@ -62,6 +80,15 @@ pub async fn run_wasm_instance_async(
     }
     if manifest.capabilities.fs {
         wire_fs(&mut linker)?;
+    }
+    if manifest.capabilities.db_query {
+        wire_db_query(&mut linker)?;
+    }
+    if manifest.capabilities.hedera_pay {
+        wire_hedera_pay(&mut linker)?;
+    }
+    if manifest.capabilities.x402_pay {
+        wire_x402_pay(&mut linker)?;
     }
 
     linker.func_wrap(
@@ -570,4 +597,330 @@ async fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> a
     }
 
     bail!("Skill missing required 'alloc' export for dynamic host-to-guest FFI data passing.");
+}
+// ── DB query capability ──────────────────────────────────────────────────────
+//
+// Generic host_db_query ABI, but the host only ever dispatches to a fixed
+// allow-list of named, parameterized queries below. WASM never gets raw SQL —
+// adding a new query type later just means adding a match arm here, no ABI
+// change and no new capability wiring needed for future query types.
+
+fn wire_db_query(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "aria",
+        "host_db_query",
+        |mut caller: Caller<'_, HostState>,
+         (type_ptr, type_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                let query_type = match read_wasm_str(&mut caller, type_ptr, type_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_db_query] bad query_type: {}", e); return 0; }
+                };
+                let params_json = match read_wasm_str(&mut caller, params_ptr, params_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_db_query] bad params: {}", e); return 0; }
+                };
+
+                let db = match caller.data().db.clone() {
+                    Some(db) => db,
+                    None => { eprintln!("[host_db_query] db_query capability not enabled"); return 0; }
+                };
+
+                let result = match dispatch_query(&db, &query_type, &params_json) {
+                    Ok(v) => v,
+                    Err(e) => json!({ "error": e }),
+                };
+
+                let bytes = serde_json::to_vec(&result).unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// Fixed allow-list — the only queries any WASM skill can ever trigger.
+/// Add new arms here as new needs come up; never expose raw SQL to the guest.
+fn dispatch_query(db: &crate::db::Db, query_type: &str, params_json: &str) -> Result<Value, String> {
+    match query_type {
+        "payments_recent" => {
+            let params: Value = serde_json::from_str(params_json).unwrap_or(json!({}));
+            let days = params["days"].as_i64().unwrap_or(7);
+            let records = db.list_recent_payments(days).map_err(|e| e.to_string())?;
+            Ok(json!({ "payments": records }))
+        }
+        other => Err(format!("unknown query type: {}", other)),
+    }
+}
+// ── x402 payment capability ──────────────────────────────────────────────────
+//
+// host_x402_pay(url_ptr, url_len) -> packed(ptr,len) of JSON result, or 0 on error
+// Fetches a URL, handles HTTP 402 by paying via X402PaymentVault, retries
+// with X-PAYMENT header, and returns the unlocked resource body.
+
+fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "aria",
+        "host_x402_pay",
+        |mut caller: Caller<'_, HostState>, (url_ptr, url_len): (i32, i32)| {
+            Box::new(async move {
+                let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_x402_pay] failed to read url: {}", e); return 0; }
+                };
+
+                // Step 1: GET the URL, expecting a 402 response
+                let initial_resp = match caller.data().http_client.get(&url).send().await {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("[host_x402_pay] initial GET failed: {}", e); return 0; }
+                };
+
+                if initial_resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+                    eprintln!("[host_x402_pay] expected 402, got: {}", initial_resp.status());
+                    return 0;
+                }
+
+                // Step 2: Parse PaymentRequirements from the 402 response
+                // READING THE 402 RESPONSE — check headers BEFORE body, not body only:
+                #[derive(serde::Deserialize)]
+                struct PaymentRequiredBody {
+                    accepts: Vec<crate::payments::x402_types::PaymentRequirements>,
+                }
+
+                let header_opt = initial_resp
+                    .headers()
+                    .get("PAYMENT-REQUIRED")
+                    .and_then(|v| v.to_str().ok());
+
+                let mut payment_body: Option<PaymentRequiredBody> = None;
+                let mut header_parsed = false;
+
+                if let Some(hdr_val) = header_opt {
+                    if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hdr_val) {
+                        if let Ok(parsed) = serde_json::from_slice::<PaymentRequiredBody>(&decoded) {
+                            payment_body = Some(parsed);
+                            header_parsed = true;
+                        } else {
+                            eprintln!("[host_x402_pay] failed to parse PAYMENT-REQUIRED header JSON");
+                        }
+                    } else {
+                        eprintln!("[host_x402_pay] failed to base64-decode PAYMENT-REQUIRED header");
+                    }
+                }
+
+                if payment_body.is_none() {
+                    // Try parsing the body
+                    if let Ok(body_text) = initial_resp.text().await {
+                        if !body_text.trim().is_empty() {
+                            match serde_json::from_str::<PaymentRequiredBody>(&body_text) {
+                                Ok(parsed) => {
+                                    payment_body = Some(parsed);
+                                }
+                                Err(e) => {
+                                    if !header_parsed {
+                                        eprintln!("[host_x402_pay] failed to parse 402 body: {} (no valid header found)", e);
+                                        return 0;
+                                    }
+                                }
+                            }
+                        } else if !header_parsed {
+                            eprintln!("[host_x402_pay] 402 response body is empty and no valid header found");
+                            return 0;
+                        }
+                    } else if !header_parsed {
+                        eprintln!("[host_x402_pay] failed to read 402 body and no valid header found");
+                        return 0;
+                    }
+                }
+
+                let payment_body = match payment_body {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("[host_x402_pay] no valid PaymentRequirements found anywhere");
+                        return 0;
+                    }
+                };
+
+                // Find a hedera:testnet requirement
+                let requirements = match payment_body.accepts.into_iter().find(|r| r.network == "hedera:testnet") {
+                    Some(r) => r,
+                    None => { eprintln!("[host_x402_pay] no hedera:testnet requirement in 402 accepts"); return 0; }
+                };
+
+                // Step 3: Pay via X402PaymentVault
+                let vault: Arc<crate::payments::x402_vault::X402PaymentVault> =
+                    match caller.data().x402_vault.clone() {
+                    Some(v) => v,
+                    None => { eprintln!("[host_x402_pay] x402_pay capability not enabled"); return 0; }
+                };
+
+                let payment_result = match vault.pay(requirements.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("[host_x402_pay] payment failed: {}", e); return 0; }
+                };
+
+                // Step 5: Retry with PAYMENT-SIGNATURE header
+                let retry_resp = match caller.data().http_client
+                    .get(&url)
+                    .header("PAYMENT-SIGNATURE", &payment_result.payment_token)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[host_x402_pay] retry GET failed: {}", e);
+                        if let Some(db) = caller.data().db.clone() {
+                            if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                                 eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
+                            }
+                        }
+                        return 0;
+                    }
+                };
+
+                if !retry_resp.status().is_success() {
+                    eprintln!("[host_x402_pay] retry returned non-200: {}", retry_resp.status());
+                    if let Some(db) = caller.data().db.clone() {
+                        if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                            eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
+                        }
+                    }
+                    return 0;
+                }
+
+                // READING THE SETTLEMENT CONFIRMATION — check for PAYMENT-RESPONSE header on successful response:
+                if let Some(resp_hdr_val) = retry_resp
+                    .headers()
+                    .get("PAYMENT-RESPONSE")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, resp_hdr_val) {
+                        match serde_json::from_slice::<crate::payments::x402_types::SettleResponse>(&decoded) {
+                            Ok(settle_resp) => {
+                                eprintln!("[host_x402_pay] Successfully parsed PAYMENT-RESPONSE header: {:?}", settle_resp);
+                            }
+                            Err(e) => {
+                                eprintln!("[host_x402_pay] failed to parse PAYMENT-RESPONSE header JSON: {}", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("[host_x402_pay] failed to base64-decode PAYMENT-RESPONSE header");
+                    }
+                }
+
+                // Step 6: Parse response body — JSON if content-type is JSON, else string
+                let content_type = retry_resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let body_bytes = match retry_resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[host_x402_pay] failed to read retry body: {}", e);
+                        if let Some(db) = caller.data().db.clone() {
+                            if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                                eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
+                            }
+                        }
+                        return 0;
+                    }
+                };
+
+                let data: serde_json::Value = if content_type.contains("application/json") {
+                    match serde_json::from_slice(&body_bytes) {
+                        Ok(v) => v,
+                        Err(_) => serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string()),
+                    }
+                } else {
+                    serde_json::Value::String(String::from_utf8_lossy(&body_bytes).to_string())
+                };
+
+                // Step 7: Return JSON matching pay.x402 output_schema
+                let result = serde_json::json!({
+                    "data": data,
+                    "transaction_id": payment_result.transaction_id,
+                    "hashscan_url": payment_result.hashscan_url,
+                });
+
+                let bytes = serde_json::to_vec(&result).unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+    Ok(())
+}
+
+// ── Hedera payment capability ────────────────────────────────────────────────
+
+fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "aria",
+        "host_hedera_pay",
+        |mut caller: Caller<'_, HostState>,
+         (recipient_ptr, recipient_len, amount_ptr, amount_len, memo_ptr, memo_len): (
+            i32, i32, i32, i32, i32, i32,
+        )| {
+            Box::new(async move {
+                let recipient = match read_wasm_str(&mut caller, recipient_ptr, recipient_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_hedera_pay] bad recipient: {}", e); return 0; }
+                };
+                let amount_str = match read_wasm_str(&mut caller, amount_ptr, amount_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_hedera_pay] bad amount: {}", e); return 0; }
+                };
+                let memo = match read_wasm_str(&mut caller, memo_ptr, memo_len) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("[host_hedera_pay] bad memo: {}", e); return 0; }
+                };
+                let amount: f64 = match amount_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => { eprintln!("[host_hedera_pay] bad amount format: {}", e); return 0; }
+                };
+
+                let vault = match caller.data().payment_vault.clone() {
+                    Some(v) => v,
+                    None => { eprintln!("[host_hedera_pay] hedera_pay capability not enabled"); return 0; }
+                };
+
+                let receipt = match vault.pay(&recipient, amount, &memo).await {
+                    Ok(r) => r,
+                    Err(e) => { eprintln!("[host_hedera_pay] payment failed: {}", e); return 0; }
+                };
+
+                // Log to db right here — host is the only side with db access.
+                // agent_did/skill_called/task_id are best-effort context that
+                // HostState should carry in from run_skill_raw (see note below).
+                if let Some(db) = caller.data().db.clone() {
+                    let state = caller.data();
+                    if let Err(e) = db.insert_payment(
+                        state.task_id.as_deref(),
+                        &state.agent_did,
+                        &state.skill_name,
+                        &recipient,
+                        amount,
+                        &memo,
+                        &receipt.transaction_id,
+                        &receipt.hashscan_url,
+                        &receipt.status,
+                    ) {
+                        eprintln!("[host_hedera_pay] failed to log payment to db: {}", e);
+                        // Don't fail the payment over a logging error — the
+                        // money already moved on-chain; the receipt is still returned.
+                    }
+                }
+
+                let bytes = serde_json::to_vec(&json!({
+                    "transaction_id": receipt.transaction_id,
+                    "hashscan_url": receipt.hashscan_url,
+                    "status": receipt.status,
+                })).unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+    Ok(())
 }

@@ -91,6 +91,11 @@ pub async fn run_react_loop(
     tx: mpsc::Sender<AgentEvent>,
     user_prompt: String,
     skills_type: Option<String>,
+    db: std::sync::Arc<crate::db::Db>,
+    payment_vault: std::sync::Arc<crate::payment::PaymentVault>,
+    x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    agent_did: String,
+    task_id: String,
 ) {
     let mut skill_fire_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -105,21 +110,18 @@ pub async fn run_react_loop(
         };
 
         // Fetch capability every step in case it was updated
-        let mut capability = match crate::db::Db::new() {
-            Ok(db) => {
-                let db_cap = db.get_model_capability(model).unwrap_or(crate::db::ToolCapability::Unverified);
-                if db_cap == crate::db::ToolCapability::Unverified {
-                    if let Some(static_cap) = static_capability(model) {
-                        let _ = db.set_model_capability(model, static_cap.clone());
-                        static_cap
-                    } else {
-                        db_cap
-                    }
+        let mut capability = {
+            let db_cap = db.get_model_capability(model).unwrap_or(crate::db::ToolCapability::Unverified);
+            if db_cap == crate::db::ToolCapability::Unverified {
+                if let Some(static_cap) = static_capability(model) {
+                    let _ = db.set_model_capability(model, static_cap.clone());
+                    static_cap
                 } else {
                     db_cap
                 }
-            },
-            Err(_) => static_capability(model).unwrap_or(crate::db::ToolCapability::Unverified),
+            } else {
+                db_cap
+            }
         };
 
         if force_fallback_this_turn {
@@ -257,7 +259,15 @@ pub async fn run_react_loop(
                     }
 
                     let (observation, is_error): (String, bool) =
-                        match skills.run_skill_raw(&skill, &enriched).await {
+                        match skills.run_skill_raw(
+                            &skill,
+                            &enriched,
+                            Some(db.clone()),
+                            Some(payment_vault.clone()),
+                            x402_vault.clone(),
+                            agent_did.clone(),
+                            Some(task_id.clone()),
+                        ).await {
                             Ok(val) => (val.to_string(), false),
                             Err(e) => (e.to_string(), true),
                         };

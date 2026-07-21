@@ -53,14 +53,34 @@ impl SkillManager {
     }
 
     /// Run a skill with db key injection.
-    pub async fn run_skill(&self, name: &str, args: &Value, db: &Db) -> anyhow::Result<Value> {
+    pub async fn run_skill(
+        &self,
+        name: &str,
+        args: &Value,
+        db: Option<Arc<Db>>,
+        payment_vault: Option<Arc<crate::payment::PaymentVault>>,
+        x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>>,
+        agent_did: String,
+        task_id: Option<String>,
+    ) -> anyhow::Result<Value> {
         let mut args = args.clone();
-        enrich_args(name, &mut args, db)?;
-        self.run_skill_raw(name, &args).await
+        if let Some(ref db_ref) = db {
+            enrich_args(name, &mut args, db_ref)?;
+        }
+        self.run_skill_raw(name, &args, db, payment_vault, x402_vault, agent_did, task_id).await
     }
 
     /// Run a skill with pre-enriched args.
-    pub async fn run_skill_raw(&self, name: &str, args: &Value) -> anyhow::Result<Value> {
+    pub async fn run_skill_raw(
+        &self,
+        name: &str,
+        args: &Value,
+        db: Option<Arc<Db>>,
+        payment_vault: Option<Arc<crate::payment::PaymentVault>>,
+        x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>>,
+        agent_did: String,
+        task_id: Option<String>,
+    ) -> anyhow::Result<Value> {
         let path = wasm_path(name)?;
 
         if !path.exists() {
@@ -78,7 +98,18 @@ impl SkillManager {
         let module = self.get_module(name, &path)?;
         let engine = self.engine.clone();
 
-        run_wasm_instance_async(&engine, module, args, &manifest).await
+        run_wasm_instance_async(
+            &engine, 
+            module, 
+            args, 
+            &manifest,
+            db,
+            payment_vault,
+            x402_vault,
+            agent_did,
+            name.to_string(),
+            task_id,
+        ).await
     }
 }
 

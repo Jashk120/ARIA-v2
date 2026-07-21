@@ -41,6 +41,12 @@ pub struct Capabilities {
     pub http: bool,
     #[serde(default)]
     pub fs: bool,
+    #[serde(default)]
+    pub hedera_pay: bool,
+    #[serde(default)]
+    pub db_query: bool,
+    #[serde(default)]
+    pub x402_pay: bool,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]

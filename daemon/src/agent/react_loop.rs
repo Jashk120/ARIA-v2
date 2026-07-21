@@ -92,7 +92,7 @@ pub async fn run_react_loop(
     user_prompt: String,
     skills_type: Option<String>,
     db: std::sync::Arc<crate::db::Db>,
-    payment_vault: std::sync::Arc<crate::payment::PaymentVault>,
+    payment_vault: std::sync::Arc<crate::payments::direct::PaymentVault>,
     x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
     agent_did: String,
     task_id: String,

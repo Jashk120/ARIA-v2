@@ -86,6 +86,12 @@ fn bootstrap_db() -> anyhow::Result<Db> {
     let db = Db::new()?;
     // Generate identity if missing
     db.ensure_identity("did:aria:jayesh")?;
+    
+    // Seed node URL from environment
+    if let Ok(url) = std::env::var("ARIA_NODE_URL") {
+        db.set_config("node_url", &url)?;
+    }
+    
     Ok(db)
 }
 

@@ -13,5 +13,12 @@ db_query = true
 args_schema   = '{"days":7}'
 output_schema = '{"payments":[{"recipient":"string","amount_hbar":"number","memo":"string","transaction_id":"string","hashscan_url":"string","status":"string","timestamp":"string"}]}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.days]
+type = "integer"
+description = "How many days back to look up payments (default: 7)"
+
 [react]
 max_steps = 1

@@ -11,8 +11,22 @@ http = true
 x402_pay = true
 
 [call]
-args_schema   = '{"url":"string"}'
+args_schema   = '{"url":"<optional, defaults to node_url>"}'
 output_schema = '{"data":"object","transaction_id":"string","hashscan_url":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.url]
+type = "string"
+description = "The full URL of the paywalled resource. If omitted, uses the configured ARIA node URL."
 
 [react]
 max_steps = 2
+
+# node_url is injected from env/db — agent doesn't need to know the URL explicitly
+[config.node_url]
+default = "http://localhost:3000/protected"
+injected = false
+inject   = true
+secret   = false

@@ -17,7 +17,7 @@ pub struct X402PaymentVault {
     client: Client,
     operator_id: AccountId,
     private_key: PrivateKey,
-    db: crate::db::Db,
+    db: std::sync::Arc<crate::db::Db>,
     facilitator_url: String,
 }
 
@@ -26,7 +26,7 @@ impl X402PaymentVault {
         client: Client,
         operator_id: AccountId,
         private_key: PrivateKey,
-        db: crate::db::Db,
+        db: std::sync::Arc<crate::db::Db>,
         facilitator_url: String,
     ) -> Self {
         Self {
@@ -41,6 +41,9 @@ impl X402PaymentVault {
     pub async fn pay(
         &self,
         requirements: PaymentRequirements,
+        skill_called: &str,
+        task_id: Option<&str>,
+        memo: Option<&str>,
     ) -> Result<PaymentResult, PaymentError> {
         // 1. Fetch /supported from the facilitator, extract the hedera:testnet feePayer
         let facilitator = FacilitatorClient::new(self.facilitator_url.clone());
@@ -90,12 +93,11 @@ impl X402PaymentVault {
         // 5. Call facilitator.verify() first
         let payload_json = serde_json::to_string(&payload).unwrap_or_default();
         let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload_json.as_bytes());
-        eprintln!("DEBUG: Full Base64 Payload right before /verify:\n{}", payload_b64);
+       
 
         let verify_res = facilitator.verify(&payload, &requirements).await?;
         if !verify_res.is_valid {
             let reason = verify_res.invalid_reason.unwrap_or_else(|| "Verification failed".to_string());
-            eprintln!("DEBUG: Verify Request Failed. Reason: {}", reason);
             return Err(PaymentError::VerificationFailed(reason));
         }
 
@@ -118,28 +120,19 @@ impl X402PaymentVault {
             .map(|(did, _)| did)
             .unwrap_or_else(|| "unknown".to_string());
 
-        let skill_called = requirements.extra.get("skillCalled")
-            .and_then(|v| v.as_str())
-            .unwrap_or("x402_payment")
-            .to_string();
-
-        let task_id = requirements.extra.get("taskId")
-            .and_then(|v| v.as_str());
-
         let amount_parsed: f64 = requirements.amount.parse().unwrap_or(0.0);
         let amount_hbar = amount_parsed / 100_000_000.0;
-        let memo = requirements.extra.get("memo").and_then(|v| v.as_str()).unwrap_or("");
 
         if let Err(e) = self.db.insert_payment(
             task_id,
             &agent_did,
-            &skill_called,
+            skill_called,
             &requirements.pay_to,
             amount_hbar,
-            memo,
+            memo.unwrap_or(""),
             &transaction_id,
             &hashscan_url,
-            "SUCCESS",
+            if settle_res.success { "SUCCESS" } else { "FAILED" },
         ) {
             warn!("Failed to log payment to db: {}", e);
         }

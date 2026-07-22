@@ -96,7 +96,7 @@ fn bootstrap_db() -> anyhow::Result<Db> {
 
 /// Attempt to build an X402PaymentVault from environment; returns None on any failure.
 /// This lets the daemon start without Hedera credentials — x402 just won't work.
-fn build_x402_vault(db: &Db) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
+fn build_x402_vault(db: Arc<crate::db::Db>) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
     use hiero_sdk::{AccountId, Client, PrivateKey};
     use std::str::FromStr;
 
@@ -118,13 +118,11 @@ fn build_x402_vault(db: &Db) -> Option<Arc<crate::payments::x402_vault::X402Paym
     let facilitator_url = std::env::var("X402_FACILITATOR_URL")
         .unwrap_or_else(|_| "https://x402.org/facilitator".to_string());
 
-    // We can't hold a &Db across the Option boundary easily, so open a fresh Db for the vault.
-    let vault_db = crate::db::Db::new().ok()?;
     Some(Arc::new(crate::payments::x402_vault::X402PaymentVault::new(
         client,
         operator_id,
         private_key,
-        vault_db,
+        db,
         facilitator_url,
     )))
 }
@@ -159,7 +157,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Build X402PaymentVault if HEDERA credentials are present; otherwise skip.
     let x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>> =
-        build_x402_vault(&db);
+        build_x402_vault(db.clone());
 
     let skills = Arc::new(SkillManager::new()?);
 

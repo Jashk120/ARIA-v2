@@ -754,7 +754,12 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     None => { eprintln!("[host_x402_pay] x402_pay capability not enabled"); return 0; }
                 };
 
-                let payment_result = match vault.pay(requirements.clone()).await {
+                let (skill_called, task_id) = {
+                    let st = caller.data();
+                    (st.skill_name.clone(), st.task_id.clone())
+                };
+
+                let payment_result = match vault.pay(requirements.clone(), &skill_called, task_id.as_deref(), None).await {
                     Ok(r) => r,
                     Err(e) => { eprintln!("[host_x402_pay] payment failed: {}", e); return 0; }
                 };

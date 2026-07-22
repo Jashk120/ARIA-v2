@@ -91,7 +91,7 @@ pub fn build_payment_transaction(
     client_account_id: &AccountId,
     client_private_key: &PrivateKey,
     requirements: &PaymentRequirements,
-    hedera_client: &Client,
+    _hedera_client: &Client,
 ) -> Result<String, PaymentError> {
     let amount: i64 = requirements.amount.parse().map_err(|_| PaymentError::InvalidAmount)?;
     if amount <= 0 {
@@ -122,7 +122,10 @@ pub fn build_payment_transaction(
 
     // Pin to a single node to ensure we don't generate a multi-node transaction list.
     // The facilitator JS SDK only supports decoding a 1-element list.
-    let node_id = AccountId::from_str("0.0.3").unwrap();
+    // Reads from HEDERA_NODE_ACCOUNT_ID environment variable to avoid a hardcoded single point of failure.
+    let node_account_str = std::env::var("HEDERA_NODE_ACCOUNT_ID").unwrap_or_else(|_| "0.0.3".to_string());
+    let node_id = AccountId::from_str(&node_account_str)
+        .map_err(|e| PaymentError::HederaSdkError(format!("Invalid node account ID '{}': {}", node_account_str, e)))?;
     tx.node_account_ids([node_id]);
 
     tx.freeze_with(None)
@@ -136,33 +139,6 @@ pub fn build_payment_transaction(
     Ok(STANDARD.encode(encode_as_transaction_list(signed_bytes)))
 }
 
-/// Helper to quickly parse the `bodyBytes` field out of a serialized `SignedTransaction`
-/// protobuf without pulling in a full protobuf parser.
-///
-/// `SignedTransaction` wire format for the first field (1, wire type 2):
-/// [0x0A, varint length, ... body_bytes ...]
-fn extract_body_bytes(signed_tx_bytes: &[u8]) -> Option<&[u8]> {
-    if signed_tx_bytes.is_empty() || signed_tx_bytes[0] != 0x0A {
-        return None;
-    }
-    let mut len = 0usize;
-    let mut shift = 0;
-    let mut offset = 1;
-    while offset < signed_tx_bytes.len() {
-        let b = signed_tx_bytes[offset];
-        offset += 1;
-        len |= ((b & 0x7F) as usize) << shift;
-        if (b & 0x80) == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    if offset + len <= signed_tx_bytes.len() {
-        Some(&signed_tx_bytes[offset..offset + len])
-    } else {
-        None
-    }
-}
 
 /// Wraps raw `SignedTransaction` protobuf bytes into the single-entry
 /// `TransactionList` envelope that the Hedera JS SDK's `Transaction.fromBytes()`
@@ -231,5 +207,42 @@ mod tests {
         assert!(res.is_ok(), "Expected Ok transaction, got: {:?}", res);
         let tx_b64 = res.unwrap();
         assert!(!tx_b64.is_empty(), "Transaction base64 should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_build_payment_transaction_ecdsa() {
+        let client_account_id = AccountId::from_str("0.0.1111").unwrap();
+        // Generate an ECDSA key to test the ECDSA path (regression test for ECDSA specific bugs)
+        let client_private_key = PrivateKey::generate_ecdsa();
+        
+        let mut extra = serde_json::Map::new();
+        extra.insert("feePayer".to_string(), serde_json::Value::String("0.0.5678".to_string()));
+
+        let requirements = PaymentRequirements {
+            scheme: "exact".to_string(),
+            network: "hedera:testnet".to_string(),
+            amount: "1000".to_string(),
+            asset: "0.0.0".to_string(),
+            pay_to: "0.0.1234".to_string(),
+            max_timeout_seconds: 120,
+            extra: serde_json::Value::Object(extra),
+        };
+
+        let hedera_client = Client::for_testnet();
+
+        let res = build_payment_transaction(
+            &client_account_id,
+            &client_private_key,
+            &requirements,
+            &hedera_client,
+        );
+
+        assert!(res.is_ok(), "Expected Ok transaction, got: {:?}", res);
+        let tx_b64 = res.unwrap();
+        assert!(!tx_b64.is_empty(), "Transaction base64 should not be empty");
+        
+        // BUG-2 regression coverage: explicitly decode the bytes and verify.
+        let raw = base64::engine::general_purpose::STANDARD.decode(&tx_b64).unwrap();
+        let _tx = hiero_sdk::AnyTransaction::from_bytes(&raw).expect("Should decode back to AnyTransaction");
     }
 }

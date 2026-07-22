@@ -241,12 +241,12 @@ async fn run() -> anyhow::Result<()> {
         hedera_client,
         operator_id,
         private_key,
-        vault_db,
+        Arc::new(vault_db),
         FACILITATOR_URL.to_string(),
     ));
 
     let result = vault
-        .pay(requirements)
+        .pay(requirements, "test_x402_payment", None, None)
         .await
         .map_err(|e| anyhow::anyhow!("vault.pay() failed: {e}"))?;
 

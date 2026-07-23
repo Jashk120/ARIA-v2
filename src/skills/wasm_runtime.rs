@@ -150,6 +150,22 @@ pub async fn run_wasm_instance_async(
 }
 
 // ── HTTP capability ───────────────────────────────────────────────────────────
+//
+// Packed-return sentinel values for host_http_get (closure return type: i64):
+//   0     = generic error (network failure, non-2xx non-402, parse error)
+//   -1i64 = HTTP 402 Payment Required detected. The host closure type is i64,
+//           so we use -1i64 (bit pattern 0xFFFFFFFFFFFFFFFF). The guest
+//           declares the import as `-> u64` and WASM reinterprets the bits,
+//           so the guest sees u64::MAX and can check `packed == u64::MAX`.
+//           Guest must NOT treat this as a generic failure — it should return
+//           {"error":"payment_required:url=<url>"} so the LLM can act on it.
+//   other = (ptr << 32 | len): points to the response body in guest linear
+//           memory (the normal success path, ptr and len both > 0 and < 2^32).
+//
+// -1i64 is safe as a sentinel: a valid allocation packed value has both
+// ptr > 0 and len > 0, and (ptr << 32 | len) == 0xFFFFFFFFFFFFFFFF only if
+// ptr == 0xFFFFFFFF AND len == 0xFFFFFFFF simultaneously, which would require
+// ~8 GB of WASM linear memory — impossible in practice.
 
 fn wire_http(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap_async(
@@ -173,9 +189,29 @@ fn wire_http(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     }
                 };
 
-                match do_http_get(&caller.data().http_client, &url, &headers_json).await {
-                    Ok(body) => write_wasm_bytes(&mut caller, &body).await.unwrap_or(0),
-                    Err(e) => {
+                match do_fetch_with_402_detection(&caller.data().http_client, &url, &headers_json).await {
+                    FetchResult::Success(body) => {
+                        write_wasm_bytes(&mut caller, &body).await.unwrap_or(0)
+                    }
+                    FetchResult::PaymentRequired(_req) => {
+                        // Signal the guest that this URL requires payment.
+                        // The guest must return {"error":"payment_required:url=..."}.
+                        // We return -1i64 (bit pattern 0xFFFFFFFFFFFFFFFF) because the
+                        // closure type is i64. The guest declares the import as -> u64
+                        // and WASM reinterprets the bits as u64::MAX, which is our sentinel.
+                        // See sentinel comment above for why this value is safe.
+                        eprintln!("[host_http_get] 402 Payment Required for {}", url);
+                        -1i64
+                    }
+                    FetchResult::PaymentRequiredUnparseable => {
+                        eprintln!("[host_http_get] 402 received but PaymentRequirements unparseable for {}", url);
+                        0
+                    }
+                    FetchResult::HttpError(status) => {
+                        eprintln!("[host_http_get] HTTP {} for {}", status, url);
+                        0
+                    }
+                    FetchResult::NetworkError(e) => {
                         eprintln!("[host_http_get] FAILED: {}", e);
                         0
                     }
@@ -186,11 +222,35 @@ fn wire_http(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn do_http_get(
+// ── Shared fetch + 402-detection primitive ────────────────────────────────────
+//
+// Used by both wire_http (scrape.web path) and wire_x402_pay (pay.x402 path).
+// This is the single source of truth for GET + 402-header-first-then-body parsing.
+
+#[derive(serde::Deserialize)]
+struct PaymentRequiredBody {
+    accepts: Vec<crate::payments::x402_types::PaymentRequirements>,
+}
+
+enum FetchResult {
+    /// 2xx response; body bytes (truncated to MAX_HTTP_RESPONSE_SIZE).
+    Success(Vec<u8>),
+    /// HTTP 402 and we successfully parsed a hedera:testnet PaymentRequirements.
+    PaymentRequired(crate::payments::x402_types::PaymentRequirements),
+    /// HTTP 402 but we could not parse PaymentRequirements (or no hedera:testnet entry).
+    PaymentRequiredUnparseable,
+    /// Non-2xx, non-402 status.
+    HttpError(reqwest::StatusCode),
+    /// Network / send error.
+    NetworkError(String),
+}
+
+async fn do_fetch_with_402_detection(
     client: &reqwest::Client,
     url: &str,
     headers_json: &str,
-) -> anyhow::Result<Vec<u8>> {
+) -> FetchResult {
+    // Build request with caller-supplied headers.
     let headers: Value = serde_json::from_str(headers_json).unwrap_or(Value::Null);
     let mut req = client.get(url);
     if let Some(obj) = headers.as_object() {
@@ -200,19 +260,110 @@ async fn do_http_get(
             }
         }
     }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        bail!("HTTP {} for {}", resp.status(), url);
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return FetchResult::NetworkError(e.to_string()),
+    };
+
+    let status = resp.status();
+
+    if status.is_success() {
+        // Normal success path — return body, respecting size limit.
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return FetchResult::NetworkError(e.to_string()),
+        };
+        let mut buffer = bytes.to_vec();
+        if buffer.len() > MAX_HTTP_RESPONSE_SIZE {
+            buffer.truncate(MAX_HTTP_RESPONSE_SIZE);
+            eprintln!("[do_fetch_with_402_detection] Response truncated to 5MB for {}", url);
+        }
+        return FetchResult::Success(buffer);
     }
 
-    let bytes = resp.bytes().await?;
-    let mut buffer = bytes.to_vec();
-    if buffer.len() > MAX_HTTP_RESPONSE_SIZE {
-        buffer.truncate(MAX_HTTP_RESPONSE_SIZE);
-        eprintln!("[do_http_get] Response truncated to 5MB");
+    if status != reqwest::StatusCode::PAYMENT_REQUIRED {
+        return FetchResult::HttpError(status);
     }
 
-    Ok(buffer)
+    // ── 402 path: parse PaymentRequirements ───────────────────────────────────
+    //
+    // Protocol: check PAYMENT-REQUIRED header first (base64-encoded JSON
+    // `{accepts:[...]}` per the x402 wire spec); fall back to parsing the
+    // response body directly if the header is absent or unparseable.
+
+    let header_opt = resp
+        .headers()
+        .get("PAYMENT-REQUIRED")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let mut payment_body: Option<PaymentRequiredBody> = None;
+    let mut header_parsed = false;
+
+    if let Some(ref hdr_val) = header_opt {
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hdr_val) {
+            Ok(decoded) => {
+                match serde_json::from_slice::<PaymentRequiredBody>(&decoded) {
+                    Ok(parsed) => {
+                        payment_body = Some(parsed);
+                        header_parsed = true;
+                    }
+                    Err(e) => {
+                        eprintln!("[do_fetch_with_402_detection] failed to parse PAYMENT-REQUIRED header JSON: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[do_fetch_with_402_detection] failed to base64-decode PAYMENT-REQUIRED header: {}", e);
+            }
+        }
+    }
+
+    if payment_body.is_none() {
+        // Fallback: try to parse the body as `{accepts:[...]}`.
+        match resp.text().await {
+            Ok(body_text) => {
+                if !body_text.trim().is_empty() {
+                    match serde_json::from_str::<PaymentRequiredBody>(&body_text) {
+                        Ok(parsed) => {
+                            payment_body = Some(parsed);
+                        }
+                        Err(e) => {
+                            if !header_parsed {
+                                eprintln!("[do_fetch_with_402_detection] failed to parse 402 body: {} (no valid header found)", e);
+                            }
+                        }
+                    }
+                } else if !header_parsed {
+                    eprintln!("[do_fetch_with_402_detection] 402 response body is empty and no valid header found");
+                }
+            }
+            Err(e) => {
+                if !header_parsed {
+                    eprintln!("[do_fetch_with_402_detection] failed to read 402 body: {}", e);
+                }
+            }
+        }
+    }
+
+    // Find the hedera:testnet entry from the accepts list (same selection logic
+    // as the original wire_x402_pay).
+    match payment_body {
+        Some(body) => {
+            match body.accepts.into_iter().find(|r| r.network == "hedera:testnet") {
+                Some(requirements) => FetchResult::PaymentRequired(requirements),
+                None => {
+                    eprintln!("[do_fetch_with_402_detection] no hedera:testnet requirement in 402 accepts");
+                    FetchResult::PaymentRequiredUnparseable
+                }
+            }
+        }
+        None => {
+            eprintln!("[do_fetch_with_402_detection] no valid PaymentRequirements found in 402 response");
+            FetchResult::PaymentRequiredUnparseable
+        }
+    }
 }
 
 // ── Filesystem capability ────────────────────────────────────────────────────
@@ -655,8 +806,9 @@ fn dispatch_query(db: &crate::db::Db, query_type: &str, params_json: &str) -> Re
 // ── x402 payment capability ──────────────────────────────────────────────────
 //
 // host_x402_pay(url_ptr, url_len) -> packed(ptr,len) of JSON result, or 0 on error
-// Fetches a URL, handles HTTP 402 by paying via X402PaymentVault, retries
-// with X-PAYMENT header, and returns the unlocked resource body.
+// Fetches a URL via do_fetch_with_402_detection. If the URL requires payment
+// (402), pays via X402PaymentVault and retries with PAYMENT-SIGNATURE header.
+// If the URL is freely accessible (2xx), returns the data directly without payment.
 
 fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap_async(
@@ -669,85 +821,53 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Err(e) => { eprintln!("[host_x402_pay] failed to read url: {}", e); return 0; }
                 };
 
-                // Step 1: GET the URL, expecting a 402 response
-                let initial_resp = match caller.data().http_client.get(&url).send().await {
-                    Ok(r) => r,
-                    Err(e) => { eprintln!("[host_x402_pay] initial GET failed: {}", e); return 0; }
-                };
-
-                if initial_resp.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
-                    eprintln!("[host_x402_pay] expected 402, got: {}", initial_resp.status());
-                    return 0;
-                }
-
-                // Step 2: Parse PaymentRequirements from the 402 response
-                // READING THE 402 RESPONSE — check headers BEFORE body, not body only:
-                #[derive(serde::Deserialize)]
-                struct PaymentRequiredBody {
-                    accepts: Vec<crate::payments::x402_types::PaymentRequirements>,
-                }
-
-                let header_opt = initial_resp
-                    .headers()
-                    .get("PAYMENT-REQUIRED")
-                    .and_then(|v| v.to_str().ok());
-
-                let mut payment_body: Option<PaymentRequiredBody> = None;
-                let mut header_parsed = false;
-
-                if let Some(hdr_val) = header_opt {
-                    if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hdr_val) {
-                        if let Ok(parsed) = serde_json::from_slice::<PaymentRequiredBody>(&decoded) {
-                            payment_body = Some(parsed);
-                            header_parsed = true;
-                        } else {
-                            eprintln!("[host_x402_pay] failed to parse PAYMENT-REQUIRED header JSON");
-                        }
-                    } else {
-                        eprintln!("[host_x402_pay] failed to base64-decode PAYMENT-REQUIRED header");
+                // Step 1: GET the URL using the shared fetch+402-detection primitive.
+                // Pass empty headers for the initial probe (no auth yet).
+                let requirements = match do_fetch_with_402_detection(
+                    &caller.data().http_client, &url, "{}"
+                ).await {
+                    FetchResult::Success(body) => {
+                        // URL is freely accessible — no payment needed. Return as-is.
+                        eprintln!("[host_x402_pay] URL did not require payment (2xx), returning body directly");
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+                        let data: serde_json::Value = serde_json::from_slice(&body)
+                            .unwrap_or_else(|_| serde_json::Value::String(body_str));
+                        let result = serde_json::json!({
+                            "data": data,
+                            "transaction_id": serde_json::Value::Null,
+                            "hashscan_url": serde_json::Value::Null,
+                        });
+                        let bytes = serde_json::to_vec(&result).unwrap_or_default();
+                        return write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0);
                     }
-                }
-
-                if payment_body.is_none() {
-                    // Try parsing the body
-                    if let Ok(body_text) = initial_resp.text().await {
-                        if !body_text.trim().is_empty() {
-                            match serde_json::from_str::<PaymentRequiredBody>(&body_text) {
-                                Ok(parsed) => {
-                                    payment_body = Some(parsed);
-                                }
-                                Err(e) => {
-                                    if !header_parsed {
-                                        eprintln!("[host_x402_pay] failed to parse 402 body: {} (no valid header found)", e);
-                                        return 0;
-                                    }
-                                }
+                    FetchResult::PaymentRequired(mut req) => {
+                        if req.extra.get("url").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                            if let Some(obj) = req.extra.as_object_mut() {
+                                obj.insert("url".to_string(), serde_json::Value::String(url.clone()));
+                            } else {
+                                let mut obj = serde_json::Map::new();
+                                obj.insert("url".to_string(), serde_json::Value::String(url.clone()));
+                                req.extra = serde_json::Value::Object(obj);
                             }
-                        } else if !header_parsed {
-                            eprintln!("[host_x402_pay] 402 response body is empty and no valid header found");
-                            return 0;
                         }
-                    } else if !header_parsed {
-                        eprintln!("[host_x402_pay] failed to read 402 body and no valid header found");
+                        req
+                    }
+
+                    FetchResult::PaymentRequiredUnparseable => {
+                        eprintln!("[host_x402_pay] 402 received but PaymentRequirements unparseable for {}", url);
                         return 0;
                     }
-                }
-
-                let payment_body = match payment_body {
-                    Some(b) => b,
-                    None => {
-                        eprintln!("[host_x402_pay] no valid PaymentRequirements found anywhere");
+                    FetchResult::HttpError(status) => {
+                        eprintln!("[host_x402_pay] initial GET returned non-402 error: {} for {}", status, url);
+                        return 0;
+                    }
+                    FetchResult::NetworkError(e) => {
+                        eprintln!("[host_x402_pay] initial GET failed: {}", e);
                         return 0;
                     }
                 };
 
-                // Find a hedera:testnet requirement
-                let requirements = match payment_body.accepts.into_iter().find(|r| r.network == "hedera:testnet") {
-                    Some(r) => r,
-                    None => { eprintln!("[host_x402_pay] no hedera:testnet requirement in 402 accepts"); return 0; }
-                };
-
-                // Step 3: Pay via X402PaymentVault
+                // Step 2: Pay via X402PaymentVault
                 let vault: Arc<crate::payments::x402_vault::X402PaymentVault> =
                     match caller.data().x402_vault.clone() {
                     Some(v) => v,
@@ -764,7 +884,7 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Err(e) => { eprintln!("[host_x402_pay] payment failed: {}", e); return 0; }
                 };
 
-                // Step 5: Retry with PAYMENT-SIGNATURE header
+                // Step 3: Retry with PAYMENT-SIGNATURE header
                 let retry_resp = match caller.data().http_client
                     .get(&url)
                     .header("PAYMENT-SIGNATURE", &payment_result.payment_token)

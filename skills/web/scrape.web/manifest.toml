@@ -1,7 +1,7 @@
 name        = "scrape.web"
 version     = "0.1.0"
-description = "Fetch and extract text content from a URL"
-triggers = ["web"]
+description = "Fetch and extract text content from a URL. If the URL requires payment (HTTP 402), returns {\"error\":\"payment_required:url=<url>\"} instead of page text — the agent should then call pay.x402 with that URL to unlock the content."
+triggers = ["web", "scrape", "http", "https", "url", "localhost", "site", "page"]
 
 [display]
 action = "Reading {url}"

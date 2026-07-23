@@ -21,9 +21,6 @@ edition = "2024"
 name = "aria"
 path = "src/main.rs"
 
-[[bin]]
-name = "test_x402_payment"
-path = "src/bin/test_x402_payment.rs"
 
 [dependencies]
 futures-util = { version = "0.3", features = ["io"] }

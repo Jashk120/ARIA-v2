@@ -72,7 +72,19 @@ fn execute(input: &str) -> Result<Value, String> {
     })
     .to_string();
 
-    let html = http_get(&args.url, &headers)?;
+    // http_get returns Err("payment_required") when the host signals HTTP 402.
+    // We surface that as a structured error string so the LLM can decide to call
+    // pay.x402 in the next ReAct step — do NOT attempt payment here.
+    // The error string format "payment_required:url=<url>" is intentional:
+    // run_wasm_instance_async unwraps {"error":"..."} JSON to a plain string, so
+    // we encode the URL inline for the LLM to parse from the observation.
+    let html = match http_get(&args.url, &headers) {
+        Ok(body) => body,
+        Err(ref e) if e == "payment_required" => {
+            return Err(format!("payment_required:url={}", args.url));
+        }
+        Err(e) => return Err(e),
+    };
     let text = extract_text(&html, max_chars);
 
     if text.is_empty() {
@@ -186,8 +198,16 @@ fn http_get(url: &str, headers_json: &str) -> Result<String, String> {
         host_http_get(u.as_ptr(), u.len(), h.as_ptr(), h.len())
     };
 
+    // Sentinel values returned by host_http_get:
+    //   0         = generic error (network failure, non-2xx non-402)
+    //   u64::MAX  = HTTP 402 Payment Required; caller should surface this
+    //               as {"error":"payment_required"} — do NOT treat as generic failure.
+    //   otherwise = packed (ptr << 32 | len) pointing to the response body.
     if packed == 0 {
         return Err("HTTP request failed".to_string());
+    }
+    if packed == u64::MAX {
+        return Err("payment_required".to_string());
     }
 
     let (ptr, len) = unpack_ptr_len(packed);

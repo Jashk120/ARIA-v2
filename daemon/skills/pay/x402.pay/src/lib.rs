@@ -31,17 +31,25 @@ pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> u64 {
 #[derive(Deserialize)]
 struct Input {
     url: Option<String>,
-    /// Injected by the daemon from ARIA_NODE_URL / db config — never set by the LLM directly.
-    node_url: Option<String>,
 }
 
 fn execute(input: &str) -> Result<Value, String> {
     let args: Input = serde_json::from_str(input).map_err(|e| format!("Invalid input: {}", e))?;
 
-    // Resolve target URL: explicit arg wins, then injected node_url, then hard default.
-    let target_url = args.url
-        .or(args.node_url)
-        .unwrap_or_else(|| "http://localhost:3000/protected".to_string());
+    // url is required — there is no default target. Failing here (before touching
+    // the network) prevents silently spending funds against an unintended server.
+    let target_url = match args.url {
+        Some(ref u) if !u.trim().is_empty() => u.clone(),
+        _ => {
+            return Err(
+                "pay.x402 requires a 'url' argument — no default target exists. \
+                Provide the full URL of the resource to fetch or pay for. \
+                If you do not have a URL yet, search for one or ask the user \
+                before calling this skill again."
+                    .to_string(),
+            );
+        }
+    };
 
     let paid = x402_pay(&target_url)?;
     serde_json::from_str(&paid).map_err(|e| format!("Bad x402 response JSON: {}", e))

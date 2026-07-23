@@ -20,7 +20,11 @@ pub fn prompt_matches_triggers(
     // all skills whose name starts with that prefix (e.g. "web.") or matches it exactly.
     if let Some(target_type) = skills_type {
         let target_prefix = format!("{}.", target_type);
-        if skill_name.starts_with(&target_prefix) || skill_name == target_type {
+        let target_suffix = format!(".{}", target_type);
+        if skill_name.starts_with(&target_prefix)
+            || skill_name.ends_with(&target_suffix)
+            || skill_name == target_type
+        {
             return true;
         }
     }
@@ -162,8 +166,27 @@ pub fn build_native_tools(user_prompt: &str, skills_type: &Option<String>) -> Ve
     let all_skills = load_all_skills();
     let mut tools = Vec::new();
 
-    for m in all_skills {
+    for m in &all_skills {
         if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
+            let parameters = m.call.parameters.clone().unwrap_or_else(|| serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }));
+            
+            tools.push(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": m.name,
+                    "description": m.description,
+                    "parameters": parameters,
+                }
+            }));
+        }
+    }
+
+    // Fallback: if no specific triggers matched, include all skills so the LLM is never left toolless
+    if tools.is_empty() {
+        for m in all_skills {
             let parameters = m.call.parameters.clone().unwrap_or_else(|| serde_json::json!({
                 "type": "object",
                 "properties": {}

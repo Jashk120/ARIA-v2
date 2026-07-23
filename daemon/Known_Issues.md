@@ -1,216 +1,261 @@
-# Known Issues & Scope Notes — x402 Payments + Identity Layer
+# Known Issues — daemon audit
 
-Working notes from the x402-on-Hedera payment implementation and a pass over
-the identity/key-storage layer. Nothing here blocks the core payment flow —
-`X402PaymentVault::pay()` is proven end-to-end against a live facilitator
-(`x402.org/facilitator`) with a real settled testnet transaction. These are
-the rough edges worth cleaning up, in roughly descending priority.
 
----
 
-## Payments — `src/payments/`
+This file tracks confirmed defects and sharp edges found in the daemon, skill
+runtime, bundled skills, payment layer, and identity/key-storage layer. Items
+are ordered roughly by impact.
 
-### 1. Debug logging left in production path (`x402_vault.rs`)
-`eprintln!` calls at lines ~93 and ~98 dump the full base64 payment payload
-and verify-failure reasons unconditionally on every call. Left over from the
-signature-debugging session. Should be removed or downgraded to
-`tracing::debug!` (respects log-level filtering, doesn't spam stderr in
-normal operation, and stops leaking transaction payload contents into logs
-by default).
+Validation run during this pass:
 
-**Fix**: remove or `tracing::debug!`-gate both lines.
-
-### 2. Hardcoded `"SUCCESS"` status string (`x402_vault.rs`)
-The payment-logging call writes the literal string `"SUCCESS"` rather than
-deriving it from `settle_res.success`. Correct *today* only because of an
-earlier `if !settle_res.success { return Err(...) }` guard — if that guard
-ever moves or changes, this line silently keeps logging `"SUCCESS"`
-regardless of actual outcome.
-
-**Fix**: `if settle_res.success { "SUCCESS" } else { "FAILED" }`, even though
-the false branch is currently unreachable — documents the invariant instead
-of relying on it implicitly.
-
-### 3. Internal bookkeeping smuggled through `PaymentRequirements.extra`
-`skillCalled`, `taskId`, `memo`, `url`, `description`, `mimeType` are all
-read out of `requirements.extra` in `x402_vault.rs`, rather than being passed
-as explicit parameters. Two problems:
-- `extra` is part of the *signed, wire-transmitted* `PaymentRequirements` —
-  ARIA's internal task/skill bookkeeping is currently being sent to the
-  external facilitator as part of the payment payload. Minor information
-  leak, no functional harm today, but not ideal.
-- If a real resource server ever populates `extra` with its own
-  scheme-specific fields, a collision with `skillCalled`/`taskId`/`memo`
-  keys would silently corrupt payment logging.
-
-**Fix**: change `X402PaymentVault::pay()`'s signature to accept
-`skill_called: &str`, `task_id: Option<&str>`, `memo: Option<&str>`
-explicitly, rather than reading them out of `extra`.
-
-### 4. `Db` stored by value in `X402PaymentVault`, not `Arc<Db>`
-`x402_vault.rs`'s `db: crate::db::Db` field — worth confirming `Db::clone()`
-(if it derives `Clone` at all) shares the underlying `Mutex<Connection>`
-rather than creating a second independent connection/mutex to the same
-SQLite file. Likely harmless (SQLite handles file-level locking regardless)
-but worth a five-minute check rather than an assumption.
-
-### 5. Hardcoded single-node pin (`x402_types.rs::build_payment_transaction`)
-```rust
-let node_id = AccountId::from_str("0.0.3").unwrap();
-tx.node_account_ids([node_id]);
-```
-This exists to work around a real `TransactionList`-dimensionality
-incompatibility (see BUG-1 below) between `hiero-sdk`'s default multi-node
-freeze behavior and the JS-based facilitator's single-transaction decode
-path. It was investigated whether a health-aware node could be pulled from
-the `Client`'s own known node set instead of a hardcoded literal —
-`hiero-sdk` 0.45.0's health-weighted `random_node_ids()` is `pub(crate)`,
-not accessible from outside the crate, so no equally-robust alternative was
-available at the time.
-
-**Risk**: if testnet node `0.0.3` ever becomes unreachable, deprecated, or
-degraded, every payment fails with a confusing, seemingly-unrelated network
-error with no obvious link back to this line.
-
-**Fix options, not yet decided**:
-- Move to a config value (env var / constant) instead of an inline literal,
-  so it can be changed without a code change if `0.0.3` becomes unreachable.
-- Revisit whether a newer `hiero-sdk` version exposes a public,
-  health-aware single-node accessor.
-- At minimum, expand the existing code comment to state explicitly that
-  this is a known single-point-of-failure, not just an implementation note.
-
-### 6. `extract_body_bytes` is dead code (`x402_types.rs`)
-Hand-rolled protobuf varint parser, confirmed unused by `cargo test`'s own
-warning output (`function 'extract_body_bytes' is never used`). Left over
-from an earlier debugging attempt at manually inspecting `SignedTransaction`
-bytes. No current call site.
-
-**Fix**: delete. Manually-maintained wire-format parsing code sitting unused
-in a payment path is pure risk (looks load-bearing, isn't) with no offsetting
-benefit.
-
-### 7. `tx.sign(...)` return value discarded (`x402_types.rs`, line ~131)
-```rust
-tx.sign(client_private_key.clone());
-```
-Not yet confirmed whether `hiero-sdk`'s `.sign()` here can fail (wrong key
-type, etc. — exactly the class of bug found and fixed earlier this session)
-and if so, whether that failure is silently swallowed by discarding the
-return value.
-
-**Fix**: check the actual method signature; if it returns `Result`, handle
-the error explicitly rather than discarding it.
-
-### 8. Test coverage doesn't cover the actual production key type
-`x402_types.rs`'s only unit test (`test_build_payment_transaction_hbar`)
-uses `PrivateKey::generate_ed25519()`. The real production path uses ECDSA
-(secp256k1) keys, and the hardest bug found this session (BUG-2 below) was
-an ECDSA-specific signature-deduplication failure that would not have been
-caught by this test even if reintroduced by a future refactor.
-
-**Fix**: add a second test case using an ECDSA key, ideally asserting the
-resulting `SignatureMap` contains exactly one `SignaturePair` for the
-signer (regression coverage for BUG-2).
-
-### 9. `amount` parsed as `i64`, not arbitrary precision
-`x402_types.rs::build_payment_transaction` parses `requirements.amount` as
-`i64`. The x402 v2 spec doesn't formally cap amount precision (relevant for
-HTS tokens with high decimal counts). Almost certainly fine for realistic
-HBAR/tinybar amounts (`i64` caps at ~9.2 quintillion), but not spec-exact.
-Low priority — noting as a known simplification, not a bug.
+- `cargo check` — passes, with warnings.
+- `cargo test` — passes: 10 daemon lib tests + 11 daemon binary tests, 1 ignored integration test in each target.
+- `cargo test --workspace` — passes; several skill crates have 0 tests.
+- Individual WASM skill builds:
+  - `cargo build -p read_fs --target wasm32-wasip1 --release` — passes.
+  - `cargo build -p search_web -p scrape_web -p find_fs -p pay_x402 -p query_payments --target wasm32-wasip1 --release` — passes.
+  - `cargo build -p list_fs --target wasm32-wasip1 --release` — passes despite stub source.
+  - `cargo build -p write_fs --target wasm32-wasip1 --release` — passes despite stub source.
+- `cargo build --workspace --target wasm32-wasip1 --release` — fails because it tries to compile the daemon crate and `tokio` rejects the enabled WASM feature set.
 
 ---
 
-## Identity / Key Storage — `src/crypto.rs`, `src/identity/`
+## Critical / High
 
-### 10. No user passphrase gate on private key export
-`FileVault`/`crypto::load_signing_key` decrypt using a key derived from
-`device_secret` (a random 32-byte file at `~/.aria/device.key`) + the DID
-string as salt — **no user-supplied passphrase is involved anywhere in the
-current code.** This is real encryption-at-rest (AES-256-GCM, Argon2id,
-correct parameters, `Zeroizing` memory hygiene) against a narrow threat
-model (a different local OS user, or a stolen disk that doesn't also include
-`device.key`) — but it does **not** protect against anything that can read
-files as the same OS user the daemon runs as (malware, a copied `~/.aria`
-directory, etc.), and there is currently no passphrase-gated export flow.
+### 1. Daemon cannot start without Hedera credentials
 
-**Planned fix** (scoped, not yet built): add an optional user passphrase as
-an additional input to a *separate* derivation used only for the export
-path — leave the existing `device_secret`-only derivation untouched for
-normal day-to-day `sign()` calls (no reason to prompt for a passphrase on
-every signature). The passphrase-derived key should use its own random
-salt (not reuse the DID-string salt), go through Argon2id, and the export
-function should re-encrypt a *copy* for output rather than mutate the
-stored `id.key` blob. Add tests: correct passphrase decrypts, wrong
-passphrase fails cleanly (mirroring the existing
-`test_aes_gcm_wrong_key_fails` pattern), and confirm normal `sign()` calls
-are unaffected.
+`src/main.rs:156` constructs `PaymentVault::from_env()?` unconditionally.
+`src/payments/direct.rs:20-21` requires `HEDERA_ACCOUNT_ID` and
+`HEDERA_PRIVATE_KEY`. That means the daemon exits during startup if payment
+credentials are missing, even for normal chat, local file, or web-search tasks.
+
+This contradicts the adjacent x402 startup behavior in `src/main.rs:158-160`,
+which intentionally makes `X402PaymentVault` optional when Hedera credentials
+are absent.
+
+**Fix**: make the direct `PaymentVault` optional too, or only construct it
+when a manifest with `hedera_pay = true` is executed. Host payment calls should
+return a clear skill error when the vault is unavailable.
+
+### 2. TCP request framing is a single 4 KiB read
+
+`src/main.rs:186-192` reads at most one 4096-byte chunk and immediately parses
+that chunk as the entire request. Any request larger than 4 KiB, fragmented by
+TCP, or sent slowly can fail as `Invalid JSON` even if the client sent valid
+JSON. TCP does not preserve application message boundaries.
+
+**Fix**: use newline-delimited JSON, length-prefixed frames, or read until EOF
+with a bounded maximum request size before parsing.
+
+### 3. Global task-chain signatures do not sign the stored task-chain link
+
+`src/main.rs:210-215` signs `db.get_task_link_info("temp_id", &req.task)`.
+`src/db.rs:215-224` then creates the real task with a fresh UUID and fresh
+timestamp and recomputes `task_chain_prev`. The stored `task_chain_sig` is
+therefore a signature over a different hash than the stored `task_chain_prev`.
+
+This breaks the intended verifiable global task chain.
+
+**Fix**: generate the task ID and timestamp once, compute the link hash once,
+sign exactly that hash, and insert all of those values in a single DB operation.
+Add a verifier test that checks `task_chain_sig` against the stored
+`task_chain_prev`.
+
+### 4. Per-step audit signatures can mismatch stored audit rows
+
+`src/main.rs:250-257` computes and signs an audit `chain_hash` using
+`db.get_next_step_info(...)`. `src/db.rs:254-259` then recomputes the input
+hash, result hash, timestamp, step index, previous hash, and chain hash inside
+`log_task_step`. If the timestamp crosses a one-second boundary or the step
+index / previous hash changes, the stored `chain_hash` no longer matches the
+signature.
+
+**Fix**: move all audit-row hash construction and signing into one path. Either
+have DB return a fully formed unsigned row to sign and then insert unchanged,
+or have the caller pass the already-signed `step`, `prev_hash`, `timestamp`,
+and `chain_hash` into `log_task_step`.
+
+### 5. Failed tasks are sealed as `done`
+
+`src/main.rs:271` always calls `db.seal_task(..., TaskStatus::Done)` after the
+event stream ends. `AgentEvent::Error` is not remembered as task failure, and a
+client write break also falls through to `Done`.
+
+**Fix**: track whether any terminal error occurred and seal as
+`TaskStatus::Failed` when appropriate. Consider distinct handling for client
+disconnect versus agent failure.
+
+### 6. `list.fs` and `write.fs` are advertised but not implemented
+
+Both skill manifests advertise usable filesystem tools, but their sources are
+one-line stubs:
+
+- `skills/fs/list.fs/src/lib.rs:1`
+- `skills/fs/write.fs/src/lib.rs:1`
+
+They still compile to WASM, so build/test does not catch this. At runtime,
+`src/skills/wasm_runtime.rs` requires exported `memory`, `alloc`, and `run`;
+these stub modules cannot satisfy the advertised behavior.
+
+**Fix**: implement both skills or remove their manifests/workspace members until
+ready. Add a smoke test that loads every manifest-backed WASM and checks required
+exports before release.
+
+### 7. Native tool names use dots and can be rejected by OpenAI-compatible APIs
+
+`src/agent/prompt.rs:172-176` emits manifest names directly as native function
+names, e.g. `search.web`, `read.fs`, `pay.x402`. Many OpenAI-compatible
+chat-completions tool schemas allow only alphanumeric, underscore, and hyphen
+characters for function names. This can make native tool mode fail before model
+execution.
+
+**Fix**: introduce a reversible mapping for native tool names, such as
+`search_web` <-> `search.web`, and map back before dispatching.
 
 ---
 
-## Bugs found and fixed this session (for reference / upstream reporting)
+## Medium
 
-### BUG-1: `hiero-sdk` `TransactionList` dimensionality mismatch
-`Transaction::freeze_with(Some(client))` selects and freezes against *all*
-of the client's known nodes (e.g. 7 for testnet), producing a
-multi-transaction `TransactionList` on `.to_bytes()`. The JS-based
-facilitator's `Transaction.fromBytes()` + `instanceof` type-inference chain
-only handles a single-transaction list. Fixed by using
-`to_signed_transaction_bytes()` (single transaction) and manually
-re-wrapping it in a single-element `TransactionList` envelope
-(`encode_as_transaction_list` in `x402_types.rs`), combined with explicitly
-pinning `node_account_ids` to one node before freezing (see item 5 above for
-the residual hardcoding risk this introduced).
+### 8. Filesystem write resolution creates directories before sandbox boundary check
 
-### BUG-2: `hiero-sdk` ECDSA signature deduplication failure (real upstream bug, confirmed from source)
-When a transaction is frozen with `freeze_with(Some(client))` (which
-auto-registers the client's operator key for signing) *and* explicitly
-signed again via `tx.sign(key)` with the same ECDSA key, `hiero-sdk`
-produces a `SignatureMap` with **two identical signature pairs** for the
-same signer, causing Hedera nodes to reject the transaction at precheck
-with `KEY_PREFIX_MISMATCH`.
+`src/skills/fs_sandbox.rs:112-117` calls `create_dir_all(parent)` for write
+targets before checking `canonical.starts_with(&self.root)` at
+`src/skills/fs_sandbox.rs:120-127`. A denied absolute path outside `fs_root`
+can still create directories before access is rejected.
 
-Root cause, confirmed directly from `hiero-sdk` 0.45.0 source
-(`src/transaction/mod.rs:942` vs. `src/key/public_key/mod.rs:222-227`): the
-signature dedup check compares `public_key.to_bytes()` (which returns
-**DER-encoded** bytes for ECDSA keys, by explicit design) against
-`pub_key_prefix` (which is always the **raw compressed** form, via
-`to_bytes_raw()`). `der_bytes.starts_with(&raw_bytes)` can never be true, so
-the dedup check always concludes "no existing match" for ECDSA keys and
-appends a duplicate `SignaturePair`. Ed25519 is unaffected because its
-`to_bytes()` is defined to equal `to_bytes_raw()`.
+**Fix**: canonicalize and boundary-check the nearest existing ancestor before
+creating directories, then create only under the verified sandbox root.
 
-**Workaround applied**: `tx.freeze_with(None)` instead of
-`freeze_with(Some(client))` — since `node_account_ids` and `transaction_id`
-are already set explicitly, the only thing `Some(client)` was providing was
-operator auto-registration (which triggers the duplicate) and default
-`max_transaction_fee` (which falls back safely to the transaction type's
-built-in default when omitted). Confirmed via source that `freeze_with(None)`
-is safe given our explicit field-setting.
+### 9. WASM memory helpers trust signed pointer/length inputs too much
 
-**Status**: not yet reported upstream — plan is to file a GitHub issue
-against `hiero-sdk-rust` with the exact line numbers, mechanism, and a
-one-line proposed fix (compare `to_bytes_raw()` on both sides at line 942)
-once bandwidth allows.
+`src/skills/wasm_runtime.rs:560-568` accepts `i32` pointer and length values,
+casts them to `usize`, and computes `(ptr + len)` before the bounds check.
+Negative values or overflow from a malicious or corrupted guest can produce
+surprising ranges or panic in debug builds.
 
-### BUG-3 (non-bug, ruled out): DER-vs-raw signature format
-Initially suspected the *signature* itself (not the public key) was
-DER-encoded and incompatible with the facilitator's expected raw 64-byte
-format. Disproven directly: `k256::ecdsa::Signature::to_vec()` (`k256` v0.13.4,
-confirmed via `Cargo.lock`) returns the raw 64-byte `(r || s)` format by
-default; DER requires the separate, explicitly-invoked `.to_der()` method,
-which `hiero-sdk` does not call in this path. The actual bug was BUG-2
-above (public key encoding, not signature encoding).
+**Fix**: reject negative pointers/lengths, use checked addition, and then
+perform the `memory.data()` bounds check.
 
-### BUG-4 (root cause of first `KEY_PREFIX_MISMATCH`-adjacent symptom): Ed25519/ECDSA key-type ambiguity
-`PrivateKey::from_str` in `hiero-sdk` cannot distinguish a bare 32-byte hex
-Ed25519 key from a bare 32-byte hex ECDSA (secp256k1) key by length alone,
-and defaults to Ed25519. The test Hedera account used
-(`0.0.8859309`) is registered as `ECDSA_SECP256K1`; loading its key via the
-generic `from_str` silently produced a mathematically valid but
-wrong-algorithm signature, rejected by the facilitator as
-`invalid_exact_hedera_payload_signature_invalid`.
+### 10. `search.web` does not handle `host_http_get` failure
 
-**Fix applied**: use `PrivateKey::from_str_ecdsa(...)` explicitly wherever
-`HEDERA_PRIVATE_KEY` is parsed, instead of the generic `from_str`.
+`skills/web/search.web/src/lib.rs:168-184` unpacks and reads the packed result
+without checking `packed == 0`. Other skills such as `scrape.web` correctly
+treat `0` as host-call failure. This can turn an HTTP failure into unsafe guest
+memory access behavior instead of a clean JSON error.
+
+**Fix**: mirror the `packed == 0` guard used by `scrape.web`, `find.fs`,
+`read.fs`, and payment skills.
+
+### 11. `cargo build --workspace --target wasm32-wasip1` is not a valid release build
+
+The full workspace WASM build fails because it includes `aria-daemon`, whose
+`tokio = { features = ["full"] }` dependency is not valid for WASM. The README
+currently shows individual package build examples, but there is no checked
+script that builds exactly the runnable skills and skips the daemon.
+
+**Fix**: add a `build-skills` script/xtask that builds only skill packages for
+`wasm32-wasip1`, and document that as the supported release command.
+
+### 12. Direct payment HashScan links are always testnet
+
+`src/payments/direct.rs:53-55` always formats
+`https://hashscan.io/testnet/transaction/...` even when `HEDERA_NETWORK=mainnet`
+or `previewnet`.
+
+**Fix**: derive the HashScan network segment from the selected Hedera network.
+
+### 13. Direct payment amount handling uses `f64`
+
+`src/payments/direct.rs:40-42` accepts `amount_hbar: f64` and converts via
+`(amount_hbar * 100_000_000.0) as i64`. This can silently truncate fractional
+tinybars and does not reject non-positive, NaN, or infinite values before
+building a transfer.
+
+**Fix**: parse/accept decimal strings or integer tinybars, validate finite
+positive values, and reject values that are not exactly representable in
+tinybars.
+
+### 14. Facilitator client has no timeout and logs raw responses to stderr
+
+`src/payments/facilitator_client.rs` uses `reqwest::Client::new()` without a
+timeout and has unconditional `eprintln!` debug logs for `/verify` and
+`/settle` responses. A hung facilitator can stall payment flow, and raw payment
+responses should not be printed in normal operation.
+
+**Fix**: build the client with a timeout and replace unconditional prints with
+`tracing::debug!` or structured, redacted logs.
+
+---
+
+## Lower Priority / Cleanup
+
+### 15. OpenRouter/provider selection is compile-time hardcoded
+
+`src/config.rs:17-23` hardcodes `Provider::Ollama`, the Ollama URL, and both
+model names. `Provider::OpenRouter` is never constructed in normal code. This
+makes deployment-specific provider selection require a source change.
+
+**Fix**: load provider, base URL, and model from DB/env with sane defaults.
+
+### 16. OpenRouter API-key prompt is interactive and unsuitable for services
+
+If provider selection is changed to OpenRouter, `src/main.rs:130-149` prompts
+on stdin when no key is in the DB. That is reasonable for a CLI setup flow but
+bad for `aria daemon` under systemd.
+
+**Fix**: fail fast with a clear config error in daemon mode, and keep prompting
+only in an explicit interactive setup command.
+
+### 17. `RuntimeConfig` is loaded once at startup
+
+`src/main.rs:155` loads injected config once and clones it into every request.
+Changes to DB-backed config such as `searxng_url`, `fs_root`, `fs_allow`, or
+`node_url` do not affect a running daemon until restart.
+
+**Fix**: reload injected config per request or add a config-watch / refresh
+mechanism.
+
+### 18. `Db` uses `Mutex<Connection>` and unwraps poisoned locks
+
+Most DB methods call `self.conn.lock().unwrap()`. A panic while holding the DB
+mutex would poison the lock and cause later daemon operations to panic instead
+of returning an error.
+
+**Fix**: map poisoned locks to `anyhow` errors consistently.
+
+### 19. `verify_task_chain` does not recompute row hashes
+
+`src/db.rs:270-295` checks `prev_hash` continuity and verifies signatures over
+stored `chain_hash`, but it does not recompute `chain_hash` from stored
+`step`, `skill_called`, `input_hash`, `result_hash`, `prev_hash`, and
+`timestamp`. A row with internally inconsistent fields could pass if its
+signature matches the stored `chain_hash`.
+
+**Fix**: recompute the expected hash for every row and compare it with stored
+`chain_hash` before verifying the signature.
+
+### 20. Identity export is not passphrase-gated
+
+`FileVault` / `crypto::load_signing_key` decrypt using a key derived from
+`device_secret` plus the DID string as salt. There is no user-supplied
+passphrase gate for private key export. This is encryption-at-rest against a
+narrow local threat model, but anything that can read the daemon user's files
+can also read the device secret and decrypt the identity key.
+
+**Fix**: add a separate passphrase-gated export path using its own random salt
+and Argon2id derivation. Do not mutate the stored `id.key` blob for day-to-day
+signing.
+
+---
+
+## Recently Fixed / Stale Notes Removed
+
+The previous issue file contained several x402 notes that are now stale:
+
+- `X402PaymentVault::pay()` now takes `skill_called` and `task_id` explicitly
+  instead of smuggling them through `PaymentRequirements.extra`.
+- The hardcoded Hedera node ID has been softened via `HEDERA_NODE_ACCOUNT_ID`
+  with `0.0.3` as fallback.
+- ECDSA transaction coverage exists in
+  `payments::x402_types::tests::test_build_payment_transaction_ecdsa`.
+- The payment DB field in `X402PaymentVault` is already `Arc<Db>`.

@@ -2,7 +2,10 @@
 //! No external deps — HTML stripping done manually
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 

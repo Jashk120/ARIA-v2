@@ -1,5 +1,8 @@
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
 #[link(wasm_import_module = "aria")]
 unsafe extern "C" {
@@ -41,13 +44,11 @@ fn execute(input: &str) -> Result<Value, String> {
     let target_url = match args.url {
         Some(ref u) if !u.trim().is_empty() => u.clone(),
         _ => {
-            return Err(
-                "pay.x402 requires a 'url' argument — no default target exists. \
+            return Err("pay.x402 requires a 'url' argument — no default target exists. \
                 Provide the full URL of the resource to fetch or pay for. \
                 If you do not have a URL yet, search for one or ask the user \
                 before calling this skill again."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
 

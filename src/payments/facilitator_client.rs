@@ -1,6 +1,12 @@
 use serde::Deserialize;
 use thiserror::Error;
-use super::x402_types::{PaymentPayload, PaymentRequirements, SettleResponse, VerifyResponse};
+
+use super::x402_types::{
+    PaymentPayload,
+    PaymentRequirements,
+    SettleResponse,
+    VerifyResponse,
+};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct SupportedKind {
@@ -33,10 +39,7 @@ pub struct FacilitatorClient {
 
 impl FacilitatorClient {
     pub fn new(base_url: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url,
-        }
+        Self { client: reqwest::Client::new(), base_url }
     }
 
     pub async fn get_supported(&self) -> Result<SupportedKindsResponse, FacilitatorError> {
@@ -152,7 +155,7 @@ mod tests {
         let client = FacilitatorClient::new("https://x402.org/facilitator".to_string());
         let res = client.get_supported().await;
         assert!(res.is_ok(), "Expected Ok supported response, got: {:?}", res);
-        
+
         let response = res.unwrap();
         let has_hedera_testnet = response.kinds.iter().any(|kind| kind.network == "hedera:testnet");
         assert!(has_hedera_testnet, "Expected kinds to contain hedera:testnet entry");

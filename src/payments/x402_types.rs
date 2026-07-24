@@ -1,8 +1,21 @@
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use hiero_sdk::{AccountId, Client, Hbar, PrivateKey, TokenId, TransactionId, TransferTransaction};
 use std::str::FromStr;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use hiero_sdk::{
+    AccountId,
+    Client,
+    Hbar,
+    PrivateKey,
+    TokenId,
+    TransactionId,
+    TransferTransaction,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use thiserror::Error;
 
 /// Matches x402 v2 exact-scheme on Hedera.
 /// Represents the requirements for a payment request.
@@ -123,22 +136,26 @@ pub fn build_payment_transaction(
     // Pin to a single node to ensure we don't generate a multi-node transaction list.
     // The facilitator JS SDK only supports decoding a 1-element list.
     // Reads from HEDERA_NODE_ACCOUNT_ID environment variable to avoid a hardcoded single point of failure.
-    let node_account_str = std::env::var("HEDERA_NODE_ACCOUNT_ID").unwrap_or_else(|_| "0.0.3".to_string());
-    let node_id = AccountId::from_str(&node_account_str)
-        .map_err(|e| PaymentError::HederaSdkError(format!("Invalid node account ID '{}': {}", node_account_str, e)))?;
+    let node_account_str =
+        std::env::var("HEDERA_NODE_ACCOUNT_ID").unwrap_or_else(|_| "0.0.3".to_string());
+    let node_id = AccountId::from_str(&node_account_str).map_err(|e| {
+        PaymentError::HederaSdkError(format!(
+            "Invalid node account ID '{}': {}",
+            node_account_str, e
+        ))
+    })?;
     tx.node_account_ids([node_id]);
 
-    tx.freeze_with(None)
-        .map_err(|e| PaymentError::HederaSdkError(e.to_string()))?;
+    tx.freeze_with(None).map_err(|e| PaymentError::HederaSdkError(e.to_string()))?;
 
     tx.sign(client_private_key.clone());
 
-    let signed_bytes = tx.to_signed_transaction_bytes()
+    let signed_bytes = tx
+        .to_signed_transaction_bytes()
         .map_err(|e| PaymentError::HederaSdkError(e.to_string()))?;
 
     Ok(STANDARD.encode(encode_as_transaction_list(signed_bytes)))
 }
-
 
 /// Wraps raw `SignedTransaction` protobuf bytes into the single-entry
 /// `TransactionList` envelope that the Hedera JS SDK's `Transaction.fromBytes()`
@@ -165,9 +182,13 @@ fn proto_field(tag: u8, data: &[u8]) -> Vec<u8> {
     loop {
         let mut b = (n & 0x7F) as u8;
         n >>= 7;
-        if n != 0 { b |= 0x80; }
+        if n != 0 {
+            b |= 0x80;
+        }
         out.push(b);
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
     out.extend_from_slice(data);
     out
@@ -181,7 +202,7 @@ mod tests {
     async fn test_build_payment_transaction_hbar() {
         let client_account_id = AccountId::from_str("0.0.1111").unwrap();
         let client_private_key = PrivateKey::generate_ed25519();
-        
+
         let mut extra = serde_json::Map::new();
         extra.insert("feePayer".to_string(), serde_json::Value::String("0.0.5678".to_string()));
 
@@ -214,7 +235,7 @@ mod tests {
         let client_account_id = AccountId::from_str("0.0.1111").unwrap();
         // Generate an ECDSA key to test the ECDSA path (regression test for ECDSA specific bugs)
         let client_private_key = PrivateKey::generate_ecdsa();
-        
+
         let mut extra = serde_json::Map::new();
         extra.insert("feePayer".to_string(), serde_json::Value::String("0.0.5678".to_string()));
 
@@ -240,9 +261,10 @@ mod tests {
         assert!(res.is_ok(), "Expected Ok transaction, got: {:?}", res);
         let tx_b64 = res.unwrap();
         assert!(!tx_b64.is_empty(), "Transaction base64 should not be empty");
-        
+
         // BUG-2 regression coverage: explicitly decode the bytes and verify.
         let raw = base64::engine::general_purpose::STANDARD.decode(&tx_b64).unwrap();
-        let _tx = hiero_sdk::AnyTransaction::from_bytes(&raw).expect("Should decode back to AnyTransaction");
+        let _tx = hiero_sdk::AnyTransaction::from_bytes(&raw)
+            .expect("Should decode back to AnyTransaction");
     }
 }

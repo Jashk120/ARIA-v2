@@ -1,6 +1,16 @@
-use anyhow::{Context, anyhow};
-use hiero_sdk::{AccountId, Client, Hbar, PrivateKey, TransferTransaction};
 use std::str::FromStr;
+
+use anyhow::{
+    Context,
+    anyhow,
+};
+use hiero_sdk::{
+    AccountId,
+    Client,
+    Hbar,
+    PrivateKey,
+    TransferTransaction,
+};
 
 pub struct PaymentReceipt {
     pub transaction_id: String,
@@ -13,31 +23,39 @@ pub struct PaymentVault {
     operator_id: AccountId,
 }
 
-impl PaymentVault{
+impl PaymentVault {
     pub fn from_env() -> anyhow::Result<Self> {
-        
-    let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-    let account_id_str = std::env::var("HEDERA_ACCOUNT_ID").context("HEDERA_ACCOUNT_ID not set in env")?;
-    let private_key_str = std::env::var("HEDERA_PRIVATE_KEY").context("HEDERA_PRIVATE_KEY not set in env")?;
-    
-    if private_key_str.trim().is_empty() {
+        let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
+        let account_id_str =
+            std::env::var("HEDERA_ACCOUNT_ID").context("HEDERA_ACCOUNT_ID not set in env")?;
+        let private_key_str =
+            std::env::var("HEDERA_PRIVATE_KEY").context("HEDERA_PRIVATE_KEY not set in env")?;
+
+        if private_key_str.trim().is_empty() {
             return Err(anyhow!(
                 "HEDERA_PRIVATE_KEY is empty — generate a testnet account at portal.hedera.com first"
             ));
         }
 
-    let operator_id = AccountId::from_str(&account_id_str).context("Invalid HEDERA_ACCOUNT_ID")?;
-    let private_key = PrivateKey::from_str_ecdsa(&private_key_str).context("Invalid HEDERA_PRIVATE_KEY")?;
-    
-    let client = match network.as_str() {
+        let operator_id =
+            AccountId::from_str(&account_id_str).context("Invalid HEDERA_ACCOUNT_ID")?;
+        let private_key =
+            PrivateKey::from_str_ecdsa(&private_key_str).context("Invalid HEDERA_PRIVATE_KEY")?;
+
+        let client = match network.as_str() {
             "mainnet" => Client::for_mainnet(),
             "previewnet" => Client::for_previewnet(),
             _ => Client::for_testnet(),
         };
-    client.set_operator(operator_id, private_key);
-    Ok(Self { client, operator_id })
+        client.set_operator(operator_id, private_key);
+        Ok(Self { client, operator_id })
     }
-     pub async fn pay(&self, recipient: &str, amount_hbar: f64, memo: &str) -> anyhow::Result<PaymentReceipt> {
+    pub async fn pay(
+        &self,
+        recipient: &str,
+        amount_hbar: f64,
+        memo: &str,
+    ) -> anyhow::Result<PaymentReceipt> {
         let recipient_id = AccountId::from_str(recipient).context("invalid recipient AccountId")?;
         let amount = Hbar::from_tinybars((amount_hbar * 100_000_000.0) as i64);
 
@@ -56,4 +74,4 @@ impl PaymentVault{
             status: format!("{:?}", receipt.status),
         })
     }
-}   
+}

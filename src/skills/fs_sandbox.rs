@@ -15,9 +15,13 @@
 //!        Empty fs_deny => everything under fs_root accessible.
 //!      - anything else => fail closed (treated as whitelist with empty allow).
 
-use anyhow::{anyhow, bail};
-use serde_json::Value;
 use std::path::PathBuf;
+
+use anyhow::{
+    anyhow,
+    bail,
+};
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct FsSandbox {
@@ -41,10 +45,7 @@ impl FsSandbox {
     /// fs_allow / fs_deny are ';'-separated glob lists.
     pub fn from_args(args: &Value) -> anyhow::Result<Self> {
         let get = |key: &str, default: &str| -> String {
-            args.get(key)
-                .and_then(|v| v.as_str())
-                .unwrap_or(default)
-                .to_string()
+            args.get(key).and_then(|v| v.as_str()).unwrap_or(default).to_string()
         };
 
         let root_raw = get("fs_root", "~/aria-workspace");
@@ -64,18 +65,10 @@ impl FsSandbox {
         };
 
         let split = |s: String| -> Vec<String> {
-            s.split(';')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .collect()
+            s.split(';').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
         };
 
-        Ok(Self {
-            root,
-            mode,
-            allow: split(get("fs_allow", "")),
-            deny: split(get("fs_deny", "")),
-        })
+        Ok(Self { root, mode, allow: split(get("fs_allow", "")), deny: split(get("fs_deny", "")) })
     }
 
     /// Resolve and validate a user/LLM-supplied path against this sandbox.
@@ -94,18 +87,13 @@ impl FsSandbox {
 
         let canonical = if must_exist {
             candidate.canonicalize().map_err(|e| {
-                anyhow!(
-                    "Path '{}' does not exist or is unreadable: {}",
-                    requested,
-                    e
-                )
+                anyhow!("Path '{}' does not exist or is unreadable: {}", requested, e)
             })?
         } else {
             // For write targets, canonicalize the parent and rejoin the filename —
             // the file itself may not exist yet.
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| anyhow!("Invalid path '{}'", requested))?;
+            let parent =
+                candidate.parent().ok_or_else(|| anyhow!("Invalid path '{}'", requested))?;
             let file_name = candidate
                 .file_name()
                 .ok_or_else(|| anyhow!("Invalid path '{}' — no file name", requested))?;
@@ -133,18 +121,12 @@ impl FsSandbox {
         match self.mode {
             FsMode::Whitelist => {
                 if !self.allow.iter().any(|pat| glob_match(pat, &rel_str)) {
-                    bail!(
-                        "Access denied: '{}' is not in the fs_allow whitelist",
-                        requested
-                    );
+                    bail!("Access denied: '{}' is not in the fs_allow whitelist", requested);
                 }
             }
             FsMode::Blacklist => {
                 if self.deny.iter().any(|pat| glob_match(pat, &rel_str)) {
-                    bail!(
-                        "Access denied: '{}' matches the fs_deny blacklist",
-                        requested
-                    );
+                    bail!("Access denied: '{}' matches the fs_deny blacklist", requested);
                 }
             }
             FsMode::Invalid => {

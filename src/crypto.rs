@@ -20,16 +20,41 @@
 //! The chain means you can't rewrite any entry without invalidating every
 //! subsequent signature, even if you have the key for those later entries.
 
-use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
+use std::fs;
+use std::path::PathBuf;
+
+use aes_gcm::aead::{
+    Aead,
+    KeyInit,
 };
-use anyhow::{Context, anyhow};
-use argon2::{Argon2, Params, Version, Algorithm};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::{RngCore, rngs::OsRng};
-use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf};
+use aes_gcm::{
+    Aes256Gcm,
+    Key,
+    Nonce,
+};
+use anyhow::{
+    Context,
+    anyhow,
+};
+use argon2::{
+    Algorithm,
+    Argon2,
+    Params,
+    Version,
+};
+use ed25519_dalek::{
+    Signature,
+    Signer,
+    SigningKey,
+    Verifier,
+    VerifyingKey,
+};
+use rand::RngCore;
+use rand::rngs::OsRng;
+use sha2::{
+    Digest,
+    Sha256,
+};
 use zeroize::Zeroizing;
 
 // ── Device secret ─────────────────────────────────────────────────────────────
@@ -116,9 +141,8 @@ pub fn encrypt_key_bytes(plaintext: &[u8], aes_key: &[u8; 32]) -> anyhow::Result
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow!("AES-GCM encrypt: {}", e))?;
+    let ciphertext =
+        cipher.encrypt(nonce, plaintext).map_err(|e| anyhow!("AES-GCM encrypt: {}", e))?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -184,10 +208,7 @@ pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
     #[cfg(not(unix))]
     fs::write(&path, &priv_hex)?;
 
-    Ok(Identity {
-        did: did.to_string(),
-        public_key_multibase: pub_multibase,
-    })
+    Ok(Identity { did: did.to_string(), public_key_multibase: pub_multibase })
 }
 
 /// Load the signing key from the `~/.aria/id.key` file.
@@ -279,15 +300,13 @@ pub fn verify_signature(
     signature_hex: &str,
 ) -> anyhow::Result<()> {
     let pub_bytes = multibase_decode(public_key_multibase)?;
-    let pub_bytes: [u8; 32] = pub_bytes
-        .try_into()
-        .map_err(|_| anyhow!("public key wrong length"))?;
+    let pub_bytes: [u8; 32] =
+        pub_bytes.try_into().map_err(|_| anyhow!("public key wrong length"))?;
     let verifying_key = VerifyingKey::from_bytes(&pub_bytes)?;
 
     let sig_bytes = hex::decode(signature_hex).context("hex decode signature")?;
-    let sig_bytes: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| anyhow!("signature wrong length"))?;
+    let sig_bytes: [u8; 64] =
+        sig_bytes.try_into().map_err(|_| anyhow!("signature wrong length"))?;
     let signature = Signature::from_bytes(&sig_bytes);
 
     verifying_key
@@ -307,10 +326,7 @@ mod tests {
         let h = sha256_hex_str("hello");
         assert_eq!(h.len(), 64);
         // known SHA-256 of "hello"
-        assert_eq!(
-            h,
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
+        assert_eq!(h, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
     }
 
     #[test]
@@ -368,10 +384,19 @@ mod tests {
 
     #[test]
     fn test_chain_hash_deterministic() {
-        let h1 = compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
-        let h2 = compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
+        let h1 =
+            compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
+        let h2 =
+            compute_chain_hash("prev", "1", "search.web", "abc", "def", "2026-01-01T00:00:00Z");
         assert_eq!(h1, h2);
-        let h3 = compute_chain_hash("prev", "1", "search.web", "abc", "DIFFERENT", "2026-01-01T00:00:00Z");
+        let h3 = compute_chain_hash(
+            "prev",
+            "1",
+            "search.web",
+            "abc",
+            "DIFFERENT",
+            "2026-01-01T00:00:00Z",
+        );
         assert_ne!(h1, h3);
     }
 

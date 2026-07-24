@@ -1,7 +1,7 @@
 name        = "query.payments"
 version     = "0.1.0"
 description = "Looks up the agent's own recent Hedera payments"
-triggers = ["paid", "payment", "spent", "transaction"]
+triggers = []
 
 [display]
 action = "Checking recent payments"

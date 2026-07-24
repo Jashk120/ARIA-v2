@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use crate::crypto;
+
 use super::IdentityVault;
+use crate::crypto;
 
 pub struct FileVault {
     did: String,

@@ -1,13 +1,29 @@
 //! WASM instance execution: host state, memory marshalling, and host
 //! function wiring (HTTP, filesystem) gated by manifest capabilities.
 
-use anyhow::{anyhow, bail};
-use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use wasmtime::{Caller, Engine, Linker, Module, Store};
+
+use anyhow::{
+    anyhow,
+    bail,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use wasmtime::{
+    Caller,
+    Engine,
+    Linker,
+    Module,
+    Store,
+};
 use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p1::{
+    self,
+    WasiP1Ctx,
+};
 
 use super::fs_sandbox::FsSandbox;
 use super::manifest::SkillManifest;
@@ -50,11 +66,8 @@ pub async fn run_wasm_instance_async(
 ) -> anyhow::Result<Value> {
     let wasi = WasiCtxBuilder::new().build_p1();
 
-    let fs_sandbox = if manifest.capabilities.fs {
-        Some(FsSandbox::from_args(args)?)
-    } else {
-        None
-    };
+    let fs_sandbox =
+        if manifest.capabilities.fs { Some(FsSandbox::from_args(args)?) } else { None };
 
     let state = HostState {
         http_client: reqwest::Client::builder()
@@ -91,13 +104,9 @@ pub async fn run_wasm_instance_async(
         wire_x402_pay(&mut linker)?;
     }
 
-    linker.func_wrap(
-        "aria",
-        "host_free",
-        |_: Caller<'_, HostState>, _ptr: i32| {
-            // No-op for now as we use a fixed buffer, but prevents skill crash
-        },
-    )?;
+    linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {
+        // No-op for now as we use a fixed buffer, but prevents skill crash
+    })?;
 
     let instance = linker.instantiate_async(&mut store, &module).await?;
     let memory = instance
@@ -114,10 +123,7 @@ pub async fn run_wasm_instance_async(
 
     let run_fn = instance.get_typed_func::<(i32, i32), i64>(&mut store, "run")?;
     let packed_result = run_fn
-        .call_async(
-            &mut store,
-            (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32),
-        )
+        .call_async(&mut store, (INPUT_BUFFER_OFFSET as i32, args_bytes.len() as i32))
         .await?;
 
     if packed_result == 0 {
@@ -126,15 +132,9 @@ pub async fn run_wasm_instance_async(
 
     let (result_ptr, result_len) = unpack_ptr_len(packed_result);
     let data = memory.data(&store);
-    let json_bytes = data
-        .get(result_ptr..result_ptr + result_len)
-        .ok_or_else(|| {
-            anyhow!(
-                "Skill result memory out of bounds (ptr: {}, len: {})",
-                result_ptr,
-                result_len
-            )
-        })?;
+    let json_bytes = data.get(result_ptr..result_ptr + result_len).ok_or_else(|| {
+        anyhow!("Skill result memory out of bounds (ptr: {}, len: {})", result_ptr, result_len)
+    })?;
 
     let result_str = std::str::from_utf8(json_bytes)
         .map_err(|e| anyhow!("Skill returned invalid UTF-8: {}", e))?;
@@ -292,30 +292,31 @@ async fn do_fetch_with_402_detection(
     // `{accepts:[...]}` per the x402 wire spec); fall back to parsing the
     // response body directly if the header is absent or unparseable.
 
-    let header_opt = resp
-        .headers()
-        .get("PAYMENT-REQUIRED")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let header_opt =
+        resp.headers().get("PAYMENT-REQUIRED").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
     let mut payment_body: Option<PaymentRequiredBody> = None;
     let mut header_parsed = false;
 
     if let Some(ref hdr_val) = header_opt {
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hdr_val) {
-            Ok(decoded) => {
-                match serde_json::from_slice::<PaymentRequiredBody>(&decoded) {
-                    Ok(parsed) => {
-                        payment_body = Some(parsed);
-                        header_parsed = true;
-                    }
-                    Err(e) => {
-                        eprintln!("[do_fetch_with_402_detection] failed to parse PAYMENT-REQUIRED header JSON: {}", e);
-                    }
+            Ok(decoded) => match serde_json::from_slice::<PaymentRequiredBody>(&decoded) {
+                Ok(parsed) => {
+                    payment_body = Some(parsed);
+                    header_parsed = true;
                 }
-            }
+                Err(e) => {
+                    eprintln!(
+                        "[do_fetch_with_402_detection] failed to parse PAYMENT-REQUIRED header JSON: {}",
+                        e
+                    );
+                }
+            },
             Err(e) => {
-                eprintln!("[do_fetch_with_402_detection] failed to base64-decode PAYMENT-REQUIRED header: {}", e);
+                eprintln!(
+                    "[do_fetch_with_402_detection] failed to base64-decode PAYMENT-REQUIRED header: {}",
+                    e
+                );
             }
         }
     }
@@ -331,12 +332,17 @@ async fn do_fetch_with_402_detection(
                         }
                         Err(e) => {
                             if !header_parsed {
-                                eprintln!("[do_fetch_with_402_detection] failed to parse 402 body: {} (no valid header found)", e);
+                                eprintln!(
+                                    "[do_fetch_with_402_detection] failed to parse 402 body: {} (no valid header found)",
+                                    e
+                                );
                             }
                         }
                     }
                 } else if !header_parsed {
-                    eprintln!("[do_fetch_with_402_detection] 402 response body is empty and no valid header found");
+                    eprintln!(
+                        "[do_fetch_with_402_detection] 402 response body is empty and no valid header found"
+                    );
                 }
             }
             Err(e) => {
@@ -350,17 +356,19 @@ async fn do_fetch_with_402_detection(
     // Find the hedera:testnet entry from the accepts list (same selection logic
     // as the original wire_x402_pay).
     match payment_body {
-        Some(body) => {
-            match body.accepts.into_iter().find(|r| r.network == "hedera:testnet") {
-                Some(requirements) => FetchResult::PaymentRequired(requirements),
-                None => {
-                    eprintln!("[do_fetch_with_402_detection] no hedera:testnet requirement in 402 accepts");
-                    FetchResult::PaymentRequiredUnparseable
-                }
+        Some(body) => match body.accepts.into_iter().find(|r| r.network == "hedera:testnet") {
+            Some(requirements) => FetchResult::PaymentRequired(requirements),
+            None => {
+                eprintln!(
+                    "[do_fetch_with_402_detection] no hedera:testnet requirement in 402 accepts"
+                );
+                FetchResult::PaymentRequiredUnparseable
             }
-        }
+        },
         None => {
-            eprintln!("[do_fetch_with_402_detection] no valid PaymentRequirements found in 402 response");
+            eprintln!(
+                "[do_fetch_with_402_detection] no valid PaymentRequirements found in 402 response"
+            );
             FetchResult::PaymentRequiredUnparseable
         }
     }
@@ -637,11 +645,7 @@ fn find_matches(
 
             // Per-entry sandbox check, so blacklisted subdirs are skipped entirely.
             if let Some(sb) = sandbox {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
                 if sb.resolve(&rel, true).is_err() {
                     continue;
                 }
@@ -668,15 +672,10 @@ fn find_matches(
                         if let Ok(text) = std::fs::read_to_string(&path) {
                             if let Some(pos) = text.to_lowercase().find(query_lower) {
                                 let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let end = text[pos..]
-                                    .find('\n')
-                                    .map(|i| pos + i)
-                                    .unwrap_or(text.len());
-                                let preview = text[start..end]
-                                    .trim()
-                                    .chars()
-                                    .take(200)
-                                    .collect::<String>();
+                                let end =
+                                    text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
+                                let preview =
+                                    text[start..end].trim().chars().take(200).collect::<String>();
                                 out.push(serde_json::json!({ "path": path.to_string_lossy(), "preview": preview }));
                             }
                         }
@@ -692,17 +691,7 @@ fn find_matches(
         Ok(())
     }
 
-    walk(
-        root,
-        &query_lower,
-        mode,
-        0,
-        &mut out,
-        MAX_RESULTS,
-        MAX_DEPTH,
-        root,
-        sandbox,
-    )?;
+    walk(root, &query_lower, mode, 0, &mut out, MAX_RESULTS, MAX_DEPTH, root, sandbox)?;
     Ok(out)
 }
 
@@ -765,16 +754,25 @@ fn wire_db_query(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             Box::new(async move {
                 let query_type = match read_wasm_str(&mut caller, type_ptr, type_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_db_query] bad query_type: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_db_query] bad query_type: {}", e);
+                        return 0;
+                    }
                 };
                 let params_json = match read_wasm_str(&mut caller, params_ptr, params_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_db_query] bad params: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_db_query] bad params: {}", e);
+                        return 0;
+                    }
                 };
 
                 let db = match caller.data().db.clone() {
                     Some(db) => db,
-                    None => { eprintln!("[host_db_query] db_query capability not enabled"); return 0; }
+                    None => {
+                        eprintln!("[host_db_query] db_query capability not enabled");
+                        return 0;
+                    }
                 };
 
                 let result = match dispatch_query(&db, &query_type, &params_json) {
@@ -792,7 +790,11 @@ fn wire_db_query(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
 /// Fixed allow-list — the only queries any WASM skill can ever trigger.
 /// Add new arms here as new needs come up; never expose raw SQL to the guest.
-fn dispatch_query(db: &crate::db::Db, query_type: &str, params_json: &str) -> Result<Value, String> {
+fn dispatch_query(
+    db: &crate::db::Db,
+    query_type: &str,
+    params_json: &str,
+) -> Result<Value, String> {
     match query_type {
         "payments_recent" => {
             let params: Value = serde_json::from_str(params_json).unwrap_or(json!({}));
@@ -986,34 +988,57 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "host_hedera_pay",
         |mut caller: Caller<'_, HostState>,
          (recipient_ptr, recipient_len, amount_ptr, amount_len, memo_ptr, memo_len): (
-            i32, i32, i32, i32, i32, i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
         )| {
             Box::new(async move {
                 let recipient = match read_wasm_str(&mut caller, recipient_ptr, recipient_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_hedera_pay] bad recipient: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_hedera_pay] bad recipient: {}", e);
+                        return 0;
+                    }
                 };
                 let amount_str = match read_wasm_str(&mut caller, amount_ptr, amount_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_hedera_pay] bad amount: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_hedera_pay] bad amount: {}", e);
+                        return 0;
+                    }
                 };
                 let memo = match read_wasm_str(&mut caller, memo_ptr, memo_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_hedera_pay] bad memo: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_hedera_pay] bad memo: {}", e);
+                        return 0;
+                    }
                 };
                 let amount: f64 = match amount_str.parse() {
                     Ok(a) => a,
-                    Err(e) => { eprintln!("[host_hedera_pay] bad amount format: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_hedera_pay] bad amount format: {}", e);
+                        return 0;
+                    }
                 };
 
                 let vault = match caller.data().payment_vault.clone() {
                     Some(v) => v,
-                    None => { eprintln!("[host_hedera_pay] hedera_pay capability not enabled"); return 0; }
+                    None => {
+                        eprintln!("[host_hedera_pay] hedera_pay capability not enabled");
+                        return 0;
+                    }
                 };
 
                 let receipt = match vault.pay(&recipient, amount, &memo).await {
                     Ok(r) => r,
-                    Err(e) => { eprintln!("[host_hedera_pay] payment failed: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_hedera_pay] payment failed: {}", e);
+                        return 0;
+                    }
                 };
 
                 // Log to db right here — host is the only side with db access.
@@ -1042,7 +1067,8 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     "transaction_id": receipt.transaction_id,
                     "hashscan_url": receipt.hashscan_url,
                     "status": receipt.status,
-                })).unwrap_or_default();
+                }))
+                .unwrap_or_default();
                 write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
             })
         },

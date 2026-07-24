@@ -1,7 +1,7 @@
 name        = "x402.pay"
 version     = "0.1.0"
 description = "Fetches a URL, paying automatically via Hedera x402 if the server returns HTTP 402 Payment Required. Use this to read, access, or retrieve paywalled content. If the URL is freely accessible, returns the content directly without payment."
-triggers = ["web", "pay", "paywall", "402", "purchase", "fetch", "get", "read", "access"]
+triggers = []
 
 [display]
 action = "Paying for \"{url}\""

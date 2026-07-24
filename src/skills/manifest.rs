@@ -2,10 +2,11 @@
 //! Used by both the runtime (skill execution / capability wiring) and the
 //! agent prompt builder (skill index + trigger matching).
 
-use anyhow::anyhow;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
+
+use anyhow::anyhow;
+use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct SkillManifest {

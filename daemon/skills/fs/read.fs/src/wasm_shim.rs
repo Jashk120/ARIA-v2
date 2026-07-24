@@ -2,9 +2,15 @@
 //! else (`extract`, format parsers) lives in lib.rs and is target-agnostic.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{
+    Value,
+    json,
+};
 
-use crate::{extract, ReadOptions};
+use crate::{
+    ReadOptions,
+    extract,
+};
 
 #[link(wasm_import_module = "aria")]
 unsafe extern "C" {

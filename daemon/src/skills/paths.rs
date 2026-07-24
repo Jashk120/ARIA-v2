@@ -7,8 +7,12 @@
 //! pointing at a user data dir (e.g. ~/.aria/skills/<category>/<name>/) containing
 //! both manifest.toml and skill.wasm side by side.
 
-use anyhow::{anyhow, bail};
 use std::path::PathBuf;
+
+use anyhow::{
+    anyhow,
+    bail,
+};
 
 /// Resolve the root directory of the daemon crate.
 pub fn get_daemon_root() -> anyhow::Result<PathBuf> {
@@ -40,10 +44,7 @@ pub fn get_daemon_root() -> anyhow::Result<PathBuf> {
 pub fn split_skill_name(name: &str) -> anyhow::Result<(&str, &str)> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     if parts.len() != 2 {
-        bail!(
-            "Invalid skill name '{}' — expected format: action.category",
-            name
-        );
+        bail!("Invalid skill name '{}' — expected format: action.category", name);
     }
     Ok((parts[0], parts[1]))
 }
@@ -53,10 +54,7 @@ pub fn skill_dir(name: &str) -> anyhow::Result<PathBuf> {
     let (action, category) = split_skill_name(name)?;
     let root = get_daemon_root()?;
 
-    Ok(root
-        .join("skills")
-        .join(category)
-        .join(format!("{}.{}", action, category)))
+    Ok(root.join("skills").join(category).join(format!("{}.{}", action, category)))
 }
 
 /// Path to the compiled wasm binary for a skill.

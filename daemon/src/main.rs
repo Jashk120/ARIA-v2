@@ -1,11 +1,27 @@
-use std::env;
-use std::fs;
-use std::io::{self, Write};
+use std::io::{
+    self,
+    Write,
+};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{
+    env,
+    fs,
+};
+
+use tokio::io::{
+    AsyncReadExt,
+    AsyncWriteExt,
+};
 use tokio::signal;
-use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing::{
+    info,
+    warn,
+};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{
+    EnvFilter,
+    fmt,
+};
 
 mod agent;
 mod config;
@@ -51,11 +67,13 @@ fn install_service() -> anyhow::Result<()> {
     match os {
         "linux" => {
             let exe_path = env::current_exe()?;
-            let user_home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            let user_home =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
             let systemd_dir = user_home.join(".config/systemd/user");
             fs::create_dir_all(&systemd_dir)?;
 
-            let service_content = format!(r#"[Unit]
+            let service_content = format!(
+                r#"[Unit]
 Description=ARIA Governed Agent Daemon
 After=network.target
 
@@ -66,7 +84,9 @@ Environment=RUST_LOG=info
 
 [Install]
 WantedBy=default.target
-"#, exe_path.display());
+"#,
+                exe_path.display()
+            );
 
             let service_path = systemd_dir.join("aria-daemon.service");
             fs::write(&service_path, service_content)?;
@@ -75,8 +95,12 @@ WantedBy=default.target
             println!("  Run this to enable and start:");
             println!("  systemctl --user enable --now aria-daemon");
         }
-        "windows" => { println!("Windows auto-start not yet implemented."); }
-        _ => { return Err(anyhow::anyhow!("Unsupported OS for auto-start installation")); }
+        "windows" => {
+            println!("Windows auto-start not yet implemented.");
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unsupported OS for auto-start installation"));
+        }
     }
     Ok(())
 }
@@ -90,13 +114,22 @@ fn bootstrap_db() -> anyhow::Result<Db> {
 
 /// Attempt to build an X402PaymentVault from environment; returns None on any failure.
 /// This lets the daemon start without Hedera credentials — x402 just won't work.
-fn build_x402_vault(db: Arc<crate::db::Db>) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
-    use hiero_sdk::{AccountId, Client, PrivateKey};
+fn build_x402_vault(
+    db: Arc<crate::db::Db>,
+) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
     use std::str::FromStr;
+
+    use hiero_sdk::{
+        AccountId,
+        Client,
+        PrivateKey,
+    };
 
     let account_id_str = std::env::var("HEDERA_ACCOUNT_ID").ok()?;
     let private_key_str = std::env::var("HEDERA_PRIVATE_KEY").ok()?;
-    if private_key_str.trim().is_empty() { return None; }
+    if private_key_str.trim().is_empty() {
+        return None;
+    }
 
     let operator_id = AccountId::from_str(&account_id_str).ok()?;
     let private_key = PrivateKey::from_str_ecdsa(&private_key_str).ok()?;
@@ -134,7 +167,9 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
             let mut api_key = String::new();
             io::stdin().read_line(&mut api_key)?;
             let api_key = api_key.trim().to_string();
-            if api_key.is_empty() { anyhow::bail!("API key cannot be empty"); }
+            if api_key.is_empty() {
+                anyhow::bail!("API key cannot be empty");
+            }
             db.set_config("openrouter_api_key", &api_key)?;
             println!("✓ API key saved.");
             Ok(api_key)
@@ -156,7 +191,8 @@ async fn run_daemon() -> anyhow::Result<()> {
     let skills = Arc::new(SkillManager::new()?);
 
     // Initialize HAL Vault with auto-probing
-    let (did, pub_key) = db.get_identity()?.ok_or_else(|| anyhow::anyhow!("Identity missing from DB"))?;
+    let (did, pub_key) =
+        db.get_identity()?.ok_or_else(|| anyhow::anyhow!("Identity missing from DB"))?;
     let (vault, level) = crate::identity::initialize_vault(did, pub_key).await?;
     info!("Identity HAL initialized (Mode: {:?})", level);
 
@@ -167,7 +203,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         tokio::select! {
             result = listener.accept() => {
                 let (mut socket, addr) = result?;
-                info!("New connection from {}", addr);
+                // info!("New connection from {}", addr);
 
                 let api_key = api_key.clone();
                 let runtime_cfg = runtime_cfg.clone();
@@ -201,14 +237,20 @@ async fn run_daemon() -> anyhow::Result<()> {
                         }
                     };
 
+                    // Mint the real task ID first so the task-chain link we
+                    // sign below is computed over the actual ID this task
+                   // will be persisted under — not a placeholder.
+                    let new_task_id = db.new_task_id();
+
                     // Sign the global task chain link via Vault HAL
-                    let (link_hash, _) = match db.get_task_link_info("temp_id", &req.task) {
+                    let (link_hash, created_at) = match db.get_task_link_info("temp_id", &req.task) {
                         Ok(info) => info,
                         Err(_) => ("".to_string(), "".to_string()),
                     };
                     let task_chain_sig = vault.sign(link_hash.as_bytes()).await.unwrap_or_default();
 
-                    let task_id: String = match db.create_task(&vault.did(), "tcp", &req.task, &task_chain_sig) {
+                    let task_id: String = match db.create_task(
+                        &new_task_id, &vault.did(), "tcp", &req.task,&link_hash, &task_chain_sig, &created_at) {
                         Ok(id) => id,
                         Err(e) => {
                             let _ = socket.write_all(format!("DB Error: {}\n", e).as_bytes()).await;
@@ -245,7 +287,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                                         let input_hash = crypto::sha256_hex_str(&args.to_string());
                                         let result_hash = crypto::sha256_hex_str(content);
                                         let chain_hash = crypto::compute_chain_hash(&prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp);
-                                        
+
                                         match vault.sign(chain_hash.as_bytes()).await {
                                             Ok(sig) => {
                                                 let _ = db.log_task_step(&task_id, &vault.did(), &skill, &args.to_string(), content, success, &sig);
@@ -299,7 +341,10 @@ async fn main() -> anyhow::Result<()> {
             info!("Logging initialized. Logs saved to: {:?}", log_dir.join("daemon.log"));
             return run_daemon().await;
         }
-        "help" | "--help" | "-h" => { print_help(); Ok(()) }
+        "help" | "--help" | "-h" => {
+            print_help();
+            Ok(())
+        }
         _ => {
             tracing_subscriber::registry()
                 .with(fmt::layer())

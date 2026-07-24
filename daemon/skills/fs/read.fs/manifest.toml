@@ -2,7 +2,7 @@ name        = "read.fs"
 version     = "0.1.0"
 description = "Read the contents of a text file from the local filesystem"
 
-triggers = ["fs"]
+triggers = []
 
 [display]
 action = "Reading {path}"

@@ -7,17 +7,30 @@ pub mod manifest;
 pub mod paths;
 mod wasm_runtime;
 
-use anyhow::{anyhow, bail};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
-use wasmtime::{Engine, Module};
+use std::sync::{
+    Arc,
+    RwLock,
+};
+
+use anyhow::{
+    anyhow,
+    bail,
+};
+use manifest::load_manifest;
+use paths::{
+    skill_dir,
+    wasm_path,
+};
+use serde_json::Value;
+use wasm_runtime::run_wasm_instance_async;
+use wasmtime::{
+    Engine,
+    Module,
+};
 
 use crate::db::Db;
-use manifest::load_manifest;
-use paths::{skill_dir, wasm_path};
-use wasm_runtime::run_wasm_instance_async;
 
 // ── Skill Manager ─────────────────────────────────────────────────────────────
 
@@ -30,10 +43,7 @@ impl SkillManager {
     pub fn new() -> anyhow::Result<Self> {
         let config = wasmtime::Config::new();
         let engine = Engine::new(&config)?;
-        Ok(Self {
-            engine,
-            modules: RwLock::new(HashMap::new()),
-        })
+        Ok(Self { engine, modules: RwLock::new(HashMap::new()) })
     }
 
     fn get_module(&self, name: &str, path: &Path) -> anyhow::Result<Arc<Module>> {
@@ -99,9 +109,9 @@ impl SkillManager {
         let engine = self.engine.clone();
 
         run_wasm_instance_async(
-            &engine, 
-            module, 
-            args, 
+            &engine,
+            module,
+            args,
             &manifest,
             db,
             payment_vault,
@@ -109,7 +119,8 @@ impl SkillManager {
             agent_did,
             name.to_string(),
             task_id,
-        ).await
+        )
+        .await
     }
 }
 
@@ -122,19 +133,14 @@ fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
     let dir = skill_dir(skill)?;
     let manifest = load_manifest(&dir)?;
 
-    let obj = args
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("Args must be a JSON object to enrich keys"))?;
+    let obj =
+        args.as_object_mut().ok_or_else(|| anyhow!("Args must be a JSON object to enrich keys"))?;
 
     for (key, entry) in &manifest.config {
         if !entry.inject {
             continue;
         }
-        let value = db
-            .get_config(key)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| entry.default.clone());
+        let value = db.get_config(key).ok().flatten().unwrap_or_else(|| entry.default.clone());
 
         obj.insert(key.clone(), Value::String(value));
     }

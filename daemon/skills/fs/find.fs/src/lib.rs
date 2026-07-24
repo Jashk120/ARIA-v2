@@ -2,8 +2,14 @@
 //! Searches a directory tree by filename pattern or file content.
 //! Compiled to WASM. All filesystem I/O goes through host_fs_find.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 
@@ -124,14 +130,7 @@ fn fs_find(path: &str, query: &str, mode: &str) -> Result<String, String> {
         let p = path.as_bytes();
         let q = query.as_bytes();
         let m = mode.as_bytes();
-        host_fs_find(
-            p.as_ptr(),
-            p.len(),
-            q.as_ptr(),
-            q.len(),
-            m.as_ptr(),
-            m.len(),
-        )
+        host_fs_find(p.as_ptr(), p.len(), q.as_ptr(), q.len(), m.as_ptr(), m.len())
     };
 
     if packed == 0 {

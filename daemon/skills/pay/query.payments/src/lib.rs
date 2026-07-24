@@ -1,9 +1,17 @@
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 
 #[link(wasm_import_module = "aria")]
 unsafe extern "C" {
-    fn host_db_query(type_ptr: *const u8, type_len: usize, params_ptr: *const u8, params_len: usize) -> u64;
+    fn host_db_query(
+        type_ptr: *const u8,
+        type_len: usize,
+        params_ptr: *const u8,
+        params_len: usize,
+    ) -> u64;
 }
 
 #[unsafe(no_mangle)]
@@ -33,7 +41,9 @@ struct Input {
     #[serde(default = "default_days")]
     days: i64,
 }
-fn default_days() -> i64 { 7 }
+fn default_days() -> i64 {
+    7
+}
 
 fn execute(input: &str) -> Result<Value, String> {
     let args: Input = serde_json::from_str(input).unwrap_or(Input { days: 7 });

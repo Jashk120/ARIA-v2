@@ -2,7 +2,7 @@ name        = "write.fs"
 version     = "0.1.0"
 description = "Write or overwrite a text file on the local filesystem"
 
-triggers = ["fs"]
+triggers = []
 
 [display]
 action = "Writing {path}"

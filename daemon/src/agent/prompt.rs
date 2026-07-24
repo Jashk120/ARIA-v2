@@ -5,7 +5,10 @@
 //! even on off-trigger phrasing). Skills whose `triggers` match the current
 //! user prompt additionally get their full call/output schema + react notes.
 
-use crate::skills::manifest::{SkillManifest, load_manifest};
+use crate::skills::manifest::{
+    SkillManifest,
+    load_manifest,
+};
 use crate::skills::paths::get_daemon_root;
 
 // ── Trigger matching ──────────────────────────────────────────────────────────
@@ -34,7 +37,7 @@ pub fn prompt_matches_triggers(
     }
     let lower_prompt = prompt.to_lowercase();
     let lower_type = skills_type.clone().unwrap_or_default().to_lowercase();
-    
+
     triggers.iter().any(|t| {
         let t_lower = t.to_lowercase();
         lower_prompt.contains(&t_lower) || lower_type.contains(&t_lower)
@@ -118,7 +121,7 @@ pub fn load_all_skills() -> Vec<SkillManifest> {
 
 fn build_skills_prompt(user_prompt: &str, skills_type: &Option<String>) -> String {
     let all_skills = load_all_skills();
- 
+
     let lines: Vec<String> = all_skills
         .iter()
         .map(|m| {
@@ -134,15 +137,9 @@ fn build_skills_prompt(user_prompt: &str, skills_type: &Option<String>) -> Strin
 }
 
 fn format_skill_block(m: &SkillManifest) -> String {
-    let args_example = m
-        .call
-        .args_schema
-        .as_deref()
-        .unwrap_or(r#"{"key":"value"}"#);
-    let call_line = format!(
-        r#"  call:   {{"type":"action","skill":"{}","args":{}}}"#,
-        m.name, args_example
-    );
+    let args_example = m.call.args_schema.as_deref().unwrap_or(r#"{"key":"value"}"#);
+    let call_line =
+        format!(r#"  call:   {{"type":"action","skill":"{}","args":{}}}"#, m.name, args_example);
 
     let mut lines = vec![format!("- {}: {}", m.name, m.description), call_line];
 
@@ -162,17 +159,22 @@ fn format_skill_block(m: &SkillManifest) -> String {
 
 // ── Native tools builder ──────────────────────────────────────────────────────
 
-pub fn build_native_tools(user_prompt: &str, skills_type: &Option<String>) -> Vec<serde_json::Value> {
+pub fn build_native_tools(
+    user_prompt: &str,
+    skills_type: &Option<String>,
+) -> Vec<serde_json::Value> {
     let all_skills = load_all_skills();
     let mut tools = Vec::new();
 
     for m in &all_skills {
         if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
-            let parameters = m.call.parameters.clone().unwrap_or_else(|| serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }));
-            
+            let parameters = m.call.parameters.clone().unwrap_or_else(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })
+            });
+
             tools.push(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -187,11 +189,13 @@ pub fn build_native_tools(user_prompt: &str, skills_type: &Option<String>) -> Ve
     // Fallback: if no specific triggers matched, include all skills so the LLM is never left toolless
     if tools.is_empty() {
         for m in all_skills {
-            let parameters = m.call.parameters.clone().unwrap_or_else(|| serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }));
-            
+            let parameters = m.call.parameters.clone().unwrap_or_else(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })
+            });
+
             tools.push(serde_json::json!({
                 "type": "function",
                 "function": {

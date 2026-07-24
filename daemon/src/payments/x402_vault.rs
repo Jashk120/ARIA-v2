@@ -1,8 +1,23 @@
-use hiero_sdk::{AccountId, Client, PrivateKey};
-use crate::payments::x402_types::{PaymentRequirements, PaymentPayload, PaymentPayloadData, PaymentResource, PaymentError};
-use crate::payments::facilitator_client::{FacilitatorClient, find_hedera_testnet_fee_payer};
 use std::str::FromStr;
+
+use hiero_sdk::{
+    AccountId,
+    Client,
+    PrivateKey,
+};
 use tracing::warn;
+
+use crate::payments::facilitator_client::{
+    FacilitatorClient,
+    find_hedera_testnet_fee_payer,
+};
+use crate::payments::x402_types::{
+    PaymentError,
+    PaymentPayload,
+    PaymentPayloadData,
+    PaymentRequirements,
+    PaymentResource,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaymentResult {
@@ -29,13 +44,7 @@ impl X402PaymentVault {
         db: std::sync::Arc<crate::db::Db>,
         facilitator_url: String,
     ) -> Self {
-        Self {
-            client,
-            operator_id,
-            private_key,
-            db,
-            facilitator_url,
-        }
+        Self { client, operator_id, private_key, db, facilitator_url }
     }
 
     pub async fn pay(
@@ -71,33 +80,36 @@ impl X402PaymentVault {
 
         // Extract metadata for PaymentResource from requirements.extra if present
         let url = requirements.extra.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let description = requirements.extra.get("description").and_then(|v| v.as_str()).unwrap_or("Hedera x402 Payment").to_string();
-        let mime_type = requirements.extra.get("mimeType").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let description = requirements
+            .extra
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Hedera x402 Payment")
+            .to_string();
+        let mime_type =
+            requirements.extra.get("mimeType").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        let resource = PaymentResource {
-            url,
-            description,
-            mime_type,
-        };
+        let resource = PaymentResource { url, description, mime_type };
 
         // 4. Wrap it into the v2 PaymentPayload envelope
         let payload = PaymentPayload {
             x402_version: 2,
             resource,
             accepted: requirements.clone(),
-            payload: PaymentPayloadData {
-                transaction,
-            },
+            payload: PaymentPayloadData { transaction },
         };
 
         // 5. Call facilitator.verify() first
         let payload_json = serde_json::to_string(&payload).unwrap_or_default();
-        let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload_json.as_bytes());
-       
+        let payload_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            payload_json.as_bytes(),
+        );
 
         let verify_res = facilitator.verify(&payload, &requirements).await?;
         if !verify_res.is_valid {
-            let reason = verify_res.invalid_reason.unwrap_or_else(|| "Verification failed".to_string());
+            let reason =
+                verify_res.invalid_reason.unwrap_or_else(|| "Verification failed".to_string());
             return Err(PaymentError::VerificationFailed(reason));
         }
 
@@ -114,7 +126,9 @@ impl X402PaymentVault {
         let hashscan_url = format!("https://hashscan.io/testnet/transaction/{}", transaction_id);
 
         // 7. Log the payment to the SQLite `payments` table
-        let agent_did = self.db.get_identity()
+        let agent_did = self
+            .db
+            .get_identity()
             .ok()
             .flatten()
             .map(|(did, _)| did)
@@ -139,16 +153,18 @@ impl X402PaymentVault {
 
         let payment_payload_json = match serde_json::to_string(&payload) {
             Ok(s) => s,
-            Err(e) => return Err(PaymentError::VerificationFailed(format!("Failed to serialize payment payload: {}", e))),
+            Err(e) => {
+                return Err(PaymentError::VerificationFailed(format!(
+                    "Failed to serialize payment payload: {}",
+                    e
+                )));
+            }
         };
-        let payment_token = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payment_payload_json.as_bytes());
+        let payment_token = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            payment_payload_json.as_bytes(),
+        );
 
-        Ok(PaymentResult {
-            transaction_id,
-            payer,
-            network,
-            hashscan_url,
-            payment_token,
-        })
+        Ok(PaymentResult { transaction_id, payer, network, hashscan_url, payment_token })
     }
 }

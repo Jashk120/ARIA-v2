@@ -17,7 +17,7 @@ pub struct AppConfig {
 pub const CONFIG: AppConfig = AppConfig {
     use_provider: Provider::Ollama,
     openrouter_url: "https://openrouter.ai/api/v1/chat/completions",
-    ollama_url: "http://0.0.0.0:8000/v1/chat/completions",//"http://localhost:11434/v1/chat/completions",
+    ollama_url: "http://0.0.0.0:8000/v1/chat/completions", //"http://localhost:11434/v1/chat/completions",
     openrouter_model: "google/gemma-4-26b-a4b-it:free",
     ollama_model: "gemma-4-31b-it",
 };
@@ -50,11 +50,8 @@ impl RuntimeConfig {
                 if !entry.inject {
                     continue;
                 }
-                let value = db
-                    .get_config(key)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| entry.default.clone());
+                let value =
+                    db.get_config(key).ok().flatten().unwrap_or_else(|| entry.default.clone());
                 skill_config.insert(key.clone(), value);
             }
             if !skill_config.is_empty() {
@@ -74,10 +71,6 @@ impl RuntimeConfig {
             .cloned()
             .filter(|k| !k.is_empty());
 
-        Self {
-            searxng_url,
-            brave_api_key,
-            injected_config: injected,
-        }
+        Self { searxng_url, brave_api_key, injected_config: injected }
     }
 }

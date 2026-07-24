@@ -2,15 +2,7 @@ name        = "find.fs"
 version     = "0.1.0"
 description = "Search for files by name pattern or by content match within a directory tree"
 
-triggers = [
-    "find file", "find files", "find the file", "find a file",
-    "search my files", "search for file", "search files",
-    "locate file", "locate files",
-    "which file contains", "grep",
-    "where is", "look for file",
-    "find on my local", "files on my local",
-    "look up file", "search directory",
-]
+triggers = []
 
 [display]
 action = "Searching for \"{query}\" in {path}"

@@ -4,8 +4,14 @@
 //!
 //! Compiled to WASM. All HTTP goes through host_http_get.
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
 
 // ── Host functions ────────────────────────────────────────────────────────────
 

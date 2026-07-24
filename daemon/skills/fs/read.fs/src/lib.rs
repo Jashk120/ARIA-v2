@@ -4,8 +4,9 @@
 //! plumbing so it can be unit-tested natively. The wasm entry points in
 //! `wasm_shim.rs` are a thin wrapper around `extract()`.
 
-use serde::Serialize;
 use std::io::Read;
+
+use serde::Serialize;
 
 #[cfg(target_arch = "wasm32")]
 #[cfg(target_arch = "wasm32")]
@@ -22,11 +23,7 @@ pub enum Format {
 }
 
 pub fn detect_format(path: &str) -> Format {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => Format::Pdf,
         "docx" => Format::Docx,
@@ -57,11 +54,7 @@ pub struct ReadOptions {
 
 impl Default for ReadOptions {
     fn default() -> Self {
-        ReadOptions {
-            line_range: None,
-            max_bytes: 1024 * 1024,
-            max_rows_per_sheet: 500,
-        }
+        ReadOptions { line_range: None, max_bytes: 1024 * 1024, max_rows_per_sheet: 500 }
     }
 }
 
@@ -129,8 +122,7 @@ pub fn extract(path: &str, raw: &[u8], opts: &ReadOptions) -> Result<ReadResult,
 // ── PDF ───────────────────────────────────────────────────────────────────────
 
 fn extract_pdf(raw: &[u8]) -> Result<String, String> {
-    pdf_extract::extract_text_from_mem(raw)
-        .map_err(|e| format!("PDF extraction failed: {}", e))
+    pdf_extract::extract_text_from_mem(raw).map_err(|e| format!("PDF extraction failed: {}", e))
 }
 
 // ── DOCX ──────────────────────────────────────────────────────────────────────
@@ -176,9 +168,7 @@ fn extract_text_from_wordprocessing_xml(xml: &str) -> Result<String, String> {
                 }
             }
             Ok(Event::Text(t)) if in_text => {
-                let decoded = t
-                    .unescape()
-                    .map_err(|e| format!("XML text decode error: {}", e))?;
+                let decoded = t.unescape().map_err(|e| format!("XML text decode error: {}", e))?;
                 out.push_str(&decoded);
             }
             Ok(Event::Eof) => break,
@@ -202,14 +192,10 @@ fn extract_pptx(raw: &[u8]) -> Result<String, String> {
 
     let mut slide_indices: Vec<(usize, String)> = Vec::new();
     for i in 0..archive.len() {
-        let name = archive
-            .by_index(i)
-            .map_err(|e| format!("Zip read error: {}", e))?
-            .name()
-            .to_string();
-        if let Some(rest) = name
-            .strip_prefix("ppt/slides/slide")
-            .and_then(|s| s.strip_suffix(".xml"))
+        let name =
+            archive.by_index(i).map_err(|e| format!("Zip read error: {}", e))?.name().to_string();
+        if let Some(rest) =
+            name.strip_prefix("ppt/slides/slide").and_then(|s| s.strip_suffix(".xml"))
         {
             if let Ok(n) = rest.parse::<usize>() {
                 slide_indices.push((n, name));
@@ -224,12 +210,10 @@ fn extract_pptx(raw: &[u8]) -> Result<String, String> {
 
     let mut out = String::new();
     for (n, name) in slide_indices {
-        let mut file = archive
-            .by_name(&name)
-            .map_err(|e| format!("Missing slide entry {}: {}", name, e))?;
+        let mut file =
+            archive.by_name(&name).map_err(|e| format!("Missing slide entry {}: {}", name, e))?;
         let mut xml = String::new();
-        file.read_to_string(&mut xml)
-            .map_err(|e| format!("Failed reading {}: {}", name, e))?;
+        file.read_to_string(&mut xml).map_err(|e| format!("Failed reading {}: {}", name, e))?;
         drop(file);
 
         let text = extract_text_from_drawingml_xml(&xml)?;
@@ -271,9 +255,7 @@ fn extract_text_from_drawingml_xml(xml: &str) -> Result<String, String> {
                 }
             }
             Ok(Event::Text(t)) if in_text => {
-                let decoded = t
-                    .unescape()
-                    .map_err(|e| format!("XML text decode error: {}", e))?;
+                let decoded = t.unescape().map_err(|e| format!("XML text decode error: {}", e))?;
                 out.push_str(&decoded);
             }
             Ok(Event::Eof) => break,
@@ -291,11 +273,15 @@ fn extract_text_from_drawingml_xml(xml: &str) -> Result<String, String> {
 // tab-separated preview capped at max_rows_per_sheet rows.
 
 fn extract_xlsx(raw: &[u8], max_rows_per_sheet: usize) -> Result<String, String> {
-    use calamine::{open_workbook_from_rs, Reader, Xlsx};
+    use calamine::{
+        Reader,
+        Xlsx,
+        open_workbook_from_rs,
+    };
 
     let cursor = std::io::Cursor::new(raw);
-    let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
-        .map_err(|e| format!("Failed to open spreadsheet: {}", e))?;
+    let mut workbook: Xlsx<_> =
+        open_workbook_from_rs(cursor).map_err(|e| format!("Failed to open spreadsheet: {}", e))?;
 
     let sheet_names = workbook.sheet_names().to_owned();
     if sheet_names.is_empty() {
@@ -317,10 +303,7 @@ fn extract_xlsx(raw: &[u8], max_rows_per_sheet: usize) -> Result<String, String>
         let total_rows = range.rows().count();
         for row in range.rows() {
             if row_count >= max_rows_per_sheet {
-                out.push_str(&format!(
-                    "... ({} more rows truncated)\n",
-                    total_rows - row_count
-                ));
+                out.push_str(&format!("... ({} more rows truncated)\n", total_rows - row_count));
                 break;
             }
             let cells: Vec<String> = row.iter().map(|c| c.to_string()).collect();
@@ -344,8 +327,7 @@ fn read_zip_entry(raw: &[u8], entry_name: &str) -> Result<String, String> {
         .by_name(entry_name)
         .map_err(|e| format!("Missing expected entry \"{}\": {}", entry_name, e))?;
     let mut s = String::new();
-    file.read_to_string(&mut s)
-        .map_err(|e| format!("Failed reading \"{}\": {}", entry_name, e))?;
+    file.read_to_string(&mut s).map_err(|e| format!("Failed reading \"{}\": {}", entry_name, e))?;
     Ok(s)
 }
 

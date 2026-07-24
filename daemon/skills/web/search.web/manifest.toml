@@ -1,7 +1,7 @@
 name        = "search.web"
 version     = "0.1.0"
 description = "Web search via SearXNG or Brave"
-triggers = ["web"]
+triggers = []
 
 [display]
 action = "Searching the web for \"{query}\""

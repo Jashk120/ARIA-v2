@@ -99,7 +99,7 @@ impl SkillManager {
                 name,
                 path.display(),
                 name.split('.').next().unwrap_or(name),
-                name.split('.').last().unwrap_or(name),
+                name.split('.').next_back().unwrap_or(name),
             );
         }
 
@@ -151,12 +151,11 @@ fn enrich_args(skill: &str, args: &mut Value, db: &Db) -> anyhow::Result<()> {
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
 pub fn describe_action(skill: &str, args: &Value) -> String {
-    if let Ok(dir) = skill_dir(skill) {
-        if let Ok(manifest) = load_manifest(&dir) {
-            if let Some(template) = manifest.display.action {
-                return render_template(&template, args);
-            }
-        }
+    if let Ok(dir) = skill_dir(skill)
+        && let Ok(manifest) = load_manifest(&dir)
+        && let Some(template) = manifest.display.action
+    {
+        return render_template(&template, args);
     }
     format!("Running skill: {}", skill)
 }

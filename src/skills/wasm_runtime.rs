@@ -669,15 +669,14 @@ fn find_matches(
             } else {
                 match mode {
                     "content" => {
-                        if let Ok(text) = std::fs::read_to_string(&path) {
-                            if let Some(pos) = text.to_lowercase().find(query_lower) {
-                                let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let end =
-                                    text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
-                                let preview =
-                                    text[start..end].trim().chars().take(200).collect::<String>();
-                                out.push(serde_json::json!({ "path": path.to_string_lossy(), "preview": preview }));
-                            }
+                        if let Ok(text) = std::fs::read_to_string(&path)
+                            && let Some(pos) = text.to_lowercase().find(query_lower)
+                        {
+                            let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                            let end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
+                            let preview =
+                                text[start..end].trim().chars().take(200).collect::<String>();
+                            out.push(serde_json::json!({ "path": path.to_string_lossy(), "preview": preview }));
                         }
                     }
                     _ => {
@@ -717,23 +716,22 @@ fn unpack_ptr_len(packed: i64) -> (usize, usize) {
 
 async fn write_wasm_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> anyhow::Result<i64> {
     // Call the guest's allocator explicitly.
-    if let Some(export) = caller.get_export("alloc") {
-        if let Some(func) = export.into_func() {
-            if let Ok(alloc_fn) = func.typed::<i32, i32>(&mut *caller) {
-                let total_len = bytes.len() as i32;
-                let allocated_ptr = alloc_fn.call_async(&mut *caller, total_len).await?;
+    if let Some(export) = caller.get_export("alloc")
+        && let Some(func) = export.into_func()
+        && let Ok(alloc_fn) = func.typed::<i32, i32>(&mut *caller)
+    {
+        let total_len = bytes.len() as i32;
+        let allocated_ptr = alloc_fn.call_async(&mut *caller, total_len).await?;
 
-                let memory = caller
-                    .get_export("memory")
-                    .and_then(|e| e.into_memory())
-                    .ok_or_else(|| anyhow!("No memory export found"))?;
+        let memory = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or_else(|| anyhow!("No memory export found"))?;
 
-                memory.write(&mut *caller, allocated_ptr as usize, bytes)?;
+        memory.write(&mut *caller, allocated_ptr as usize, bytes)?;
 
-                let packed = ((allocated_ptr as u64) << 32) | (bytes.len() as u64);
-                return Ok(packed as i64);
-            }
-        }
+        let packed = ((allocated_ptr as u64) << 32) | (bytes.len() as u64);
+        return Ok(packed as i64);
     }
 
     bail!("Skill missing required 'alloc' export for dynamic host-to-guest FFI data passing.");
@@ -833,7 +831,7 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         eprintln!("[host_x402_pay] URL did not require payment (2xx), returning body directly");
                         let body_str = String::from_utf8_lossy(&body).to_string();
                         let data: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|_| serde_json::Value::String(body_str));
+                            .unwrap_or(serde_json::Value::String(body_str));
                         let result = serde_json::json!({
                             "data": data,
                             "transaction_id": serde_json::Value::Null,
@@ -896,22 +894,20 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("[host_x402_pay] retry GET failed: {}", e);
-                        if let Some(db) = caller.data().db.clone() {
-                            if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                        if let Some(db) = caller.data().db.clone()
+                            && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                                  eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                             }
-                        }
                         return 0;
                     }
                 };
 
                 if !retry_resp.status().is_success() {
                     eprintln!("[host_x402_pay] retry returned non-200: {}", retry_resp.status());
-                    if let Some(db) = caller.data().db.clone() {
-                        if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                    if let Some(db) = caller.data().db.clone()
+                        && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                             eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                         }
-                    }
                     return 0;
                 }
 
@@ -947,11 +943,10 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Ok(b) => b,
                     Err(e) => {
                         eprintln!("[host_x402_pay] failed to read retry body: {}", e);
-                        if let Some(db) = caller.data().db.clone() {
-                            if let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                        if let Some(db) = caller.data().db.clone()
+                            && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                                 eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                             }
-                        }
                         return 0;
                     }
                 };

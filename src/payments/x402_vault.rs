@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use hiero_sdk::{
     AccountId,
     Client,
@@ -101,7 +99,7 @@ impl X402PaymentVault {
 
         // 5. Call facilitator.verify() first
         let payload_json = serde_json::to_string(&payload).unwrap_or_default();
-        let payload_b64 = base64::Engine::encode(
+        let _payload_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             payload_json.as_bytes(),
         );

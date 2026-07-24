@@ -107,7 +107,7 @@ pub async fn run_react_loop(
     x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
     agent_did: String,
     task_id: String,
-) {
+) -> anyhow::Result<()> {
     let mut skill_fire_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
@@ -188,7 +188,7 @@ pub async fn run_react_loop(
                     .send(AgentEvent::Error { content: format!("LLM error: {}", clean_err) })
                     .await;
                 let _ = tx.send(AgentEvent::Done).await;
-                return;
+                return Err(e);
             }
         };
 
@@ -206,21 +206,20 @@ pub async fn run_react_loop(
             parsed = parse_agent_responses(&raw);
             if parsed.is_empty() {
                 let _ = tx.send(AgentEvent::Done).await;
-                return;
+                return Ok(());
             }
         } else {
             if !tool_calls.is_empty() {
                 for tc in tool_calls.iter() {
-                    if let Some(func) = tc.get("function") {
-                        if let (Some(name), Some(args_str)) =
+                    if let Some(func) = tc.get("function")
+                        && let (Some(name), Some(args_str)) =
                             (func.get("name"), func.get("arguments"))
-                        {
-                            let name = name.as_str().unwrap_or_default().to_string();
-                            let args_text = args_str.as_str().unwrap_or_default();
-                            let args: serde_json::Value =
-                                serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
-                            parsed.push(AgentResponseKind::Action { skill: name, args });
-                        }
+                    {
+                        let name = name.as_str().unwrap_or_default().to_string();
+                        let args_text = args_str.as_str().unwrap_or_default();
+                        let args: serde_json::Value =
+                            serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
+                        parsed.push(AgentResponseKind::Action { skill: name, args });
                     }
                 }
             } else if !raw.is_empty() {
@@ -236,7 +235,7 @@ pub async fn run_react_loop(
                 }
             } else {
                 let _ = tx.send(AgentEvent::Done).await;
-                return;
+                return Ok(());
             }
         }
 
@@ -277,11 +276,11 @@ pub async fn run_react_loop(
                         .await;
 
                     let mut enriched = args.clone();
-                    if let Some(obj) = enriched.as_object_mut() {
-                        if let Some(skill_config) = injected_config.get(&skill) {
-                            for (k, v) in skill_config {
-                                obj.insert(k.clone(), json!(v));
-                            }
+                    if let Some(obj) = enriched.as_object_mut()
+                        && let Some(skill_config) = injected_config.get(&skill)
+                    {
+                        for (k, v) in skill_config {
+                            obj.insert(k.clone(), json!(v));
                         }
                     }
 
@@ -311,10 +310,10 @@ pub async fn run_react_loop(
                     if is_native {
                         // Native tool_calls shape history appending
                         let matched_call = tool_calls.iter().find(|tc| {
-                            if let Some(f) = tc.get("function") {
-                                if let Some(n) = f.get("name") {
-                                    return n.as_str().unwrap_or_default() == skill;
-                                }
+                            if let Some(f) = tc.get("function")
+                                && let Some(n) = f.get("name")
+                            {
+                                return n.as_str().unwrap_or_default() == skill;
                             }
                             false
                         });
@@ -352,7 +351,7 @@ pub async fn run_react_loop(
 
         if !should_continue {
             let _ = tx.send(AgentEvent::Done).await;
-            return;
+            return Ok(());
         }
 
         step += 1;
@@ -362,6 +361,7 @@ pub async fn run_react_loop(
         .send(AgentEvent::Error { content: "Max steps reached without a final answer.".into() })
         .await;
     let _ = tx.send(AgentEvent::Done).await;
+    Ok(())
 }
 
 fn load_react_meta(skill: &str) -> ReactConfig {
@@ -474,10 +474,10 @@ async fn call_llm_streaming(
         "stream": true,
     });
 
-    if let Some(t) = tools {
-        if !t.is_empty() {
-            body.as_object_mut().unwrap().insert("tools".to_string(), json!(t));
-        }
+    if let Some(t) = tools
+        && !t.is_empty()
+    {
+        body.as_object_mut().unwrap().insert("tools".to_string(), json!(t));
     }
 
     tracing::info!("LLM Call: provider={}, model={}, url={}", provider_name, model, url);
@@ -495,35 +495,25 @@ async fn call_llm_streaming(
         let text = resp.text().await.unwrap_or_default();
 
         let mut is_tool_rejection = false;
-        if status.is_client_error() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(err_obj) = json.get("error") {
-                    let err_msg = err_obj
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let err_type = err_obj
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let err_code = err_obj
-                        .get("code")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or_default()
-                        .to_lowercase();
+        if status.is_client_error()
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(err_obj) = json.get("error")
+        {
+            let err_msg =
+                err_obj.get("message").and_then(|m| m.as_str()).unwrap_or_default().to_lowercase();
+            let err_type =
+                err_obj.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_lowercase();
+            let err_code =
+                err_obj.get("code").and_then(|c| c.as_str()).unwrap_or_default().to_lowercase();
 
-                    if err_msg.contains("tool")
-                        || err_msg.contains("function")
-                        || err_type.contains("tool")
-                        || err_type.contains("function")
-                        || err_code.contains("tool")
-                        || err_code.contains("function")
-                    {
-                        is_tool_rejection = true;
-                    }
-                }
+            if err_msg.contains("tool")
+                || err_msg.contains("function")
+                || err_type.contains("tool")
+                || err_type.contains("function")
+                || err_code.contains("tool")
+                || err_code.contains("function")
+            {
+                is_tool_rejection = true;
             }
         }
 
@@ -554,49 +544,42 @@ async fn call_llm_streaming(
             }
 
             let json_str = line.strip_prefix("data: ").unwrap_or(&line);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(choices) = v.get("choices") {
-                    if let Some(delta) = choices.get(0).and_then(|c| c.get("delta")) {
-                        // 1. Content accumulation & streaming
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            full_content.push_str(content);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str)
+                && let Some(choices) = v.get("choices")
+                && let Some(delta) = choices.get(0).and_then(|c| c.get("delta"))
+            {
+                // 1. Content accumulation & streaming
+                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    full_content.push_str(content);
 
-                            // Streaming safety fix - do not stream JSON to UI in fallback mode!
-                            if !is_native
-                                && (full_content.contains("```json") || full_content.contains("{"))
-                            {
-                                seen_json_block = true;
+                    // Streaming safety fix - do not stream JSON to UI in fallback mode!
+                    if !is_native
+                        && (full_content.contains("```json") || full_content.contains("{"))
+                    {
+                        seen_json_block = true;
+                    }
+
+                    if is_native || !seen_json_block {
+                        let _ = tx.send(AgentEvent::Token { content: content.to_string() }).await;
+                    }
+                }
+
+                // 2. Tool calls accumulation (never streamed to UI)
+                if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for call in calls {
+                        if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
+                            let index = index as usize;
+                            let entry = tool_calls_map.entry(index).or_default();
+
+                            if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                                entry.id = id.to_string();
                             }
-
-                            if is_native || !seen_json_block {
-                                let _ = tx
-                                    .send(AgentEvent::Token { content: content.to_string() })
-                                    .await;
-                            }
-                        }
-
-                        // 2. Tool calls accumulation (never streamed to UI)
-                        if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            for call in calls {
-                                if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
-                                    let index = index as usize;
-                                    let entry = tool_calls_map.entry(index).or_default();
-
-                                    if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
-                                        entry.id = id.to_string();
-                                    }
-                                    if let Some(func) = call.get("function") {
-                                        if let Some(name) =
-                                            func.get("name").and_then(|n| n.as_str())
-                                        {
-                                            entry.name.push_str(name);
-                                        }
-                                        if let Some(args) =
-                                            func.get("arguments").and_then(|a| a.as_str())
-                                        {
-                                            entry.arguments.push_str(args);
-                                        }
-                                    }
+                            if let Some(func) = call.get("function") {
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    entry.name.push_str(name);
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                    entry.arguments.push_str(args);
                                 }
                             }
                         }

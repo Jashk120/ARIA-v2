@@ -132,14 +132,12 @@ impl FacilitatorClient {
 
 pub fn find_hedera_testnet_fee_payer(response: &SupportedKindsResponse) -> Option<String> {
     for kind in &response.kinds {
-        if kind.network == "hedera:testnet" {
-            if let Some(extra) = &kind.extra {
-                if let Some(fee_payer) = extra.get("feePayer") {
-                    if let Some(fee_payer_str) = fee_payer.as_str() {
-                        return Some(fee_payer_str.to_string());
-                    }
-                }
-            }
+        if kind.network == "hedera:testnet"
+            && let Some(extra) = &kind.extra
+            && let Some(fee_payer) = extra.get("feePayer")
+            && let Some(fee_payer_str) = fee_payer.as_str()
+        {
+            return Some(fee_payer_str.to_string());
         }
     }
     None

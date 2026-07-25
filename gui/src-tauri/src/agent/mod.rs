@@ -173,13 +173,14 @@ pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), S
 pub async fn resume_daemon_task(
     app: AppHandle,
     state: State<'_, AppState>,
+    session_id: String,
     task_id: String,
     reply: String,
     skill_type: String,
 ) -> Result<(), String> {
     state
         .db
-        .clear_pending_confirmation(&task_id)
+        .clear_pending_confirmation(&session_id)
         .map_err(|e| e.to_string())?;
 
     let (res, final_result) = tokio::task::spawn_blocking({

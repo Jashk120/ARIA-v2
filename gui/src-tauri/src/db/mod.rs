@@ -1,6 +1,5 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -142,25 +141,15 @@ impl Database {
             .and_then(|json| serde_json::from_str::<PendingConfirmation>(&json).ok()))
     }
 
-    pub fn clear_pending_confirmation(&self, task_id: &str) -> SqlResult<()> {
+    /// Clear a session's pending confirmation, keyed directly by session_id
+    /// (the caller already knows which session it's resuming — no need to
+    /// scan every session's stored JSON looking for a task_id match).
+    pub fn clear_pending_confirmation(&self, session_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, pending_confirmation FROM sessions")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<SqlResult<Vec<_>>>()?;
-
-        for (session_id, pending_json) in rows {
-            if let Some(pending_json) = pending_json {
-                if pending_matches_task_id(&pending_json, task_id) {
-                    conn.execute(
-                        "UPDATE sessions SET pending_confirmation = NULL WHERE id = ?1",
-                        params![session_id],
-                    )?;
-                }
-            }
-        }
+        conn.execute(
+            "UPDATE sessions SET pending_confirmation = NULL WHERE id = ?1",
+            params![session_id],
+        )?;
 
         Ok(())
     }
@@ -219,10 +208,3 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> SqlResult<bool
     Ok(rows.iter().any(|name| name == column))
 }
 
-fn pending_matches_task_id(pending_json: &str, task_id: &str) -> bool {
-    serde_json::from_str::<Value>(pending_json)
-        .ok()
-        .and_then(|value| value["task_id"].as_str().map(str::to_string))
-        .as_deref()
-        == Some(task_id)
-}

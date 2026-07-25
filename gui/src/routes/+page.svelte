@@ -355,13 +355,14 @@
    */
   async function resumeConfirmation(msg, reply) {
     const text = reply.trim();
-    if (!msg.taskId || !msg.skillType || !text || isThinking || !daemonOnline) return;
+    if (!msg.taskId || !msg.skillType || !text || !currentSession || isThinking || !daemonOnline) return;
 
     messages = messages.filter(item => item.id !== msg.id);
     isThinking = true;
 
     try {
       await invoke('resume_daemon_task', {
+        sessionId: currentSession,
         taskId: msg.taskId,
         reply: text,
         skillType: msg.skillType

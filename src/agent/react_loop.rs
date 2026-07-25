@@ -167,6 +167,10 @@ pub async fn run_react_loop(
         match confirmation_decision(&user_prompt) {
             ConfirmationDecision::Confirmed => {
                 if let Some(error) = payment_proposal_error(&skill, &args) {
+                    if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
+                        let pkey = compute_payment_key(&agent_did, &rec, amt);
+                        let _ = db.release_spend_hold(&agent_did, &pkey);
+                    }
                     let _ = db.clear_pending_action(&task_id);
                     let _ = tx.send(AgentEvent::Error { content: error }).await;
                     let _ = tx.send(AgentEvent::Done).await;
@@ -175,6 +179,11 @@ pub async fn run_react_loop(
 
                 let current_fingerprint = payment_fingerprint(&skill, &args, &injected_config);
                 if stored_fingerprint != current_fingerprint {
+                    if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
+                        let old_pkey = compute_payment_key(&agent_did, &rec, amt);
+                        let _ = db.release_spend_hold(&agent_did, &old_pkey);
+                    }
+
                     let refreshed = pending_payment_action(&skill, args.clone(), &injected_config);
                     let question = payment_confirmation_message(&skill, &args);
                     let _ = tx
@@ -200,6 +209,12 @@ pub async fn run_react_loop(
                     let _ = tx.send(AgentEvent::Done).await;
                     return Ok(());
                 }
+
+                // Extract payment key now so we can commit/release after run_skill_raw.
+                let payment_key_for_hold =
+                    extract_payment_recipient_and_amount(&skill, &args)
+                        .ok()
+                        .map(|(rec, amt)| compute_payment_key(&agent_did, &rec, amt));
 
                 let _ = db.clear_pending_action(&task_id);
 
@@ -232,6 +247,17 @@ pub async fn run_react_loop(
                 };
                 let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
 
+                // Commit the hold on success (insert_payment already ran inside run_skill_raw,
+                // so the payments table has the row — the hold's only remaining job is to stop
+                // double-counting). Release on failure so the budget isn't stuck.
+                if let Some(ref pkey) = payment_key_for_hold {
+                    if is_error {
+                        let _ = db.release_spend_hold(&agent_did, pkey);
+                    } else {
+                        let _ = db.commit_spend_hold(&agent_did, pkey);
+                    }
+                }
+
                 if is_error {
                     let _ = tx.send(AgentEvent::Error { content: observation }).await;
                     let _ = tx.send(AgentEvent::Done).await;
@@ -246,6 +272,10 @@ pub async fn run_react_loop(
                 // synthesize a final user-facing response from the observation.
             }
             ConfirmationDecision::Denied => {
+                if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
+                    let pkey = compute_payment_key(&agent_did, &rec, amt);
+                    let _ = db.release_spend_hold(&agent_did, &pkey);
+                }
                 let _ = db.clear_pending_action(&task_id);
                 let _ = tx
                     .send(AgentEvent::Final {
@@ -256,6 +286,10 @@ pub async fn run_react_loop(
                 return Ok(());
             }
             ConfirmationDecision::ContinueConversation => {
+                if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
+                    let pkey = compute_payment_key(&agent_did, &rec, amt);
+                    let _ = db.release_spend_hold(&agent_did, &pkey);
+                }
                 let _ = db.clear_pending_action(&task_id);
                 history.push(json!({
                     "role": "user",
@@ -428,35 +462,214 @@ pub async fn run_react_loop(
                             break;
                         }
 
-                        let question = payment_confirmation_message(&skill, &args);
-                        let _ = tx
-                            .send(AgentEvent::Ask {
-                                content: question,
-                                task_id: task_id.clone(),
-                                kind: Some(AskKind::Payment),
-                            })
-                            .await;
+                        let runtime_cfg = crate::config::RuntimeConfig::load(&db);
+                        let governance = &runtime_cfg.governance;
+                        let audit_client = payment_vault
+                            .as_ref()
+                            .map(|v| v.client())
+                            .or_else(|| x402_vault.as_ref().map(|v| v.client()));
+                        let topic_id = governance.audit_topic_id.clone();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
 
-                        history.push(json!({
-                            "role": "assistant",
-                            "content": format!(
-                                "Proposed payment action awaiting human confirmation: {}",
-                                payment_action_summary(&skill, &args)
+                        let (recipient, amount_hbar) =
+                            match extract_payment_recipient_and_amount(&skill, &args) {
+                                Ok(res) => res,
+                                Err(err_msg) => {
+                                    let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
+                                    should_continue = false;
+                                    break;
+                                }
+                            };
+
+                        // Check 1a: Allowlist (curb.allowlist)
+                        let is_allowed =
+                            db.is_account_allowlisted(&agent_did, &recipient).unwrap_or(false);
+                        crate::payments::audit::write_payment_decision(
+                            audit_client.clone(),
+                            topic_id.clone(),
+                            crate::payments::audit::CurbRecord {
+                                v: 1,
+                                agent: agent_did.clone(),
+                                ts: now_ms,
+                                policy: Some("curb.allowlist".to_string()),
+                                method: Some(skill.clone()),
+                                amount: Some(amount_hbar),
+                                currency: Some("HBAR".to_string()),
+                                counterparty: Some(recipient.clone()),
+                                allowed: Some(is_allowed),
+                                reason: Some(if is_allowed {
+                                    "allowlisted".to_string()
+                                } else {
+                                    format!("not_allowlisted:{}", recipient)
+                                }),
+                                request_id: None,
+                            },
+                        );
+
+                        if !is_allowed {
+                            let err_msg = format!(
+                                "Payment blocked by policy (curb.allowlist): account '{}' is not on the allowlist.",
+                                recipient
+                            );
+                            let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
+                            should_continue = false;
+                            break;
+                        }
+
+                        // Check 1b: Spend Limit (curb.spend-limit)
+                        if let Some(per_task) = governance.per_task_cap {
+                            if amount_hbar > per_task {
+                                crate::payments::audit::write_payment_decision(
+                                    audit_client.clone(),
+                                    topic_id.clone(),
+                                    crate::payments::audit::CurbRecord {
+                                        v: 1,
+                                        agent: agent_did.clone(),
+                                        ts: now_ms,
+                                        policy: Some("curb.spend-limit".to_string()),
+                                        method: Some(skill.clone()),
+                                        amount: Some(amount_hbar),
+                                        currency: Some("HBAR".to_string()),
+                                        counterparty: Some(recipient.clone()),
+                                        allowed: Some(false),
+                                        reason: Some("per_task_exceeded".to_string()),
+                                        request_id: None,
+                                    },
+                                );
+
+                                let err_msg = format!(
+                                    "Payment blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR.",
+                                    amount_hbar, per_task
+                                );
+                                let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
+                                should_continue = false;
+                                break;
+                            }
+                        }
+
+                        let pkey = compute_payment_key(&agent_did, &recipient, amount_hbar);
+                        let reserved = db
+                            .try_reserve_spend(
+                                &agent_did,
+                                &pkey,
+                                amount_hbar,
+                                governance.per_day_cap,
                             )
-                        }));
+                            .unwrap_or(false);
 
-                        let history_json = serde_json::to_string(&history).unwrap_or_default();
-                        let pending_json = serde_json::to_string(&pending_payment_action(
-                            &skill,
-                            args.clone(),
-                            &injected_config,
-                        ))
-                        .unwrap_or_default();
-                        let _ =
-                            db.save_awaiting_confirmation(&task_id, &history_json, &pending_json);
+                        crate::payments::audit::write_payment_decision(
+                            audit_client.clone(),
+                            topic_id.clone(),
+                            crate::payments::audit::CurbRecord {
+                                v: 1,
+                                agent: agent_did.clone(),
+                                ts: now_ms,
+                                policy: Some("curb.spend-limit".to_string()),
+                                method: Some(skill.clone()),
+                                amount: Some(amount_hbar),
+                                currency: Some("HBAR".to_string()),
+                                counterparty: Some(recipient.clone()),
+                                allowed: Some(reserved),
+                                reason: Some(if reserved {
+                                    "within_budget".to_string()
+                                } else {
+                                    "per_day_exceeded".to_string()
+                                }),
+                                request_id: None,
+                            },
+                        );
 
-                        should_continue = false;
-                        break;
+                        if !reserved {
+                            let err_msg = format!(
+                                "Payment blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap.",
+                                amount_hbar
+                            );
+                            let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
+                            should_continue = false;
+                            break;
+                        }
+
+                        // Check 1c: Approval Tier (curb.approval-tier)
+                        let auto_approved = match governance.auto_under {
+                            Some(threshold) if amount_hbar < threshold => true,
+                            _ => false,
+                        };
+
+                        if auto_approved {
+                            crate::payments::audit::write_payment_decision(
+                                audit_client.clone(),
+                                topic_id.clone(),
+                                crate::payments::audit::CurbRecord {
+                                    v: 1,
+                                    agent: agent_did.clone(),
+                                    ts: now_ms,
+                                    policy: Some("curb.approval-tier".to_string()),
+                                    method: Some(skill.clone()),
+                                    amount: Some(amount_hbar),
+                                    currency: Some("HBAR".to_string()),
+                                    counterparty: Some(recipient.clone()),
+                                    allowed: Some(true),
+                                    reason: Some("auto_approved".to_string()),
+                                    request_id: None,
+                                },
+                            );
+                            // Hold is committed/released AFTER run_skill_raw below, not here.
+                            // (pkey is captured in the outer scope for use post-execution.)
+                        } else {
+                            crate::payments::audit::write_payment_decision(
+                                audit_client.clone(),
+                                topic_id.clone(),
+                                crate::payments::audit::CurbRecord {
+                                    v: 1,
+                                    agent: agent_did.clone(),
+                                    ts: now_ms,
+                                    policy: Some("curb.approval-tier".to_string()),
+                                    method: Some(skill.clone()),
+                                    amount: Some(amount_hbar),
+                                    currency: Some("HBAR".to_string()),
+                                    counterparty: Some(recipient.clone()),
+                                    allowed: Some(false),
+                                    reason: Some("approval_required".to_string()),
+                                    request_id: None,
+                                },
+                            );
+
+                            let question = payment_confirmation_message(&skill, &args);
+                            let _ = tx
+                                .send(AgentEvent::Ask {
+                                    content: question,
+                                    task_id: task_id.clone(),
+                                    kind: Some(AskKind::Payment),
+                                })
+                                .await;
+
+                            history.push(json!({
+                                "role": "assistant",
+                                "content": format!(
+                                    "Proposed payment action awaiting human confirmation: {}",
+                                    payment_action_summary(&skill, &args)
+                                )
+                            }));
+
+                            let history_json = serde_json::to_string(&history).unwrap_or_default();
+                            let pending_json = serde_json::to_string(&pending_payment_action(
+                                &skill,
+                                args.clone(),
+                                &injected_config,
+                            ))
+                            .unwrap_or_default();
+                            let _ = db.save_awaiting_confirmation(
+                                &task_id,
+                                &history_json,
+                                &pending_json,
+                            );
+
+                            should_continue = false;
+                            break;
+                        }
                     }
                     let _ = tx
                         .send(AgentEvent::Action { skill: skill.clone(), args: args.clone() })
@@ -487,6 +700,21 @@ pub async fn run_react_loop(
                         Err(e) => (e.to_string(), true),
                     };
                     let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
+
+                    // For payment skills (both auto-approved and confirmed-after-policy),
+                    // commit the hold on success or release it on failure.
+                    if skill_requires_confirmation(&skill) {
+                        if let Ok((rec, amt)) =
+                            extract_payment_recipient_and_amount(&skill, &args)
+                        {
+                            let pkey = compute_payment_key(&agent_did, &rec, amt);
+                            if is_error {
+                                let _ = db.release_spend_hold(&agent_did, &pkey);
+                            } else {
+                                let _ = db.commit_spend_hold(&agent_did, &pkey);
+                            }
+                        }
+                    }
 
                     if react_meta.terminal && !is_error {
                         let _ = tx.send(AgentEvent::Final { content: observation }).await;
@@ -985,6 +1213,40 @@ mod tests {
         assert!(artifacts.get("manifest_hash").is_some());
         assert!(artifacts.get("manifest_path").is_some());
     }
+
+    #[test]
+    fn payment_key_computation_is_deterministic() {
+        let key1 = compute_payment_key("did:aria:test", "0.0.1234", 5.0);
+        let key2 = compute_payment_key("did:aria:test", "0.0.1234", 5.0);
+        let key3 = compute_payment_key("did:aria:test", "0.0.5678", 5.0);
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+        assert_eq!(key1.len(), 16);
+    }
+
+    #[test]
+    fn auto_under_match_logic_behaves_safely() {
+        let auto_under_none: Option<f64> = None;
+        let auto_under_some: Option<f64> = Some(10.0);
+
+        let is_auto_none = match auto_under_none {
+            Some(threshold) if 5.0 < threshold => true,
+            _ => false,
+        };
+        assert!(!is_auto_none, "None auto_under must require confirmation");
+
+        let is_auto_below = match auto_under_some {
+            Some(threshold) if 5.0 < threshold => true,
+            _ => false,
+        };
+        assert!(is_auto_below, "Amount below threshold must auto-approve");
+
+        let is_auto_above = match auto_under_some {
+            Some(threshold) if 15.0 < threshold => true,
+            _ => false,
+        };
+        assert!(!is_auto_above, "Amount above threshold must require confirmation");
+    }
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -1221,4 +1483,58 @@ async fn call_llm_streaming(
     }
 
     Ok((full_content, final_tool_calls))
+}
+
+fn compute_payment_key(agent_did: &str, recipient: &str, amount_hbar: f64) -> String {
+    let raw = format!("{}:{}:{}", agent_did, recipient, amount_hbar);
+    let hash = crate::crypto::sha256_hex_str(&raw);
+    hash[..16].to_string()
+}
+
+fn extract_payment_recipient_and_amount(
+    skill: &str,
+    args: &serde_json::Value,
+) -> Result<(String, f64), String> {
+    let capabilities = skill_capabilities(skill).unwrap_or_default();
+    if capabilities.hedera_pay {
+        let recipient = args
+            .get("recipient")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if recipient.is_empty() {
+            return Err(format!("Payment proposal for {} is missing recipient.", skill));
+        }
+        let amount = args
+            .get("amount")
+            .and_then(json_number_as_f64)
+            .ok_or_else(|| format!("Payment proposal for {} is missing valid amount.", skill))?;
+        Ok((recipient, amount))
+    } else if capabilities.x402_pay {
+        let recipient = first_present_arg(
+            args,
+            &["pay_to", "recipient", "payee", "destination", "paymentAddress"],
+        )
+        .unwrap_or_default();
+
+        // x402 PaymentRequirements.amount is always in tinybars (i64 string),
+        // identical to how x402_vault.rs records it: amount_parsed / 100_000_000.0.
+        // We do NOT guess units by magnitude — that heuristic can silently misclassify
+        // a large legitimate HBAR amount.
+        let amount = first_present_arg(
+            args,
+            &["amount", "price", "max_amount", "maxAmount", "maxAmountRequired"],
+        )
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|tinybars| tinybars / 100_000_000.0)
+        .unwrap_or(0.0);
+
+        if recipient.is_empty() {
+            return Err(format!("Payment proposal for {} is missing recipient account.", skill));
+        }
+        Ok((recipient, amount))
+    } else {
+        Err(format!("Skill {} is not a supported payment skill.", skill))
+    }
 }

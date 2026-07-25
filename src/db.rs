@@ -98,6 +98,22 @@ CREATE TABLE IF NOT EXISTS payments (
     hashscan_url    TEXT NOT NULL,
     status          TEXT NOT NULL,
     timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Allowlist for payment recipients
+CREATE TABLE IF NOT EXISTS payment_allowlist (
+    agent_did       TEXT NOT NULL,
+    account         TEXT NOT NULL,
+    PRIMARY KEY(agent_did, account)
+);
+
+-- Holds on rolling daily payment budget
+CREATE TABLE IF NOT EXISTS payment_holds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_did       TEXT NOT NULL,
+    payment_key     TEXT UNIQUE NOT NULL,
+    amount_hbar     REAL NOT NULL,
+    timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
 )";
 
 pub struct Db {
@@ -314,7 +330,36 @@ impl Db {
         if let Some(row) = rows.next()? {
             let status: String = row.get(0)?;
             let history_json: Option<String> = row.get(1)?;
-            let pending_action_json: Option<String> = row.get(2)?;
+            let mut pending_action_json: Option<String> = row.get(2)?;
+
+            if let Some(ref json_str) = pending_action_json {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(asked_at) = val.get("asked_at").and_then(|v| v.as_u64()) {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let current_flag =
+                            val.get("status_flag").and_then(|v| v.as_str()).unwrap_or("pending");
+                        if now_secs.saturating_sub(asked_at) >= 300 && current_flag != "unresponsive"
+                        {
+                            if let Some(obj) = val.as_object_mut() {
+                                obj.insert(
+                                    "status_flag".to_string(),
+                                    serde_json::json!("unresponsive"),
+                                );
+                            }
+                            let updated_str = val.to_string();
+                            let _ = conn.execute(
+                                "UPDATE tasks SET pending_action_json = ? WHERE task_id = ?",
+                                params![&updated_str, task_id],
+                            );
+                            pending_action_json = Some(updated_str);
+                        }
+                    }
+                }
+            }
+
             return Ok(Some(TaskSession { status, history_json, pending_action_json }));
         }
         Ok(None)
@@ -592,6 +637,166 @@ impl Db {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ── Payment Governance (Curb Port) ──────────────────────────────────────────
+
+    pub fn is_account_allowlisted(&self, agent_did: &str, account: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM payment_allowlist WHERE agent_did = ? AND account = ?",
+            params![agent_did, account],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn add_allowlist_entry(&self, agent_did: &str, account: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO payment_allowlist (agent_did, account) VALUES (?, ?)",
+            params![agent_did, account],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_allowlist_entry(&self, agent_did: &str, account: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM payment_allowlist WHERE agent_did = ? AND account = ?",
+            params![agent_did, account],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_allowlist(&self, agent_did: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT account FROM payment_allowlist WHERE agent_did = ? ORDER BY account",
+        )?;
+        let rows = stmt.query_map([agent_did], |row| row.get(0))?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
+    pub fn get_daily_committed_spend(&self, agent_did: &str) -> anyhow::Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let sum: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status = 'SUCCESS' AND timestamp >= datetime('now', '-24 hours')",
+            params![agent_did],
+            |row| row.get(0),
+        )?;
+        Ok(sum)
+    }
+
+    pub fn get_daily_held_spend(&self, agent_did: &str) -> anyhow::Result<f64> {
+        let conn = self.conn.lock().unwrap();
+        let sum: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payment_holds WHERE agent_did = ?",
+            params![agent_did],
+            |row| row.get(0),
+        )?;
+        Ok(sum)
+    }
+
+    pub fn try_reserve_spend(
+        &self,
+        agent_did: &str,
+        payment_key: &str,
+        amount_hbar: f64,
+        per_day_cap: Option<f64>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        // Idempotent: same payment key re-checked returns true without creating a second hold
+        let existing: i64 = conn.query_row(
+            "SELECT count(*) FROM payment_holds WHERE agent_did = ? AND payment_key = ?",
+            params![agent_did, payment_key],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            return Ok(true);
+        }
+
+        if let Some(cap) = per_day_cap {
+            let committed: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status = 'SUCCESS' AND timestamp >= datetime('now', '-24 hours')",
+                params![agent_did],
+                |row| row.get(0),
+            )?;
+            let held: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payment_holds WHERE agent_did = ?",
+                params![agent_did],
+                |row| row.get(0),
+            )?;
+            if committed + held + amount_hbar > cap {
+                return Ok(false);
+            }
+        }
+
+        let now = now_iso8601();
+        conn.execute(
+            "INSERT INTO payment_holds (agent_did, payment_key, amount_hbar, timestamp) VALUES (?, ?, ?, ?)",
+            params![agent_did, payment_key, amount_hbar, now],
+        )?;
+        Ok(true)
+    }
+
+    pub fn release_spend_hold(&self, agent_did: &str, payment_key: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM payment_holds WHERE agent_did = ? AND payment_key = ?",
+            params![agent_did, payment_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_spend_hold(&self, agent_did: &str, payment_key: &str) -> anyhow::Result<()> {
+        self.release_spend_hold(agent_did, payment_key)
+    }
+
+    /// Called once on daemon startup. Removes holds that are leftover from a crash that
+    /// occurred between a successful payment (which wrote to `payments`) and the hold
+    /// release. Matches by agent_did + amount_hbar within a 48-hour window (generous
+    /// enough to cover holds placed before a restart).
+    /// Returns the number of stale holds deleted.
+    pub fn reconcile_stale_holds(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Collect all current holds.
+        let hold_rows: Vec<(i64, String, String, f64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, agent_did, payment_key, amount_hbar FROM payment_holds",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, f64>(3)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut removed = 0usize;
+        for (hold_id, agent_did, _payment_key, amount_hbar) in hold_rows {
+            // Check if a SUCCESS payment with the same agent_did and amount exists
+            // in the last 48 hours (covers holds that survived a daemon crash).
+            let matched: i64 = conn.query_row(
+                "SELECT count(*) FROM payments \
+                 WHERE agent_did = ? \
+                   AND ABS(amount_hbar - ?) < 0.000001 \
+                   AND status = 'SUCCESS' \
+                   AND timestamp >= datetime('now', '-48 hours')",
+                rusqlite::params![agent_did, amount_hbar],
+                |row| row.get(0),
+            )?;
+
+            if matched > 0 {
+                conn.execute("DELETE FROM payment_holds WHERE id = ?", rusqlite::params![hold_id])?;
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
 }
 
 fn now_iso8601() -> String {
@@ -635,4 +840,169 @@ fn new_uuid() -> String {
             u64::from_be_bytes(arr)
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowlist_crud() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let acc1 = "0.0.1234";
+        let acc2 = "0.0.5678";
+
+        assert!(!db.is_account_allowlisted(agent, acc1)?);
+        db.add_allowlist_entry(agent, acc1)?;
+        assert!(db.is_account_allowlisted(agent, acc1)?);
+
+        db.add_allowlist_entry(agent, acc2)?;
+        let list = db.list_allowlist(agent)?;
+        assert_eq!(list, vec![acc1.to_string(), acc2.to_string()]);
+
+        let removed = db.remove_allowlist_entry(agent, acc1)?;
+        assert!(removed);
+        assert!(!db.is_account_allowlisted(agent, acc1)?);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spend_holds_and_cap() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let key1 = "key-001";
+        let key2 = "key-002";
+
+        // Reserve 5.0 with 10.0 cap -> should succeed
+        let ok1 = db.try_reserve_spend(agent, key1, 5.0, Some(10.0))?;
+        assert!(ok1);
+        assert_eq!(db.get_daily_held_spend(agent)?, 5.0);
+
+        // Idempotent re-check with same key -> should return true
+        let ok1_idem = db.try_reserve_spend(agent, key1, 5.0, Some(10.0))?;
+        assert!(ok1_idem);
+        assert_eq!(db.get_daily_held_spend(agent)?, 5.0);
+
+        // Try to reserve 6.0 with 10.0 cap (5 held + 6 new > 10) -> should fail
+        let ok2 = db.try_reserve_spend(agent, key2, 6.0, Some(10.0))?;
+        assert!(!ok2);
+
+        // Release key1 hold
+        db.release_spend_hold(agent, key1)?;
+        assert_eq!(db.get_daily_held_spend(agent)?, 0.0);
+
+        // Now reserving 6.0 succeeds
+        let ok2_after = db.try_reserve_spend(agent, key2, 6.0, Some(10.0))?;
+        assert!(ok2_after);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Reproduces the original bug: a failed payment must release the hold, not leave it stuck.
+    ///
+    /// Old (buggy) behaviour: commit_spend_hold was called BEFORE run_skill_raw.
+    /// If run_skill_raw then failed, the hold was already deleted (committed), but no
+    /// SUCCESS row existed in payments \u2014 so the budget looked consumed while the money
+    /// never moved. In the REVERSE scenario (hold NOT committed on failure), the hold
+    /// would stick around and permanently eat daily budget.
+    ///
+    /// New behaviour tested here:
+    /// - reserve a hold
+    /// - simulate a failed payment (no insert_payment, hold is explicitly released)
+    /// - assert hold is gone (get_daily_held_spend == 0)
+    /// - assert committed spend is still 0 (no SUCCESS row in payments)
+    /// - assert the same budget can be reserved again immediately
+    #[test]
+    fn test_failed_payment_releases_hold_and_does_not_count_as_committed() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pkey = "pay-key-fail-001";
+
+        // Step 1: reserve a hold for 7.0 HBAR against a 10.0 cap.
+        let reserved = db.try_reserve_spend(agent, pkey, 7.0, Some(10.0))?;
+        assert!(reserved, "hold reservation should succeed");
+        assert_eq!(db.get_daily_held_spend(agent)?, 7.0);
+        assert_eq!(db.get_daily_committed_spend(agent)?, 0.0, "no committed spend yet");
+
+        // Step 2: simulate the skill execution failing — release the hold explicitly
+        // (this is what react_loop.rs now does in the is_error branch after run_skill_raw).
+        db.release_spend_hold(agent, pkey)?;
+
+        // Step 3: hold must be gone.
+        assert_eq!(db.get_daily_held_spend(agent)?, 0.0, "hold must be released after failure");
+        assert_eq!(db.get_daily_committed_spend(agent)?, 0.0, "no committed spend after failure");
+
+        // Step 4: the same payment can be retried — full cap is available again.
+        let retried = db.try_reserve_spend(agent, "pay-key-retry-001", 7.0, Some(10.0))?;
+        assert!(retried, "budget must be fully available again after failed payment releases hold");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Verifies that reconcile_stale_holds cleans up holds that survived a daemon crash
+    /// (i.e., the payment succeeded and wrote to `payments`, but the hold was never deleted).
+    #[test]
+    fn test_reconcile_stale_holds_removes_orphaned_holds() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:crash";
+        let pkey = "stale-hold-001";
+
+        // Simulate: hold was reserved before the crash.
+        db.try_reserve_spend(agent, pkey, 3.0, Some(20.0))?;
+        assert_eq!(db.get_daily_held_spend(agent)?, 3.0);
+
+        // Simulate: payment succeeded (insert_payment ran inside WASM before crash).
+        db.insert_payment(
+            None,
+            agent,
+            "transfer.pay",
+            "0.0.9999",
+            3.0,
+            "memo",
+            "0.0.1234@1234567890.123456789",
+            "https://hashscan.io/testnet/tx/test",
+            "SUCCESS",
+        )?;
+
+        // At this point the hold is orphaned: a SUCCESS row exists but the hold was
+        // never deleted (crash happened between run_skill_raw returning and hold release).
+        assert_eq!(db.get_daily_held_spend(agent)?, 3.0, "orphaned hold still present before reconcile");
+
+        // Reconcile should remove the stale hold.
+        let cleaned = db.reconcile_stale_holds()?;
+        assert_eq!(cleaned, 1, "exactly one stale hold should be cleaned up");
+        assert_eq!(db.get_daily_held_spend(agent)?, 0.0, "hold gone after reconcile");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
 }

@@ -42,6 +42,9 @@ struct DaemonRequest {
     task: String,
     #[serde(rename = "Type")]
     skills_type: Option<String>,
+    /// If set and the task is awaiting confirmation, resume it with `task`
+    /// treated as the human's yes/no reply instead of a new instruction.
+    task_id: Option<String>,
 }
 
 fn print_help() {
@@ -201,136 +204,195 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-                                    result = listener.accept() => {
-                                        let (mut socket, _addr) = result?;
+            result = listener.accept() => {
+                let (mut socket, _addr) = result?;
 
-                                        // Clone references from outer context instead of re-instantiating
-                                        let db = db.clone();
-                                        let api_key = api_key.clone();
-                                        let runtime_cfg = runtime_cfg.clone();
-                                        let skills = skills.clone();
-                                        let vault = vault.clone();
-                                        let payment_vault = payment_vault.clone();
-                                        let x402_vault = x402_vault.clone();
+                // Clone references from outer context instead of re-instantiating
+                let db = db.clone();
+                let api_key = api_key.clone();
+                let runtime_cfg = runtime_cfg.clone();
+                let skills = skills.clone();
+                let vault = vault.clone();
+                let payment_vault = payment_vault.clone();
+                let x402_vault = x402_vault.clone();
 
-                                        tokio::spawn(async move {
-                                            let mut buffer = vec![0u8; 16384]; // Increased buffer capacity
-                                            let n = match socket.read(&mut buffer).await {
-                                                Ok(n) if n > 0 => n,
-                                                _ => return,
-                                            };
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 16384]; // Increased buffer capacity
+                    let n = match socket.read(&mut buffer).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
 
-                                            let req: DaemonRequest = match serde_json::from_slice(&buffer[..n]) {
-                                                Ok(r) => r,
-                                                Err(e) => {
-                                                    let _ = socket.write_all(format!("Invalid JSON: {}\n", e).as_bytes()).await;
-                                                    return;
+                    let req: DaemonRequest = match serde_json::from_slice(&buffer[..n]) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = socket.write_all(format!("Invalid JSON: {}\n", e).as_bytes()).await;
+                            return;
+                        }
+                    };
+
+                    info!("Received task: {}", req.task);
+
+                    // Resume a paused task if a task_id was given and it's actually
+                    // awaiting confirmation; otherwise fall back to a fresh task,
+                    // same as before this change.
+                    let mut resume: Option<(
+                        String,
+                        Vec<serde_json::Value>,
+                        Option<serde_json::Value>,
+                    )> = None;
+                    if let Some(ref existing_id) = req.task_id {
+                        if let Ok(Some(session)) = db.get_task_session(existing_id)
+                            && session.status == "awaiting_confirmation"
+                        {
+                            let history: Vec<serde_json::Value> = session
+                                .history_json
+                                .as_deref()
+                                .and_then(|h| serde_json::from_str(h).ok())
+                                .unwrap_or_default();
+
+                            let pending_action: Option<serde_json::Value> = session
+                                .pending_action_json
+                                .as_deref()
+                                .and_then(|p| serde_json::from_str(p).ok());
+
+                            resume = Some((existing_id.clone(), history, pending_action));
+                        }
+                    }
+
+                    let (task_id, history, pending_action) = if let Some(r) = resume {
+                        r
+                    } else {
+                        let new_task_id = db.new_task_id();
+
+                        // FIX 1: Pass the actual `new_task_id` to fetch correct link info
+                        let (link_hash, created_at) = match db.get_task_link_info(&new_task_id, &req.task) {
+                            Ok(info) => info,
+                            Err(_) => ("".to_string(), "".to_string()),
+                        };
+
+                        let task_chain_sig = vault.sign(link_hash.as_bytes()).await.unwrap_or_default();
+
+                        let id = match db.create_task(
+                            &new_task_id,
+                            &vault.did(),
+                            "tcp",
+                            &req.task,
+                            &link_hash,
+                            &task_chain_sig,
+                            &created_at,
+                        ) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let _ = socket.write_all(format!("DB Error: {}\n", e).as_bytes()).await;
+                                return;
+                            }
+                        };
+                        (
+                            id,
+                            vec![serde_json::json!({
+                                "role": "user",
+                                "content": req.task.clone()
+                            })],
+                            None,
+                        )
+                    };
+
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+                    let db_for_loop = db.clone();
+                    let did_for_loop = vault.did();
+                    let task_id_for_loop = task_id.clone();
+
+                    let handle = tokio::spawn(async move {
+                        crate::agent::react_loop::run_react_loop(
+                            api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
+                            db_for_loop, payment_vault, x402_vault, did_for_loop, task_id_for_loop, pending_action
+                        ).await
+                    });
+
+                    let mut last_action: Option<(String, serde_json::Value)> = None;
+
+                    while let Some(event) = rx.recv().await {
+                        match &event {
+                            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+                                last_action = Some((skill.clone(), args.clone()));
+                            }
+                            crate::agent::react_loop::AgentEvent::Observation { content } |
+                            crate::agent::react_loop::AgentEvent::Error { content } => {
+                                let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
+                                if let Some((skill, args)) = last_action.take()
+                                    && let Ok((step, prev_hash, timestamp)) = db.get_next_step_info(&task_id) {
+                                        let input_hash = crypto::sha256_hex_str(&args.to_string());
+                                        let result_hash = crypto::sha256_hex_str(content);
+                                        let chain_hash = crypto::compute_chain_hash(
+                                            &prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp
+                                        );
+
+                                        match vault.sign(chain_hash.as_bytes()).await {
+                                            Ok(sig) => {
+                                                if let Err(e) = db.log_task_step(&task_id, &vault.did(), &skill, &args.to_string(), content, success, &sig) {
+                                                    warn!("Failed to log step to DB: {}", e);
                                                 }
-                                            };
+                                            },
+                                            Err(e) => warn!("HAL Signing failed: {}", e),
+                                        }
+                                    }
+                            }
+                            _ => {}
+                        }
 
-                                            info!("Received task: {}", req.task);
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
 
-                                            let new_task_id = db.new_task_id();
+                    let status = match handle.await {
+                        Ok(Ok(())) => TaskStatus::Done,
+                        Ok(Err(e)) => {
+                            warn!("Task failed: {}", e);
+                            TaskStatus::Failed
+                        }
+                        Err(e) => {
+                            warn!("Task panicked: {}", e);
+                            TaskStatus::Failed
+                        }
+                    };
 
-                                            // FIX 1: Pass the actual `new_task_id` to fetch correct link info
-                                            let (link_hash, created_at) = match db.get_task_link_info(&new_task_id, &req.task) {
-                                                Ok(info) => info,
-                                                Err(_) => ("".to_string(), "".to_string()),
-                                            };
+                    match db.get_task_session(&task_id) {
+                        Ok(Some(session))
+                            if session.status == "awaiting_confirmation" =>
+                        {
+                            info!(
+                                "Task {} is awaiting confirmation; leaving it unsealed for resume",
+                                task_id
+                            );
+                        }
+                        Ok(_) => {
+                            if let Err(e) = db.seal_task(&task_id, status) {
+                                warn!("Failed to seal task {}: {}", task_id, e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to inspect task {} before sealing: {}",
+                                task_id, e
+                            );
+                            if let Err(e) = db.seal_task(&task_id, status) {
+                                warn!("Failed to seal task {}: {}", task_id, e);
+                            }
+                        }
+                    }
 
-                                            let task_chain_sig = vault.sign(link_hash.as_bytes()).await.unwrap_or_default();
 
-                                            let task_id = match db.create_task(
-                                                &new_task_id,
-                                                &vault.did(),
-                                                "tcp",
-                                                &req.task,
-                                                &link_hash,
-                                                &task_chain_sig,
-                                                &created_at,
-                                            ) {
-                                                Ok(id) => id,
-                                                Err(e) => {
-                                                    let _ = socket.write_all(format!("DB Error: {}\n", e).as_bytes()).await;
-                                                    return;
-                                                }
-                                            };
-
-                                            let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-                                            let history = vec![serde_json::json!({ "role": "user", "content": req.task.clone() })];
-
-                                            let db_for_loop = db.clone();
-                                            let did_for_loop = vault.did();
-                                            let task_id_for_loop = task_id.clone();
-
-                                            let handle = tokio::spawn(async move {
-                                                crate::agent::react_loop::run_react_loop(
-                                                    api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
-                                                    db_for_loop, payment_vault, x402_vault, did_for_loop, task_id_for_loop
-                                                ).await
-                                            });
-
-                                            let mut last_action: Option<(String, serde_json::Value)> = None;
-
-                                            while let Some(event) = rx.recv().await {
-                                                match &event {
-                                                    crate::agent::react_loop::AgentEvent::Action { skill, args } => {
-                                                        last_action = Some((skill.clone(), args.clone()));
-                                                    }
-                                                    crate::agent::react_loop::AgentEvent::Observation { content } |
-                                                    crate::agent::react_loop::AgentEvent::Error { content } => {
-                                                        let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
-                                                        if let Some((skill, args)) = last_action.take()
-                                                            && let Ok((step, prev_hash, timestamp)) = db.get_next_step_info(&task_id) {
-                                                                let input_hash = crypto::sha256_hex_str(&args.to_string());
-                                                                let result_hash = crypto::sha256_hex_str(content);
-                                                                let chain_hash = crypto::compute_chain_hash(
-                                                                    &prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp
-                                                                );
-
-                                                                match vault.sign(chain_hash.as_bytes()).await {
-                                                                    Ok(sig) => {
-                                                                        if let Err(e) = db.log_task_step(&task_id, &vault.did(), &skill, &args.to_string(), content, success, &sig) {
-                                                                            warn!("Failed to log step to DB: {}", e);
-                                                                        }
-                                                                    },
-                                                                    Err(e) => warn!("HAL Signing failed: {}", e),
-                                                                }
-                                                            }
-                                                    }
-                                                    _ => {}
-                                                }
-
-                                                let json = serde_json::to_string(&event).unwrap_or_default();
-                                                if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-
-                                          let status = match handle.await {
-            Ok(Ok(())) => TaskStatus::Done,
-            Ok(Err(e)) => {
-                warn!("Task failed: {}", e);
-                TaskStatus::Failed
+                });
             }
-            Err(e) => {
-                warn!("Task panicked: {}", e);
-                TaskStatus::Failed
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received. Closing ARIA Daemon...");
+                break;
             }
-        };
-
-             if let Err(e) = db.seal_task(&task_id, status) {
-            warn!("Failed to seal task {}: {}", task_id, e);
         }
-
-
-                                        });
-                                    }
-                                    _ = tokio::signal::ctrl_c() => {
-                                        info!("Shutdown signal received. Closing ARIA Daemon...");
-                                        break;
-                                    }
-                                }
     }
     Ok(())
 }

@@ -24,7 +24,6 @@ pub struct PaymentVault {
 }
 
 impl PaymentVault {
-
     /// Non-fatal variant of `from_env`: returns `None` (with a log line) when
     /// Hedera credentials aren't configured, instead of erroring out. Use this
     /// at daemon startup so direct HBAR payments being unconfigured doesn't
@@ -33,10 +32,7 @@ impl PaymentVault {
         match Self::from_env() {
             Ok(vault) => Some(vault),
             Err(e) => {
-                tracing::warn!(
-                    "Direct HBAR payment vault not configured, skipping: {}",
-                    e
-                );
+                tracing::warn!("Direct HBAR payment vault not configured, skipping: {}", e);
                 None
             }
         }

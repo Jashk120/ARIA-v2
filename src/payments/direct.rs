@@ -24,6 +24,23 @@ pub struct PaymentVault {
 }
 
 impl PaymentVault {
+
+    /// Non-fatal variant of `from_env`: returns `None` (with a log line) when
+    /// Hedera credentials aren't configured, instead of erroring out. Use this
+    /// at daemon startup so direct HBAR payments being unconfigured doesn't
+    /// prevent the daemon from running (mirrors `build_x402_vault`).
+    pub fn try_from_env() -> Option<Self> {
+        match Self::from_env() {
+            Ok(vault) => Some(vault),
+            Err(e) => {
+                tracing::warn!(
+                    "Direct HBAR payment vault not configured, skipping: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
     pub fn from_env() -> anyhow::Result<Self> {
         let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
         let account_id_str =

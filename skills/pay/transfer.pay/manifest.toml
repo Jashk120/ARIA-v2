@@ -1,0 +1,32 @@
+name        = "transfer.pay"
+version     = "0.1.0"
+description = "Sends a direct HBAR payment to a Hedera account on the configured network (testnet by default). Use this when you need to pay a known Hedera account ID directly — not for paywalled URLs, use pay.x402 for those."
+triggers = []
+
+[display]
+action = "Sending {amount} HBAR to {recipient}"
+
+[capabilities]
+hedera_pay = true
+
+[call]
+args_schema   = '{"recipient":"<required — Hedera AccountId, e.g. 0.0.1234>","amount":"<required — HBAR amount as a number, e.g. 1.5>","memo":"<optional — transaction memo, defaults to empty>"}'
+output_schema = '{"transaction_id":"string","hashscan_url":"string","status":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.recipient]
+type = "string"
+description = "The Hedera AccountId to send HBAR to, e.g. 0.0.1234. Required — this skill has no default recipient."
+
+[call.parameters.properties.amount]
+type = "number"
+description = "Amount of HBAR to send, e.g. 1.5. Required — this skill has no default amount."
+
+[call.parameters.properties.memo]
+type = "string"
+description = "Optional memo to attach to the transfer transaction."
+
+[react]
+max_steps = 2

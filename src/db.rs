@@ -1,5 +1,6 @@
 use std::fs;
 
+use futures_util::stream::Skip;
 use rusqlite::{
     Connection,
     params,
@@ -294,13 +295,31 @@ impl Db {
         let mut expected_prev = String::new();
         let mut count = 0;
         while let Some(row) = rows.next()? {
-            let _step: i64 = row.get(0)?;
+            let step: i64 = row.get(0)?;
+            let skill_called: String = row.get(1)?;
+            let input_hash: String = row.get(2)?;
+            let result_hash: String = row.get(3)?;
             let prev_hash: String = row.get(4)?;
             let chain_hash: String = row.get(5)?;
             let signature: String = row.get(6)?;
+            let timestamp: String = row.get(7)?;
 
             if prev_hash != expected_prev {
-                anyhow::bail!("Chain broken: prev_hash mismatch");
+                anyhow::bail!("Chain broken: prev_hash mismatch at step {}", step);
+            }
+            let recomputed = crypto::compute_chain_hash(
+                &prev_hash,
+                &step.to_string(),
+                &skill_called,
+                &input_hash,
+                &result_hash,
+                &timestamp,
+            );
+            if recomputed != chain_hash {
+                anyhow::bail!(
+                    "Chain broken: chain_hash does not match row content at step {}",
+                    step
+                );
             }
 
             crypto::verify_signature(&pub_key, chain_hash.as_bytes(), &signature)?;

@@ -182,7 +182,8 @@ async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(bootstrap_db()?);
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
-    let payment_vault = std::sync::Arc::new(crate::payments::direct::PaymentVault::from_env()?);
+    let payment_vault: Option<Arc<crate::payments::direct::PaymentVault>> =
+        crate::payments::direct::PaymentVault::try_from_env().map(Arc::new);
 
     let x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>> =
         build_x402_vault(db.clone());

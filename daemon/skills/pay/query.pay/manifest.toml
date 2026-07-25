@@ -1,4 +1,4 @@
-name        = "query.payments"
+name        = "query.pay"
 version     = "0.1.0"
 description = "Looks up the agent's own recent Hedera payments"
 triggers = []

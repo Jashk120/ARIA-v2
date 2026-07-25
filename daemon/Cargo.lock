@@ -3127,7 +3127,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "query_payments"
+name = "query_pay"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -4551,6 +4551,14 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transfer_pay"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

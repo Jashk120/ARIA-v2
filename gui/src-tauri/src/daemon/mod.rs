@@ -16,6 +16,7 @@ pub struct DaemonRequest {
     pub task: String,
     #[serde(rename = "Type")]
     pub skill_type: String,
+    pub task_id: Option<String>,
 }
 
 /// Every line the daemon sends back is a `DaemonEvent`.
@@ -67,7 +68,12 @@ fn connect_with_retries() -> Result<TcpStream, String> {
 
 /// Connect to the daemon, submit a task, and iterate over the event stream.
 /// Calls `on_event` for every `DaemonEvent` received until a `done` or `error` event.
-pub fn submit_task<F>(task: &str, skill_type: &str, mut on_event: F) -> Result<(), String>
+pub fn submit_task<F>(
+    task: &str,
+    skill_type: &str,
+    task_id: Option<String>,
+    mut on_event: F,
+) -> Result<(), String>
 where
     F: FnMut(DaemonEvent),
 {
@@ -77,6 +83,7 @@ where
     let request = DaemonRequest {
         task: task.to_string(),
         skill_type: skill_type.to_string(),
+        task_id,
     };
 
     let request_json =

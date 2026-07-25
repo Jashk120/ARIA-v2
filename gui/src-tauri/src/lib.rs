@@ -3,7 +3,7 @@ mod daemon;
 mod db;
 mod llm;
 
-use db::{Database, StoredMessage};
+use db::{Database, PendingConfirmation, StoredMessage};
 use llm::ChatMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,7 +66,7 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
 
     let app_events = app.clone();
     let result = tokio::task::spawn_blocking(move || {
-        daemon::submit_task(&task, &skill_type, |event| {
+        daemon::submit_task(&task, &skill_type, None, |event| {
             app_events
                 .emit(
                     "direct-daemon-event",
@@ -131,6 +131,38 @@ async fn load_messages(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn save_pending_confirmation(
+    state: State<'_, AppState>,
+    session_id: String,
+    task_id: String,
+    content: String,
+    kind: Option<String>,
+    skill_type: String,
+) -> Result<(), String> {
+    state
+        .db
+        .save_pending_confirmation(
+            &session_id,
+            &task_id,
+            &content,
+            kind.as_deref(),
+            &skill_type,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn load_pending_confirmation(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<PendingConfirmation>, String> {
+    state
+        .db
+        .load_pending_confirmation(&session_id)
+        .map_err(|e| e.to_string())
+}
+
 /// List all sessions.
 #[tauri::command]
 async fn list_sessions(
@@ -174,9 +206,12 @@ pub fn run() {
             check_daemon,
             send_message,
             send_direct_task,
+            agent::resume_daemon_task,
             create_session,
             save_message,
             load_messages,
+            save_pending_confirmation,
+            load_pending_confirmation,
             list_sessions,
             delete_session
         ])

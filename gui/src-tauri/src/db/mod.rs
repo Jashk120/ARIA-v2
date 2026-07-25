@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -12,6 +13,14 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingConfirmation {
+    pub task_id: String,
+    pub content: String,
+    pub kind: Option<String>,
+    pub skill_type: String,
 }
 
 // ── Global DB connection (Mutex-protected single connection) ─────────────────
@@ -40,7 +49,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS sessions (
                 id          TEXT PRIMARY KEY,
                 title       TEXT NOT NULL DEFAULT 'New Chat',
-                created_at  INTEGER NOT NULL
+                created_at  INTEGER NOT NULL,
+                pending_confirmation TEXT
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -54,6 +64,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             ",
         )?;
+        if !column_exists(&conn, "sessions", "pending_confirmation")? {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN pending_confirmation TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -85,6 +101,67 @@ impl Database {
     pub fn delete_session(&self, id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn save_pending_confirmation(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        content: &str,
+        kind: Option<&str>,
+        skill_type: &str,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let pending = PendingConfirmation {
+            task_id: task_id.to_string(),
+            content: content.to_string(),
+            kind: kind.map(str::to_string),
+            skill_type: skill_type.to_string(),
+        };
+        let pending_json = serde_json::to_string(&pending)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "UPDATE sessions SET pending_confirmation = ?2 WHERE id = ?1",
+            params![session_id, pending_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_pending_confirmation(
+        &self,
+        session_id: &str,
+    ) -> SqlResult<Option<PendingConfirmation>> {
+        let conn = self.conn.lock().unwrap();
+        let pending_json: Option<String> = conn.query_row(
+            "SELECT pending_confirmation FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(pending_json
+            .and_then(|json| serde_json::from_str::<PendingConfirmation>(&json).ok()))
+    }
+
+    pub fn clear_pending_confirmation(&self, task_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, pending_confirmation FROM sessions")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        for (session_id, pending_json) in rows {
+            if let Some(pending_json) = pending_json {
+                if pending_matches_task_id(&pending_json, task_id) {
+                    conn.execute(
+                        "UPDATE sessions SET pending_confirmation = NULL WHERE id = ?1",
+                        params![session_id],
+                    )?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -132,4 +209,20 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> SqlResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(rows.iter().any(|name| name == column))
+}
+
+fn pending_matches_task_id(pending_json: &str, task_id: &str) -> bool {
+    serde_json::from_str::<Value>(pending_json)
+        .ok()
+        .and_then(|value| value["task_id"].as_str().map(str::to_string))
+        .as_deref()
+        == Some(task_id)
 }

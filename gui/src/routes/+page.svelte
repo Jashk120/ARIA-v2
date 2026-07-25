@@ -13,6 +13,9 @@
    *   content: string,
    *   streaming?: boolean,
    *   skillType?: string,
+   *   taskId?: string,
+   *   confirmationKind?: string,
+   *   confirmationReply?: string,
    *   daemonEvents?: DaemonLogEvent[]
    * }} UiMessage
    */
@@ -31,6 +34,7 @@
   let directTask = $state('');
   let directEvents = /** @type {DaemonLogEvent[]} */ ($state([]));
   let isDirectSending = $state(false);
+  let activeDaemonSkillType = /** @type {string | null} */ ($state(null));
   let msgId = 0;
   /** @type {ReturnType<typeof setInterval> | undefined} */
   let daemonPollInterval;
@@ -91,6 +95,7 @@
     currentSession = id;
     history = [];
     messages = [];
+    activeDaemonSkillType = null;
 
     const stored = /** @type {ChatHistoryItem[]} */ (await invoke('load_messages', { sessionId: id }).catch(() => []));
     for (const msg of stored) {
@@ -99,6 +104,21 @@
         messages = [...messages, { id: ++msgId, role: msg.role, content: msg.content }];
         history = [...history, { role: msg.role, content: msg.content }];
       }
+    }
+    const pending = /** @type {{ task_id: string, content: string, kind?: string, skill_type: string } | null} */ (
+      await invoke('load_pending_confirmation', { sessionId: id }).catch(() => null)
+    );
+    if (pending) {
+      activeDaemonSkillType = pending.skill_type;
+      messages = [...messages, {
+        id: ++msgId,
+        role: 'awaiting_confirmation',
+        content: pending.content,
+        taskId: pending.task_id,
+        confirmationKind: pending.kind,
+        skillType: pending.skill_type,
+        confirmationReply: ''
+      }];
     }
     await tick();
     scrollBottom();
@@ -154,6 +174,7 @@
       }
 
       case 'daemon_started': {
+        activeDaemonSkillType = data.skill_type;
         messages = [...messages, {
           id: ++msgId,
           role: 'daemon_block',
@@ -167,8 +188,8 @@
       }
 
       case 'daemon_event': {
-        const last = messages[messages.length - 1];
-        if (last && last.role === 'daemon_block') {
+        const last = lastDaemonBlock();
+        if (last) {
           last.daemonEvents = [...(last.daemonEvents || []), { event_type: data.event_type, payload: data.payload }];
           messages = messages;
         }
@@ -177,10 +198,37 @@
       }
 
       case 'daemon_done': {
-        const last = messages[messages.length - 1];
-        if (last && last.role === 'daemon_block') {
+        const last = lastDaemonBlock();
+        if (last) {
           last.streaming = false;
           messages = messages;
+        }
+        activeDaemonSkillType = null;
+        isThinking = false;
+        scrollBottom();
+        break;
+      }
+
+      case 'awaiting_confirmation': {
+        const last = lastDaemonBlock();
+        const skillType = last?.skillType ?? activeDaemonSkillType ?? '';
+        messages = [...messages, {
+          id: ++msgId,
+          role: 'awaiting_confirmation',
+          content: data.content,
+          taskId: data.task_id,
+          confirmationKind: data.payload?.kind,
+          skillType,
+          confirmationReply: ''
+        }];
+        if (currentSession) {
+          invoke('save_pending_confirmation', {
+            sessionId: currentSession,
+            taskId: data.task_id,
+            content: data.content,
+            kind: data.payload?.kind,
+            skillType
+          }).catch(() => {});
         }
         isThinking = false;
         scrollBottom();
@@ -293,6 +341,34 @@
         payload: { content: `Failed to send task: ${err}` }
       }];
       isDirectSending = false;
+    }
+  }
+
+  /** @returns {UiMessage | undefined} */
+  function lastDaemonBlock() {
+    return [...messages].reverse().find(msg => msg.role === 'daemon_block');
+  }
+
+  /**
+   * @param {UiMessage} msg
+   * @param {string} reply
+   */
+  async function resumeConfirmation(msg, reply) {
+    const text = reply.trim();
+    if (!msg.taskId || !msg.skillType || !text || isThinking || !daemonOnline) return;
+
+    messages = messages.filter(item => item.id !== msg.id);
+    isThinking = true;
+
+    try {
+      await invoke('resume_daemon_task', {
+        taskId: msg.taskId,
+        reply: text,
+        skillType: msg.skillType
+      });
+    } catch (err) {
+      messages = [...messages, { id: ++msgId, role: 'error', content: `Failed to resume task: ${err}` }];
+      isThinking = false;
     }
   }
 
@@ -460,6 +536,50 @@
               {/if}
             </div>
           </div>
+
+        {:else if msg.role === 'awaiting_confirmation'}
+          {#if msg.confirmationKind === 'payment'}
+            <div class="row row-ai">
+              <div class="avatar avatar-ai">✦</div>
+              <div class="payment-confirmation">
+                <pre>{msg.content}</pre>
+                <div class="confirmation-actions">
+                  <button onclick={() => resumeConfirmation(msg, 'yes')} disabled={!daemonOnline || isThinking}>Yes</button>
+                  <button onclick={() => resumeConfirmation(msg, 'no')} disabled={!daemonOnline || isThinking}>No</button>
+                </div>
+                <form
+                  class="confirmation-form"
+                  onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
+                >
+                  <input
+                    type="text"
+                    bind:value={msg.confirmationReply}
+                    disabled={!daemonOnline || isThinking}
+                    placeholder="Something else"
+                  />
+                  <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
+                </form>
+              </div>
+            </div>
+          {:else}
+            <div class="row row-ai">
+              <div class="avatar avatar-ai">✦</div>
+              <div class="bubble bubble-ai">
+                <div>{msg.content}</div>
+                <form
+                  class="confirmation-form"
+                  onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
+                >
+                  <input
+                    type="text"
+                    bind:value={msg.confirmationReply}
+                    disabled={!daemonOnline || isThinking}
+                  />
+                  <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
+                </form>
+              </div>
+            </div>
+          {/if}
 
         {:else if msg.role === 'error'}
           <div class="row row-error">

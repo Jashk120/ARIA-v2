@@ -14,7 +14,13 @@ pub fn delegate_tool_definition() -> Value {
         "type": "function",
         "function": {
             "name": "delegate_to_daemon",
-            "description": "Delegate a task to the ARIA system daemon for execution. Use this when the user needs to interact with the local file system (type: 'fs'), search the web (type: 'web'), run OS commands (type: 'os'), or other system-level operations. Always infer the correct type from context.",
+            "description": "Delegate a task to the ARIA system daemon for execution. Use this when
+the user needs to interact with the local file system (type: 'fs'), search the web
+(type: 'web'), run OS commands (type: 'os'), or send a Hedera/HBAR payment or make an
+x402 payment (type: 'pay'). ARIA CAN send real payments via a governed daemon — do not
+refuse payment requests or tell the user to use an external wallet; always delegate
+payment tasks with type: 'pay' and let the daemon handle allowlist/cap/approval checks.
+Always infer the correct type from context",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -24,8 +30,9 @@ pub fn delegate_tool_definition() -> Value {
                     },
                     "type": {
                         "type": "string",
-                        "enum": ["fs", "web", "os"],
-                        "description": "The skill category: 'fs' for file system, 'web' for web search/browse, 'os' for OS-level commands."
+                        "enum": ["fs", "web", "os", "pay"],
+                        "description": "The skill category: 'fs' for file system, 'web' for web
+        search/browse, 'os' for OS-level commands, 'pay' for Hedera or x402 payments."
                     }
                 },
                 "required": ["task", "type"]

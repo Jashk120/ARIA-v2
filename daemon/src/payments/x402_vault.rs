@@ -35,6 +35,10 @@ pub struct X402PaymentVault {
 }
 
 impl X402PaymentVault {
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     pub fn new(
         client: Client,
         operator_id: AccountId,

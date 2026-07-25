@@ -36,6 +36,16 @@ pub struct RuntimeConfig {
     /// with [config.X] inject=true will automatically be picked up here
     /// without touching react_loop.rs or repl.rs.
     pub injected_config: HashMap<String, HashMap<String, String>>,
+    /// Payment governance static config
+    pub governance: PaymentGovernanceConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PaymentGovernanceConfig {
+    pub per_task_cap: Option<f64>,
+    pub per_day_cap: Option<f64>,
+    pub auto_under: Option<f64>,
+    pub audit_topic_id: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -71,6 +81,49 @@ impl RuntimeConfig {
             .cloned()
             .filter(|k| !k.is_empty());
 
-        Self { searxng_url, brave_api_key, injected_config: injected }
+        let parse_opt_f64 = |env_var: &str, db_key: &str| -> Option<f64> {
+            if let Ok(v) = std::env::var(env_var) {
+                if let Ok(n) = v.trim().parse::<f64>() {
+                    return Some(n);
+                }
+            }
+            if let Ok(Some(v)) = db.get_config(db_key) {
+                if let Ok(n) = v.trim().parse::<f64>() {
+                    return Some(n);
+                }
+            }
+            None
+        };
+
+        let parse_opt_str = |env_vars: &[&str], db_key: &str| -> Option<String> {
+            for var in env_vars {
+                if let Ok(v) = std::env::var(var) {
+                    if !v.trim().is_empty() {
+                        return Some(v.trim().to_string());
+                    }
+                }
+            }
+            if let Ok(Some(v)) = db.get_config(db_key) {
+                if !v.trim().is_empty() {
+                    return Some(v.trim().to_string());
+                }
+            }
+            None
+        };
+
+        let governance = PaymentGovernanceConfig {
+            per_task_cap: parse_opt_f64("PER_TASK_CAP", "per_task_cap")
+                .or_else(|| parse_opt_f64("CURB_PER_TASK_CAP", "curb_per_task_cap")),
+            per_day_cap: parse_opt_f64("PER_DAY_CAP", "per_day_cap")
+                .or_else(|| parse_opt_f64("CURB_PER_DAY_CAP", "curb_per_day_cap")),
+            auto_under: parse_opt_f64("AUTO_UNDER", "auto_under")
+                .or_else(|| parse_opt_f64("CURB_AUTO_UNDER", "curb_auto_under")),
+            audit_topic_id: parse_opt_str(
+                &["HEDERA_PAYMENT_AUDIT_TOPIC", "HEDERA_AUDIT_TOPIC", "CURB_AUDIT_TOPIC"],
+                "hedera_payment_audit_topic",
+            ),
+        };
+
+        Self { searxng_url, brave_api_key, injected_config: injected, governance }
     }
 }

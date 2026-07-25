@@ -53,12 +53,17 @@ fn print_help() {
     println!("Usage: aria [COMMAND]");
     println!();
     println!("Commands:");
-    println!("  daemon    Run headless TCP service (default)");
-    println!("  install   Install systemd user service for auto-start");
-    println!("  help      Show this help");
+    println!("  daemon                   Run headless TCP service (default)");
+    println!("  allowlist add <account>   Add an account to the payment allowlist");
+    println!("  allowlist remove <account> Remove an account from the payment allowlist");
+    println!("  allowlist list           List allowlisted payment recipients");
+    println!("  install                  Install systemd user service for auto-start");
+    println!("  help                     Show this help");
     println!();
     println!("Examples:");
     println!("  aria");
+    println!("  aria allowlist add 0.0.12345");
+    println!("  aria allowlist list");
     println!("  aria daemon");
     println!("  aria install");
 }
@@ -198,6 +203,33 @@ async fn run_daemon() -> anyhow::Result<()> {
     let (vault, level) = crate::identity::initialize_vault(did, pub_key).await?;
     let vault = Arc::new(vault);
     info!("Identity HAL initialized (Mode: {:?})", level);
+
+    // Startup hold reconciliation: delete any holds for which a matching SUCCESS
+    // payment already exists (leftover from a crash between payment success and
+    // hold release — they would otherwise permanently squat on daily budget).
+    match db.reconcile_stale_holds() {
+        Ok(0) => {}
+        Ok(n) => info!("Startup: reconciled {} stale payment hold(s) that matched SUCCESS payments.", n),
+        Err(e) => tracing::warn!("Startup: hold reconciliation failed (non-fatal): {}", e),
+    }
+
+    if runtime_cfg.governance.audit_topic_id.is_none() {
+        if let Some(ref pv) = payment_vault {
+            let client = pv.client();
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await {
+                info!("Provisioned new HCS payment audit topic: {}", tid);
+                println!("HCS Payment Audit Topic ID: {}", tid);
+                let _ = db.set_config("hedera_payment_audit_topic", &tid);
+            }
+        } else if let Some(ref xv) = x402_vault {
+            let client = xv.client();
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await {
+                info!("Provisioned new HCS payment audit topic: {}", tid);
+                println!("HCS Payment Audit Topic ID: {}", tid);
+                let _ = db.set_config("hedera_payment_audit_topic", &tid);
+            }
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:5005").await?;
     info!("ARIA Daemon listening on 127.0.0.1:5005");
@@ -421,6 +453,47 @@ async fn main() -> anyhow::Result<()> {
 
             info!("Logging initialized. Logs saved to: {:?}", log_dir.join("daemon.log"));
             return run_daemon().await;
+        }
+        "allowlist" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            let db = bootstrap_db()?;
+            let (agent_did, _) =
+                db.get_identity()?.unwrap_or(("did:aria:jayesh".into(), String::new()));
+            match subcmd {
+                "add" => {
+                    let account = args.get(3).ok_or_else(|| {
+                        anyhow::anyhow!("Account required: aria allowlist add <account>")
+                    })?;
+                    db.add_allowlist_entry(&agent_did, account)?;
+                    println!("✓ Account '{}' added to allowlist for {}", account, agent_did);
+                }
+                "remove" => {
+                    let account = args.get(3).ok_or_else(|| {
+                        anyhow::anyhow!("Account required: aria allowlist remove <account>")
+                    })?;
+                    let removed = db.remove_allowlist_entry(&agent_did, account)?;
+                    if removed {
+                        println!("✓ Account '{}' removed from allowlist for {}", account, agent_did);
+                    } else {
+                        println!("Account '{}' was not on allowlist for {}", account, agent_did);
+                    }
+                }
+                "list" => {
+                    let list = db.list_allowlist(&agent_did)?;
+                    println!("Allowlisted accounts for {}:", agent_did);
+                    if list.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for acc in list {
+                            println!("  • {}", acc);
+                        }
+                    }
+                }
+                _ => {
+                    println!("Usage: aria allowlist <add|remove|list> [account]");
+                }
+            }
+            Ok(())
         }
         "help" | "--help" | "-h" => {
             print_help();

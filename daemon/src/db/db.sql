@@ -84,3 +84,19 @@ CREATE TABLE payments (
     status          TEXT NOT NULL,               -- receipt status, e.g. "SUCCESS"
     timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Allowlist for payment recipients
+CREATE TABLE payment_allowlist (
+    agent_did       TEXT NOT NULL,
+    account         TEXT NOT NULL,
+    PRIMARY KEY(agent_did, account)
+);
+
+-- Holds on rolling daily payment budget
+CREATE TABLE payment_holds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_did       TEXT NOT NULL,
+    payment_key     TEXT UNIQUE NOT NULL,
+    amount_hbar     REAL NOT NULL,
+    timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
+);

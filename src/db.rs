@@ -28,11 +28,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     agent_did       TEXT NOT NULL,
     source          TEXT NOT NULL,          -- 'mcp' | 'cli' | 'webhook'
     prompt_hash     TEXT NOT NULL,          -- SHA-256 of the raw prompt (plaintext never stored)
-    status          TEXT NOT NULL DEFAULT 'running', -- 'running' | 'done' | 'failed'
+    status          TEXT NOT NULL DEFAULT 'running', -- 'running' | 'done' | 'failed'| 'awaiting_confirmation'
     step_count      INTEGER NOT NULL DEFAULT 0,
     final_hash      TEXT,                   -- chain_hash of last audit entry; NULL until sealed
     task_chain_prev TEXT,                   -- hash of previous tasks row (global task chain)
     task_chain_sig  TEXT,                   -- Ed25519 signature over task_chain_prev
+    history_json        TEXT,       
+     pending_action_json TEXT, 
     created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
     sealed_at       TEXT
 );
@@ -108,6 +110,7 @@ pub enum TaskStatus {
     Running,
     Done,
     Failed,
+    AwaitingConfirmation,
 }
 
 impl TaskStatus {
@@ -116,6 +119,7 @@ impl TaskStatus {
             TaskStatus::Running => "running",
             TaskStatus::Done => "done",
             TaskStatus::Failed => "failed",
+            TaskStatus::AwaitingConfirmation => "awaiting_confirmation",
         }
     }
 }
@@ -138,6 +142,13 @@ pub struct PaymentRecord {
     pub hashscan_url: String,
     pub status: String,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskSession {
+    pub status: String,
+    pub history_json: Option<String>,
+    pub pending_action_json: Option<String>,
 }
 
 impl ToolCapability {
@@ -180,6 +191,12 @@ impl Db {
     fn run_migration(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
+        // Existing DBs created before session persistence was added won't have
+        // these columns (CREATE TABLE IF NOT EXISTS doesn't retrofit them).
+        // Ignore the error if the column already exists.
+        let _ = conn.execute("ALTER TABLE tasks ADD COLUMN history_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE tasks ADD COLUMN pending_action_json TEXT", []);
+
         Ok(())
     }
 
@@ -243,13 +260,64 @@ impl Db {
         let final_hash = self.get_last_step_hash(task_id)?;
         let now = now_iso8601();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE tasks SET status=?, final_hash=?, sealed_at=?,
              step_count=(SELECT count(*) FROM audit_log WHERE task_id=?)
-             WHERE task_id=?",
+             WHERE task_id=? AND status != 'awaiting_confirmation'",
             params![status.as_str(), final_hash, now, task_id, task_id],
         )?;
+        if changed == 0 {
+            anyhow::bail!("task {} is awaiting confirmation and was not sealed", task_id);
+        }
         Ok(())
+    }
+    // ── Resumable sessions (human-in-the-loop confirmation) ─────────────────────
+
+    /// Pause a task awaiting a human yes/no reply — e.g. before executing a
+    /// payment-capable skill. Persists the full react-loop history so a
+    /// follow-up request carrying the same task_id can resume exactly here,
+    /// instead of every TCP connection starting a brand-new, context-free task.
+    pub fn save_awaiting_confirmation(
+        &self,
+        task_id: &str,
+        history_json: &str,
+        pending_action_json: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='awaiting_confirmation', history_json=?, pending_action_json=? WHERE task_id=?",
+            params![history_json, pending_action_json, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the pending action and drop back to 'running' once the human has
+    /// replied (confirmed or denied) and the loop is continuing.
+    pub fn clear_pending_action(&self, task_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='running', pending_action_json=NULL WHERE task_id=?",
+            params![task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Load a task's session state so a new TCP connection can resume it by
+    /// task_id, instead of starting fresh. Returns None if the task doesn't
+    /// exist.
+    pub fn get_task_session(&self, task_id: &str) -> anyhow::Result<Option<TaskSession>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT status, history_json, pending_action_json FROM tasks WHERE task_id = ?",
+        )?;
+        let mut rows = stmt.query([task_id])?;
+        if let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            let history_json: Option<String> = row.get(1)?;
+            let pending_action_json: Option<String> = row.get(2)?;
+            return Ok(Some(TaskSession { status, history_json, pending_action_json }));
+        }
+        Ok(None)
     }
 
     // ── Audit Log ─────────────────────────────────────────────────────────────

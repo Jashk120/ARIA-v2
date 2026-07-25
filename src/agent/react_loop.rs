@@ -25,6 +25,20 @@ pub const MAX_REACT_STEPS: usize = 8;
 
 // ── Agent event / response types ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    Payment,
+    // Future: Clarification is intentionally NOT added as a variant.
+    // Absence of `kind` already means "plain question" — don't encode
+    // that case explicitly, or every clarification call site has to
+    // remember to set it. Only add variants here as new *decision-
+    // grade* Ask reasons emerge (e.g. a future access/permission
+    // confirmation), following the same rule: only add a variant when
+    // the surrounding Rust code deterministically knows the reason
+    // without asking the LLM.
+}
+
 #[derive(serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AgentEvent {
@@ -40,6 +54,9 @@ pub enum AgentEvent {
     },
     Ask {
         content: String,
+        task_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<AskKind>,
     },
     /// Streamed token — print immediately, no newline
     Token {
@@ -160,7 +177,13 @@ pub async fn run_react_loop(
                 if stored_fingerprint != current_fingerprint {
                     let refreshed = pending_payment_action(&skill, args.clone(), &injected_config);
                     let question = payment_confirmation_message(&skill, &args);
-                    let _ = tx.send(AgentEvent::Ask { content: question }).await;
+                    let _ = tx
+                        .send(AgentEvent::Ask {
+                            content: question,
+                            task_id: task_id.clone(),
+                            kind: Some(AskKind::Payment),
+                        })
+                        .await;
 
                     history.push(json!({
                         "role": "assistant",
@@ -406,7 +429,13 @@ pub async fn run_react_loop(
                         }
 
                         let question = payment_confirmation_message(&skill, &args);
-                        let _ = tx.send(AgentEvent::Ask { content: question }).await;
+                        let _ = tx
+                            .send(AgentEvent::Ask {
+                                content: question,
+                                task_id: task_id.clone(),
+                                kind: Some(AskKind::Payment),
+                            })
+                            .await;
 
                         history.push(json!({
                             "role": "assistant",
@@ -497,7 +526,13 @@ pub async fn run_react_loop(
                     }
                 }
                 AgentResponseKind::Ask(question) => {
-                    let _ = tx.send(AgentEvent::Ask { content: question }).await;
+                    let _ = tx
+                        .send(AgentEvent::Ask {
+                            content: question,
+                            task_id: task_id.clone(),
+                            kind: None,
+                        })
+                        .await;
                     should_continue = false;
                 }
                 AgentResponseKind::Final(answer) => {
@@ -858,6 +893,33 @@ mod tests {
         );
         assert_eq!(confirmation_decision("yes"), ConfirmationDecision::Confirmed);
         assert_eq!(confirmation_decision("no"), ConfirmationDecision::Denied);
+    }
+
+    #[test]
+    fn ask_event_serializes_task_id_for_resume() {
+        let plain_event = AgentEvent::Ask {
+            content: "What should I do next?".into(),
+            task_id: "task-123".into(),
+            kind: None,
+        };
+        let payment_event = AgentEvent::Ask {
+            content: "Confirm payment?".into(),
+            task_id: "task-123".into(),
+            kind: Some(AskKind::Payment),
+        };
+
+        let plain_json_line = serde_json::to_string(&plain_event).unwrap();
+        let payment_json_line = serde_json::to_string(&payment_event).unwrap();
+
+        assert_eq!(
+            plain_json_line,
+            r#"{"type":"ask","content":"What should I do next?","task_id":"task-123"}"#
+        );
+        assert!(!plain_json_line.contains(r#""kind""#));
+        assert_eq!(
+            payment_json_line,
+            r#"{"type":"ask","content":"Confirm payment?","task_id":"task-123","kind":"payment"}"#
+        );
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub enum FrontendEvent {
     Token { content: String },
     /// The LLM finished a normal text response
     Done { full_text: String },
+    /// The router itself is asking a clarifying question, instead of
+    /// guessing and delegating or answering blind. Distinct from
+    /// AwaitingConfirmation below, which is the daemon pausing mid-task.
+    Ask { content: String },
     /// The LLM is about to delegate a task to the daemon
     DaemonStarted { task: String, skill_type: String },
     AwaitingConfirmation { task_id: String, content: String, kind: Option<String> },
@@ -44,6 +48,12 @@ impl Serialize for FrontendEvent {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("kind", "done")?;
                 map.serialize_entry("full_text", full_text)?;
+                map.end()
+            }
+            FrontendEvent::Ask { content } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "ask_self")?;
+                map.serialize_entry("content", content)?;
                 map.end()
             }
             FrontendEvent::DaemonStarted { task, skill_type } => {
@@ -118,6 +128,11 @@ pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), S
         // ── Normal text response — nothing else to do ─────────────────────
         Ok(LlmStreamResult::TextDone { full_text }) => {
             FrontendEvent::Done { full_text }.emit(&app);
+        }
+
+        // ── Router is asking a clarifying question instead of guessing ────
+        Ok(LlmStreamResult::Ask { question }) => {
+            FrontendEvent::Ask { content: question }.emit(&app);
         }
 
         // ── Tool call — delegate to the daemon ────────────────────────────

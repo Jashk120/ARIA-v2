@@ -41,6 +41,34 @@ Always infer the correct type from context",
     })
 }
 
+// Lets the router ask a clarifying question instead of guessing a task
+// description/type before delegating, or answering as if it already knew
+// what the user meant. Previously the router had exactly two moves —
+// delegate, or answer in plain text — with nothing in between.
+pub const ASK_TOOL_NAME: &str = "ask_user";
+
+pub fn ask_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": ASK_TOOL_NAME,
+            "description": "Ask the user a clarifying question before responding or delegating,
+when the request is ambiguous or you're missing information needed to answer or to fill in
+delegate_to_daemon's task/type correctly. Prefer this over guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the user, in plain language."
+                    }
+                },
+                "required": ["question"]
+            }
+        }
+    })
+}
+
 // ── Request / Response Types ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,11 +117,25 @@ pub struct ToolCallFunction {
 pub enum LlmStreamResult {
     /// LLM emitted a tool call - needs delegation to daemon
     ToolCall { id: String, name: String, arguments: String },
+    /// LLM called ask_user - needs to pause and ask the user something
+    /// before continuing, instead of guessing.
+    Ask { question: String },
     /// LLM finished a normal text response
     TextDone { full_text: String },
 }
 
 // ── Streaming LLM Call ────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT: &str = "You are ARIA. For system tasks (files, web, OS commands, payments) \
+call delegate_to_daemon. If the request is ambiguous or you're missing information needed to \
+answer or to fill in delegate_to_daemon's task/type correctly, call ask_user instead of guessing. \
+Otherwise just reply normally.";
+
+fn system_prefixed(history: &[ChatMessage]) -> Vec<Value> {
+    let mut messages = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
+    messages.extend(history.iter().map(|m| serde_json::to_value(m).unwrap_or(Value::Null)));
+    messages
+}
 
 /// Stream a chat completion. Emits tokens via `on_token` callback.
 /// Returns LlmStreamResult indicating whether the LLM finished with text or a tool call.
@@ -107,8 +149,8 @@ where
 {
     let body = json!({
         "model": OLLAMA_MODEL,
-        "messages": messages,
-        "tools": [delegate_tool_definition()],
+        "messages": system_prefixed(messages),
+        "tools": [delegate_tool_definition(), ask_tool_definition()],
         "stream": true,
     });
 
@@ -179,6 +221,13 @@ where
     }
 
     if is_tool_call && !tool_call_name.is_empty() {
+        if tool_call_name == ASK_TOOL_NAME {
+            let question = serde_json::from_str::<Value>(&tool_call_args)
+                .ok()
+                .and_then(|v| v.get("question").and_then(|q| q.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "(no question provided)".to_string());
+            return Ok(LlmStreamResult::Ask { question });
+        }
         Ok(LlmStreamResult::ToolCall {
             id: tool_call_id,
             name: tool_call_name,

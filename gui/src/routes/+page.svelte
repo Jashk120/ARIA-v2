@@ -16,7 +16,8 @@
    *   taskId?: string,
    *   confirmationKind?: string,
    *   confirmationReply?: string,
-   *   daemonEvents?: DaemonLogEvent[]
+   *   daemonEvents?: DaemonLogEvent[],
+   *   groupId?: string
    * }} UiMessage
    */
 
@@ -36,11 +37,54 @@
   let isDirectSending = $state(false);
   let activeDaemonSkillType = /** @type {string | null} */ ($state(null));
   let msgId = 0;
+  /** Groups every event of the in-flight delegated task under one id so it
+   * can be persisted and later reconstructed as a single daemon_block. */
+  let currentGroupId = /** @type {string | null} */ (null);
   /** @type {ReturnType<typeof setInterval> | undefined} */
   let daemonPollInterval;
 
   let messagesEl = /** @type {HTMLElement | undefined} */ ($state());
   let unlisten = /** @type {Array<() => void>} */ ([]);
+
+  // ── Persistence helpers ───────────────────────────────────────────────────
+
+  /**
+   * Save any event to disk — the fix for the GUI only ever persisting plain
+   * user/assistant text and silently dropping every delegated-task event
+   * (thought/action/observation/final/chat/ask). Everything now goes
+   * through this one path so a reload can rebuild it.
+   * @param {string} role
+   * @param {string} content
+   * @param {string} eventType
+   * @param {Record<string, any> | null} [payload]
+   * @param {string | null} [groupId]
+   */
+  function persistEvent(role, content, eventType, payload = null, groupId = null) {
+    if (!currentSession) return;
+    invoke('save_event', {
+      sessionId: currentSession,
+      role,
+      content,
+      eventType,
+      payloadJson: payload ? JSON.stringify(payload) : null,
+      groupId
+    }).catch(() => {});
+  }
+
+  /**
+   * Build the one-line context summary the router LLM sees for a completed
+   * delegated task, so it retains continuity across turns (and reloads)
+   * without replaying every raw thought/action.
+   * @param {string} task
+   * @param {string} skillType
+   * @param {DaemonLogEvent[]} events
+   */
+  function summarizeDaemonGroup(task, skillType, events) {
+    const outcome = [...events].reverse().find(ev => ev.event_type === 'final' || ev.event_type === 'chat');
+    const errorEv = events.find(ev => ev.event_type === 'error');
+    const result = outcome?.payload?.content ?? (errorEv ? `Error: ${errorEv.payload?.content}` : '(no result)');
+    return `Delegated task (${skillType}): ${task}\nResult: ${result}`;
+  }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -97,14 +141,56 @@
     messages = [];
     activeDaemonSkillType = null;
 
-    const stored = /** @type {ChatHistoryItem[]} */ (await invoke('load_messages', { sessionId: id }).catch(() => []));
-    for (const msg of stored) {
-      // Rebuild UI messages (don't show daemon internal events from past turns)
-      if (msg.role === 'user' || msg.role === 'assistant') {
-        messages = [...messages, { id: ++msgId, role: msg.role, content: msg.content }];
-        history = [...history, { role: msg.role, content: msg.content }];
+    const stored = /** @type {any[]} */ (await invoke('load_messages', { sessionId: id }).catch(() => []));
+
+    /** @type {Map<string, UiMessage>} */
+    const groupBlocks = new Map();
+
+    for (const row of stored) {
+      const payload = row.payload_json ? JSON.parse(row.payload_json) : {};
+
+      if (row.group_id) {
+        // Part of a delegated-task block — accumulate under its group_id.
+        let block = groupBlocks.get(row.group_id);
+        if (row.event_type === 'daemon_task') {
+          if (!block) {
+            block = {
+              id: ++msgId,
+              role: 'daemon_block',
+              content: row.content,
+              skillType: payload.skill_type ?? 'task',
+              daemonEvents: [],
+              streaming: false,
+              groupId: row.group_id
+            };
+            groupBlocks.set(row.group_id, block);
+            messages = [...messages, block];
+          }
+        } else if (block) {
+          block.daemonEvents = [...(block.daemonEvents ?? []), { event_type: row.event_type, payload }];
+          messages = messages;
+          if (row.event_type === 'final' || row.event_type === 'chat' || row.event_type === 'error') {
+            history = [
+              ...history,
+              { role: 'assistant', content: summarizeDaemonGroup(block.content, block.skillType ?? 'task', block.daemonEvents ?? []) }
+            ];
+          }
+        }
+        continue;
+      }
+
+      // Standalone (non-grouped) rows.
+      if (row.event_type === 'text') {
+        messages = [...messages, { id: ++msgId, role: row.role, content: row.content }];
+        history = [...history, { role: row.role, content: row.content }];
+      } else if (row.event_type === 'ask_self') {
+        messages = [...messages, { id: ++msgId, role: 'ask_self', content: row.content }];
+        history = [...history, { role: 'assistant', content: row.content }];
+      } else if (row.event_type === 'error') {
+        messages = [...messages, { id: ++msgId, role: 'error', content: row.content }];
       }
     }
+
     const pending = /** @type {{ task_id: string, content: string, kind?: string, skill_type: string } | null} */ (
       await invoke('load_pending_confirmation', { sessionId: id }).catch(() => null)
     );
@@ -145,6 +231,11 @@
 
     switch (kind) {
       case 'token': {
+        // Thinking → streaming-final is the only transition here: the
+        // "thinking" dots render whenever isThinking is true and the last
+        // message is still the user's (see the template below); the first
+        // token replaces that with a real bubble that keeps growing in
+        // place. No separate "final" step — this bubble IS the final answer.
         const last = messages[messages.length - 1];
         if (last && last.role === 'assistant' && last.streaming) {
           last.content += data.content;
@@ -159,15 +250,28 @@
       case 'done': {
         const last = messages[messages.length - 1];
         if (last && last.role === 'assistant') {
+          // Just stop the caret — content was already built token-by-token
+          // above. (Previously this also overwrote content from a
+          // separately-assembled full_text, which was redundant and could
+          // visibly flash/diverge from what was actually streamed.)
           last.streaming = false;
-          last.content = data.full_text || last.content;
           messages = messages;
           history = [...history, { role: 'assistant', content: last.content }];
-          // Persist assistant reply
-          if (currentSession) {
-            invoke('save_message', { sessionId: currentSession, role: 'assistant', content: last.content }).catch(() => {});
-          }
+          persistEvent('assistant', last.content, 'text');
         }
+        isThinking = false;
+        scrollBottom();
+        break;
+      }
+
+      case 'ask_self': {
+        // The router itself asked a clarifying question instead of
+        // guessing. Persisted and folded into history exactly like a
+        // normal reply so the next turn has full context of what was
+        // asked — the conversation just continues normally from here.
+        messages = [...messages, { id: ++msgId, role: 'ask_self', content: data.content }];
+        history = [...history, { role: 'assistant', content: data.content }];
+        persistEvent('assistant', data.content, 'ask_self');
         isThinking = false;
         scrollBottom();
         break;
@@ -175,14 +279,17 @@
 
       case 'daemon_started': {
         activeDaemonSkillType = data.skill_type;
+        currentGroupId = `dg_${Date.now()}_${++msgId}`;
         messages = [...messages, {
-          id: ++msgId,
+          id: msgId,
           role: 'daemon_block',
           content: data.task,
           skillType: data.skill_type,
           daemonEvents: [],
-          streaming: true
+          streaming: true,
+          groupId: currentGroupId
         }];
+        persistEvent(data.skill_type, data.task, 'daemon_task', { skill_type: data.skill_type }, currentGroupId);
         scrollBottom();
         break;
       }
@@ -192,6 +299,7 @@
         if (last) {
           last.daemonEvents = [...(last.daemonEvents || []), { event_type: data.event_type, payload: data.payload }];
           messages = messages;
+          persistEvent('daemon', data.payload?.content ?? '', data.event_type, data.payload, last.groupId ?? currentGroupId);
         }
         scrollBottom();
         break;
@@ -202,7 +310,15 @@
         if (last) {
           last.streaming = false;
           messages = messages;
+          // Fold a short summary back into history so the router LLM
+          // retains what the daemon actually did/returned on the next
+          // turn — previously the router had no memory of this at all.
+          history = [
+            ...history,
+            { role: 'assistant', content: summarizeDaemonGroup(last.content, last.skillType ?? 'task', last.daemonEvents ?? []) }
+          ];
         }
+        currentGroupId = null;
         activeDaemonSkillType = null;
         isThinking = false;
         scrollBottom();
@@ -212,6 +328,7 @@
       case 'awaiting_confirmation': {
         const last = lastDaemonBlock();
         const skillType = last?.skillType ?? activeDaemonSkillType ?? '';
+        const groupId = last?.groupId ?? currentGroupId;
         messages = [...messages, {
           id: ++msgId,
           role: 'awaiting_confirmation',
@@ -219,8 +336,10 @@
           taskId: data.task_id,
           confirmationKind: data.payload?.kind,
           skillType,
-          confirmationReply: ''
+          confirmationReply: '',
+          groupId
         }];
+        persistEvent('daemon', data.content, 'ask', { content: data.content, kind: data.payload?.kind, task_id: data.task_id }, groupId);
         if (currentSession) {
           invoke('save_pending_confirmation', {
             sessionId: currentSession,
@@ -237,6 +356,7 @@
 
       case 'error': {
         messages = [...messages, { id: ++msgId, role: 'error', content: data.message }];
+        persistEvent('system', data.message, 'error', null, currentGroupId);
         isThinking = false;
         scrollBottom();
         break;
@@ -256,9 +376,7 @@
     isThinking = true;
 
     // Persist user message
-    if (currentSession) {
-      invoke('save_message', { sessionId: currentSession, role: 'user', content: text }).catch(() => {});
-    }
+    persistEvent('user', text, 'text');
 
     await tick();
     scrollBottom();
@@ -360,6 +478,17 @@
     messages = messages.filter(item => item.id !== msg.id);
     isThinking = true;
 
+    // Record what was actually answered — previously this reply vanished
+    // entirely (only sent over the wire to the daemon, never shown again
+    // or saved), so a reload lost the confirmation exchange.
+    const groupId = msg.groupId ?? currentGroupId;
+    const block = lastDaemonBlock();
+    if (block) {
+      block.daemonEvents = [...(block.daemonEvents ?? []), { event_type: 'user_reply', payload: { content: text } }];
+      messages = messages;
+    }
+    persistEvent('user', text, 'user_reply', { content: text }, groupId);
+
     try {
       await invoke('resume_daemon_task', {
         sessionId: currentSession,
@@ -385,13 +514,13 @@
 
   /** @param {string} type */
   function evIcon(type) {
-    const labels = /** @type {Record<string, string>} */ ({ thought: '◈', action: '▶', observation: '◉', final: '✔', chat: '◎', error: '✕', done: '■', started: '>' });
+    const labels = /** @type {Record<string, string>} */ ({ thought: '◈', action: '▶', observation: '◉', final: '✔', chat: '◎', error: '✕', done: '■', started: '>', user_reply: '↳', ask: '?' });
     return labels[type] ?? '·';
   }
 
   /** @param {string} type */
   function evLabel(type) {
-    const labels = /** @type {Record<string, string>} */ ({ thought: 'Thought', action: 'Action', observation: 'Result', final: 'Final', chat: 'Reply', error: 'Error', done: 'Done', started: 'Started' });
+    const labels = /** @type {Record<string, string>} */ ({ thought: 'Thought', action: 'Action', observation: 'Result', final: 'Final', chat: 'Reply', error: 'Error', done: 'Done', started: 'Started', user_reply: 'You replied', ask: 'Asked' });
     return labels[type] ?? type;
   }
 
@@ -506,6 +635,14 @@
             <div class="avatar avatar-ai">✦</div>
             <div class="bubble bubble-ai">
               {msg.content}{#if msg.streaming}<span class="caret">█</span>{/if}
+            </div>
+          </div>
+
+        {:else if msg.role === 'ask_self'}
+          <div class="row row-ai">
+            <div class="avatar avatar-ai">?</div>
+            <div class="bubble bubble-ai bubble-ask">
+              {msg.content}
             </div>
           </div>
 

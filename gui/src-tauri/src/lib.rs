@@ -105,7 +105,7 @@ async fn create_session(
         .map_err(|e| e.to_string())
 }
 
-/// Save a message to the database.
+/// Save a plain-text message to the database (back-compat; prefer save_event).
 #[tauri::command]
 async fn save_message(
     state: State<'_, AppState>,
@@ -116,6 +116,32 @@ async fn save_message(
     state
         .db
         .save_message(&session_id, &role, &content)
+        .map_err(|e| e.to_string())
+}
+
+/// Save any event (daemon thought/action/observation/final/chat, an ask,
+/// an error) so it survives a reload instead of only living in the
+/// in-memory UI state.
+#[tauri::command]
+async fn save_event(
+    state: State<'_, AppState>,
+    session_id: String,
+    role: String,
+    content: String,
+    event_type: String,
+    payload_json: Option<String>,
+    group_id: Option<String>,
+) -> Result<i64, String> {
+    state
+        .db
+        .save_event(
+            &session_id,
+            &role,
+            &content,
+            &event_type,
+            payload_json.as_deref(),
+            group_id.as_deref(),
+        )
         .map_err(|e| e.to_string())
 }
 
@@ -209,6 +235,7 @@ pub fn run() {
             agent::resume_daemon_task,
             create_session,
             save_message,
+            save_event,
             load_messages,
             save_pending_confirmation,
             load_pending_confirmation,

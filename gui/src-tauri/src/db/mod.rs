@@ -12,6 +12,27 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub timestamp: i64,
+    /// 'text' | 'daemon_task' | 'thought' | 'action' | 'observation' | 'final'
+    /// | 'chat' | 'ask' | 'ask_self' | 'error' — see agent/mod.rs FrontendEvent
+    /// and daemon.rs DaemonEvent for the full set. Defaults to 'text' for the
+    /// plain user/assistant messages this table originally stored.
+    #[serde(default = "default_event_type")]
+    pub event_type: String,
+    /// Structured extras a plain `content` string can't hold — e.g. an
+    /// action's {skill, args}, or an ask's {kind}. Frontend re-parses this
+    /// on load the same way it reads a live daemon_event's payload.
+    #[serde(default)]
+    pub payload_json: Option<String>,
+    /// Ties every event belonging to one delegated daemon task together so
+    /// a reload can rebuild the nested daemon_block the same way the live
+    /// event stream built it. None for standalone messages (user text,
+    /// plain chat replies, the router's own ask_self).
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+fn default_event_type() -> String {
+    "text".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +87,22 @@ impl Database {
         if !column_exists(&conn, "sessions", "pending_confirmation")? {
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN pending_confirmation TEXT",
+                [],
+            )?;
+        }
+        if !column_exists(&conn, "messages", "event_type")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN event_type TEXT NOT NULL DEFAULT 'text'",
+                [],
+            )?;
+        }
+        if !column_exists(&conn, "messages", "payload_json")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN payload_json TEXT", [])?;
+        }
+        if !column_exists(&conn, "messages", "group_id")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN group_id TEXT", [])?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)",
                 [],
             )?;
         }
@@ -156,25 +193,47 @@ impl Database {
 
     // ── Message Operations ────────────────────────────────────────────────────
 
-    /// Persist a single message.
-    pub fn save_message(&self, session_id: &str, role: &str, content: &str) -> SqlResult<i64> {
+    /// Persist any event the agent produces — plain text, a daemon
+    /// thought/action/observation/final/chat, an ask (daemon or the GUI's
+    /// own router), or an error. This is the fix for the GUI previously
+    /// only saving plain user/assistant text and silently dropping every
+    /// delegated-task event: everything now goes through this one path.
+    pub fn save_event(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        event_type: &str,
+        payload_json: Option<&str>,
+        group_id: Option<&str>,
+    ) -> SqlResult<i64> {
         let conn = self.conn.lock().unwrap();
         let now = unix_now();
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, role, content, now],
+            "INSERT INTO messages (session_id, role, content, timestamp, event_type, payload_json, group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![session_id, role, content, now, event_type, payload_json, group_id],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    /// Load all messages for a session ordered by oldest first.
+    /// Back-compat wrapper for plain text messages (user input, plain
+    /// non-delegated assistant replies). Equivalent to
+    /// `save_event(.., event_type: "text", payload_json: None, group_id: None)`.
+    pub fn save_message(&self, session_id: &str, role: &str, content: &str) -> SqlResult<i64> {
+        self.save_event(session_id, role, content, "text", None, None)
+    }
+
+    /// Load all events for a session ordered by oldest first. Includes
+    /// every event_type — the frontend groups by group_id to rebuild
+    /// daemon_block cards the same way the live stream built them.
     pub fn load_messages(&self, session_id: &str) -> SqlResult<Vec<StoredMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, role, content, timestamp
+            "SELECT id, session_id, role, content, timestamp, event_type, payload_json, group_id
              FROM messages
              WHERE session_id = ?1
-             ORDER BY timestamp ASC",
+             ORDER BY timestamp ASC, id ASC",
         )?;
         let rows = stmt
             .query_map(params![session_id], |row| {
@@ -184,6 +243,9 @@ impl Database {
                     role: row.get(2)?,
                     content: row.get(3)?,
                     timestamp: row.get(4)?,
+                    event_type: row.get(5)?,
+                    payload_json: row.get(6)?,
+                    group_id: row.get(7)?,
                 })
             })?
             .collect::<SqlResult<Vec<_>>>()?;

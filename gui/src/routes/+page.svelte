@@ -6,7 +6,16 @@
   /**
    * @typedef {{ role: string, content: string }} ChatHistoryItem
    * @typedef {{ id: string, title: string, ts: number }} Session
-   * @typedef {{ event_type: string, payload: Record<string, any> }} DaemonLogEvent
+   * @typedef {{
+   *   event_type: string,
+   *   payload: Record<string, any>,
+   *   resolved?: boolean,
+   *   reply?: string,
+   *   taskId?: string,
+   *   skillType?: string,
+   *   groupId?: string | null,
+   *   confirmationReply?: string
+   * }} DaemonLogEvent
    * @typedef {{
    *   id: number,
    *   role: string,
@@ -16,8 +25,10 @@
    *   taskId?: string,
    *   confirmationKind?: string,
    *   confirmationReply?: string,
+   *   resolved?: boolean,
+   *   resolutionReply?: string,
    *   daemonEvents?: DaemonLogEvent[],
-   *   groupId?: string
+   *   groupId?: string | null
    * }} UiMessage
    */
 
@@ -167,8 +178,25 @@
             messages = [...messages, block];
           }
         } else if (block) {
-          block.daemonEvents = [...(block.daemonEvents ?? []), { event_type: row.event_type, payload }];
-          messages = messages;
+          // A 'user_reply' that answers an earlier 'ask' in this same group
+          // gets folded into that ask entry (resolved + reply) instead of
+          // being appended as its own plain log line — so a reload shows
+          // the original ask/payment box with its outcome, not two rows.
+          const answeredAsk = row.event_type === 'user_reply' && payload.task_id
+            ? [...(block.daemonEvents ?? [])].reverse().find(
+                (ev) => ev.event_type === 'ask' && ev.payload?.task_id === payload.task_id && !ev.resolved
+              )
+            : undefined;
+
+          if (answeredAsk) {
+            answeredAsk.resolved = true;
+            answeredAsk.reply = payload.content;
+            messages = messages;
+          } else {
+            block.daemonEvents = [...(block.daemonEvents ?? []), { event_type: row.event_type, payload }];
+            messages = messages;
+          }
+
           if (row.event_type === 'final' || row.event_type === 'chat' || row.event_type === 'error') {
             history = [
               ...history,
@@ -196,15 +224,29 @@
     );
     if (pending) {
       activeDaemonSkillType = pending.skill_type;
-      messages = [...messages, {
-        id: ++msgId,
-        role: 'awaiting_confirmation',
-        content: pending.content,
-        taskId: pending.task_id,
-        confirmationKind: pending.kind,
-        skillType: pending.skill_type,
-        confirmationReply: ''
-      }];
+      const block = lastDaemonBlock();
+      if (block) {
+        block.daemonEvents = [...(block.daemonEvents ?? []), {
+          event_type: 'ask',
+          payload: { content: pending.content, kind: pending.kind },
+          taskId: pending.task_id,
+          skillType: pending.skill_type,
+          groupId: block.groupId,
+          resolved: false,
+          confirmationReply: ''
+        }];
+        messages = messages;
+      } else {
+        messages = [...messages, {
+          id: ++msgId,
+          role: 'awaiting_confirmation',
+          content: pending.content,
+          taskId: pending.task_id,
+          confirmationKind: pending.kind,
+          skillType: pending.skill_type,
+          confirmationReply: ''
+        }];
+      }
     }
     await tick();
     scrollBottom();
@@ -329,16 +371,36 @@
         const last = lastDaemonBlock();
         const skillType = last?.skillType ?? activeDaemonSkillType ?? '';
         const groupId = last?.groupId ?? currentGroupId;
-        messages = [...messages, {
-          id: ++msgId,
-          role: 'awaiting_confirmation',
-          content: data.content,
-          taskId: data.task_id,
-          confirmationKind: data.payload?.kind,
-          skillType,
-          confirmationReply: '',
-          groupId
-        }];
+
+        // Embedded in the daemon block's own event log (same place later
+        // thought/action/observation events land) instead of a trailing
+        // top-level message — otherwise events that stream in *after* the
+        // ask is answered land inside the earlier block while the ask sits
+        // after it in the list, making it look chronologically out of order.
+        if (last) {
+          last.daemonEvents = [...(last.daemonEvents ?? []), {
+            event_type: 'ask',
+            payload: { content: data.content, kind: data.payload?.kind },
+            taskId: data.task_id,
+            skillType,
+            groupId,
+            resolved: false,
+            confirmationReply: ''
+          }];
+          messages = messages;
+        } else {
+          messages = [...messages, {
+            id: ++msgId,
+            role: 'awaiting_confirmation',
+            content: data.content,
+            taskId: data.task_id,
+            confirmationKind: data.payload?.kind,
+            skillType,
+            confirmationReply: '',
+            groupId
+          }];
+        }
+
         persistEvent('daemon', data.content, 'ask', { content: data.content, kind: data.payload?.kind, task_id: data.task_id }, groupId);
         if (currentSession) {
           invoke('save_pending_confirmation', {
@@ -468,38 +530,72 @@
   }
 
   /**
-   * @param {UiMessage} msg
+   * Shared core for answering any ask/payment confirmation, whether it's
+   * rendered as a standalone message or embedded inline in a daemon
+   * block's event log. `markResolved` mutates whichever shape holds the
+   * reply so the box updates in place rather than being removed.
+   * @param {{ taskId?: string, skillType?: string, groupId?: string | null, kind?: string }} target
    * @param {string} reply
+   * @param {(text: string) => void} markResolved
    */
-  async function resumeConfirmation(msg, reply) {
+  async function answerConfirmation(target, reply, markResolved) {
     const text = reply.trim();
-    if (!msg.taskId || !msg.skillType || !text || !currentSession || isThinking || !daemonOnline) return;
+    if (!target.taskId || !target.skillType || !text || !currentSession || isThinking || !daemonOnline) return;
 
-    messages = messages.filter(item => item.id !== msg.id);
+    // Resolve in place rather than discarding — the box (with its original
+    // ask/payment content) stays visible with a clear accepted/declined/
+    // replied status, instead of collapsing into a plain "you replied" log
+    // line once answered.
+    markResolved(text);
+    messages = messages;
     isThinking = true;
 
-    // Record what was actually answered — previously this reply vanished
-    // entirely (only sent over the wire to the daemon, never shown again
-    // or saved), so a reload lost the confirmation exchange.
-    const groupId = msg.groupId ?? currentGroupId;
-    const block = lastDaemonBlock();
-    if (block) {
-      block.daemonEvents = [...(block.daemonEvents ?? []), { event_type: 'user_reply', payload: { content: text } }];
-      messages = messages;
-    }
-    persistEvent('user', text, 'user_reply', { content: text }, groupId);
+    // Persisted with the task_id + kind so a reload can re-attach this
+    // reply to the exact ask it answered and rebuild the same box.
+    const groupId = target.groupId ?? currentGroupId;
+    persistEvent('user', text, 'user_reply', { content: text, task_id: target.taskId, kind: target.kind }, groupId);
 
     try {
       await invoke('resume_daemon_task', {
         sessionId: currentSession,
-        taskId: msg.taskId,
+        taskId: target.taskId,
         reply: text,
-        skillType: msg.skillType
+        skillType: target.skillType
       });
     } catch (err) {
       messages = [...messages, { id: ++msgId, role: 'error', content: `Failed to resume task: ${err}` }];
       isThinking = false;
     }
+  }
+
+  /**
+   * Answers a standalone top-level confirmation message (fallback path —
+   * used only when a reload's still-pending ask had no matching daemon
+   * block to embed into).
+   * @param {UiMessage} msg
+   * @param {string} reply
+   */
+  async function resumeConfirmation(msg, reply) {
+    await answerConfirmation(
+      { taskId: msg.taskId, skillType: msg.skillType, groupId: msg.groupId, kind: msg.confirmationKind },
+      reply,
+      (text) => { msg.resolved = true; msg.resolutionReply = text; }
+    );
+  }
+
+  /**
+   * Answers an ask embedded inline in a daemon block's event log — the
+   * normal live path, so it resolves in exact chronological position
+   * alongside whatever streams in next.
+   * @param {DaemonLogEvent} ev
+   * @param {string} reply
+   */
+  async function resumeInlineAsk(ev, reply) {
+    await answerConfirmation(
+      { taskId: ev.taskId, skillType: ev.skillType, groupId: ev.groupId, kind: ev.payload?.kind },
+      reply,
+      (text) => { ev.resolved = true; ev.reply = text; }
+    );
   }
 
   /** @param {KeyboardEvent} e */
@@ -522,6 +618,22 @@
   function evLabel(type) {
     const labels = /** @type {Record<string, string>} */ ({ thought: 'Thought', action: 'Action', observation: 'Result', final: 'Final', chat: 'Reply', error: 'Error', done: 'Done', started: 'Started', user_reply: 'You replied', ask: 'Asked' });
     return labels[type] ?? type;
+  }
+
+  /**
+   * Human-readable outcome for a resolved ask/payment confirmation, so an
+   * answered box shows a clear accepted/declined/replied status instead of
+   * just the raw reply string.
+   * @param {string | undefined} kind
+   * @param {string | undefined} reply
+   */
+  function confirmationStatus(kind, reply) {
+    if (kind === 'payment') {
+      if (reply === 'yes') return { text: '✓ Accepted', cls: 'status-yes' };
+      if (reply === 'no') return { text: '✕ Declined', cls: 'status-no' };
+      return { text: `Replied: ${reply}`, cls: 'status-other' };
+    }
+    return { text: `You replied: ${reply}`, cls: 'status-other' };
   }
 
 </script>
@@ -658,7 +770,48 @@
               {#if (msg.daemonEvents?.length ?? 0) > 0}
                 <div class="daemon-log">
                   {#each msg.daemonEvents ?? [] as ev}
-                    {#if ev.event_type !== 'done'}
+                    {#if ev.event_type === 'ask'}
+                      <!-- Lives in the same event log as everything else so it stays
+                           in exact chronological order with events streamed before
+                           and after it — whether live or reconstructed on reload. -->
+                      <div class="payment-confirmation log-ask-card" class:resolved={ev.resolved}>
+                        <pre>{ev.payload?.content}</pre>
+                        {#if ev.resolved}
+                          <div class="confirmation-status {confirmationStatus(ev.payload?.kind, ev.reply).cls}">
+                            {confirmationStatus(ev.payload?.kind, ev.reply).text}
+                          </div>
+                        {:else if ev.payload?.kind === 'payment'}
+                          <div class="confirmation-actions">
+                            <button onclick={() => resumeInlineAsk(ev, 'yes')} disabled={!daemonOnline || isThinking}>Yes</button>
+                            <button onclick={() => resumeInlineAsk(ev, 'no')} disabled={!daemonOnline || isThinking}>No</button>
+                          </div>
+                          <form
+                            class="confirmation-form"
+                            onsubmit={(e) => { e.preventDefault(); resumeInlineAsk(ev, ev.confirmationReply ?? ''); }}
+                          >
+                            <input
+                              type="text"
+                              bind:value={ev.confirmationReply}
+                              disabled={!daemonOnline || isThinking}
+                              placeholder="Something else"
+                            />
+                            <button type="submit" disabled={!daemonOnline || isThinking || !(ev.confirmationReply ?? '').trim()}>Submit</button>
+                          </form>
+                        {:else}
+                          <form
+                            class="confirmation-form"
+                            onsubmit={(e) => { e.preventDefault(); resumeInlineAsk(ev, ev.confirmationReply ?? ''); }}
+                          >
+                            <input
+                              type="text"
+                              bind:value={ev.confirmationReply}
+                              disabled={!daemonOnline || isThinking}
+                            />
+                            <button type="submit" disabled={!daemonOnline || isThinking || !(ev.confirmationReply ?? '').trim()}>Submit</button>
+                          </form>
+                        {/if}
+                      </div>
+                    {:else if ev.event_type !== 'done'}
                       <div class="log-row log-{ev.event_type}">
                         <span class="log-icon">{evIcon(ev.event_type)}</span>
                         <span class="log-type">{evLabel(ev.event_type)}</span>
@@ -679,42 +832,54 @@
           {#if msg.confirmationKind === 'payment'}
             <div class="row row-ai">
               <div class="avatar avatar-ai">✦</div>
-              <div class="payment-confirmation">
+              <div class="payment-confirmation" class:resolved={msg.resolved}>
                 <pre>{msg.content}</pre>
-                <div class="confirmation-actions">
-                  <button onclick={() => resumeConfirmation(msg, 'yes')} disabled={!daemonOnline || isThinking}>Yes</button>
-                  <button onclick={() => resumeConfirmation(msg, 'no')} disabled={!daemonOnline || isThinking}>No</button>
-                </div>
-                <form
-                  class="confirmation-form"
-                  onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
-                >
-                  <input
-                    type="text"
-                    bind:value={msg.confirmationReply}
-                    disabled={!daemonOnline || isThinking}
-                    placeholder="Something else"
-                  />
-                  <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
-                </form>
+                {#if msg.resolved}
+                  <div class="confirmation-status {confirmationStatus(msg.confirmationKind, msg.resolutionReply).cls}">
+                    {confirmationStatus(msg.confirmationKind, msg.resolutionReply).text}
+                  </div>
+                {:else}
+                  <div class="confirmation-actions">
+                    <button onclick={() => resumeConfirmation(msg, 'yes')} disabled={!daemonOnline || isThinking}>Yes</button>
+                    <button onclick={() => resumeConfirmation(msg, 'no')} disabled={!daemonOnline || isThinking}>No</button>
+                  </div>
+                  <form
+                    class="confirmation-form"
+                    onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
+                  >
+                    <input
+                      type="text"
+                      bind:value={msg.confirmationReply}
+                      disabled={!daemonOnline || isThinking}
+                      placeholder="Something else"
+                    />
+                    <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
+                  </form>
+                {/if}
               </div>
             </div>
           {:else}
             <div class="row row-ai">
               <div class="avatar avatar-ai">✦</div>
-              <div class="bubble bubble-ai">
+              <div class="bubble bubble-ai bubble-ask" class:resolved={msg.resolved}>
                 <div>{msg.content}</div>
-                <form
-                  class="confirmation-form"
-                  onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
-                >
-                  <input
-                    type="text"
-                    bind:value={msg.confirmationReply}
-                    disabled={!daemonOnline || isThinking}
-                  />
-                  <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
-                </form>
+                {#if msg.resolved}
+                  <div class="confirmation-status {confirmationStatus(msg.confirmationKind, msg.resolutionReply).cls}">
+                    {confirmationStatus(msg.confirmationKind, msg.resolutionReply).text}
+                  </div>
+                {:else}
+                  <form
+                    class="confirmation-form"
+                    onsubmit={(e) => { e.preventDefault(); resumeConfirmation(msg, msg.confirmationReply ?? ''); }}
+                  >
+                    <input
+                      type="text"
+                      bind:value={msg.confirmationReply}
+                      disabled={!daemonOnline || isThinking}
+                    />
+                    <button type="submit" disabled={!daemonOnline || isThinking || !(msg.confirmationReply ?? '').trim()}>Submit</button>
+                  </form>
+                {/if}
               </div>
             </div>
           {/if}

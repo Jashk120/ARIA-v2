@@ -122,8 +122,37 @@ textarea {
   flex: 1;
 }
 
+.payment-confirmation.resolved {
+  opacity: 0.9;
+}
+
+.confirmation-status {
+  font-weight: bold;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid;
+  display: inline-block;
+}
+
+.status-yes {
+  border-color: seagreen;
+  color: seagreen;
+}
+
+.status-no {
+  border-color: crimson;
+  color: crimson;
+}
+
+.status-other {
+  opacity: 0.8;
+}
+
 .daemon-log {
   margin-top: 0.5rem;
+}
+
+.log-ask-card {
+  margin: 0.5rem 0;
 }
 
 .direct-panel label {

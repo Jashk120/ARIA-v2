@@ -143,6 +143,19 @@ pub async fn run_react_loop(
     let mut step = 0;
     let mut force_fallback_this_turn = false;
 
+    // ── Resume: a plain ask just needs its reply folded back into history ──────
+    // No fingerprinting/holds involved — this isn't a decision-grade
+    // confirmation, just "the user answered a clarifying question." Falls
+    // through into the normal loop below instead of returning early.
+    let pending_action = match pending_action {
+        Some(ref pending) if pending.get("kind").and_then(|v| v.as_str()) == Some("ask") => {
+            let _ = db.clear_pending_action(&task_id);
+            history.push(json!({ "role": "user", "content": user_prompt.clone() }));
+            None
+        }
+        other => other,
+    };
+
     // ── Resume: a pending payment confirmation takes priority over the LLM ─────
     // Interpreted deterministically (not re-asked to the model) so a
     // confirmation reply can't be reinterpreted into a different action right
@@ -404,7 +417,17 @@ pub async fn run_react_loop(
                         let args_text = args_str.as_str().unwrap_or_default();
                         let args: serde_json::Value =
                             serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
-                        parsed.push(AgentResponseKind::Action { skill: name, args });
+
+                        if name == crate::agent::prompt::ASK_TOOL_NAME {
+                            let question = args
+                                .get("question")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("(no question provided)")
+                                .to_string();
+                            parsed.push(AgentResponseKind::Ask(question));
+                        } else {
+                            parsed.push(AgentResponseKind::Action { skill: name, args });
+                        }
                     }
                 }
             } else if !raw.is_empty() {
@@ -756,11 +779,30 @@ pub async fn run_react_loop(
                 AgentResponseKind::Ask(question) => {
                     let _ = tx
                         .send(AgentEvent::Ask {
-                            content: question,
+                            content: question.clone(),
                             task_id: task_id.clone(),
                             kind: None,
                         })
                         .await;
+
+                    // Persist so the next message on this task_id resumes the
+                    // conversation instead of starting a fresh task with no
+                    // memory of what was asked. Unlike a payment ask, there's
+                    // no skill/args to hold open — just a marker so the top of
+                    // this function knows to fold the reply back into history
+                    // and continue, rather than trying to interpret it as a
+                    // payment confirmation.
+                    history.push(json!({
+                        "role": "assistant",
+                        "content": format!("Asked the user: {}", question)
+                    }));
+                    let history_json = serde_json::to_string(&history).unwrap_or_default();
+                    let _ = db.save_awaiting_confirmation(
+                        &task_id,
+                        &history_json,
+                        r#"{"kind":"ask"}"#,
+                    );
+
                     should_continue = false;
                 }
                 AgentResponseKind::Final(answer) => {

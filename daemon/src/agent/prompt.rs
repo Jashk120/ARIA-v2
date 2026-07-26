@@ -44,11 +44,46 @@ pub fn prompt_matches_triggers(
     })
 }
 
+// ── Ask tool (native mode) ──────────────────────────────────────────────────────
+// The prompt-fallback protocol has always had a generic `{"type":"ask", ...}`
+// response the model can emit instead of an action/final (see below). Native
+// tool-calling models had no equivalent — they could only call a skill or
+// return plain text, which was force-treated as a Final answer. This tool
+// gives native models the same "ask before acting" option, plain (no kind:
+// only payment confirmations carry a kind — see AskKind in react_loop.rs).
+
+pub const ASK_TOOL_NAME: &str = "ask_user";
+
+fn ask_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": ASK_TOOL_NAME,
+            "description": "Ask the user a clarifying question or request confirmation before proceeding, instead of guessing missing details or calling a skill with incomplete/uncertain arguments. Use this whenever the request is ambiguous or you're missing information you need (e.g. which file, which recipient, which of several matches). Do not use this for payments — payment skills already pause for confirmation on their own.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the user, in plain language."
+                    }
+                },
+                "required": ["question"]
+            }
+        }
+    })
+}
+
 // ── System prompt ─────────────────────────────────────────────────────────────
 
 pub fn system_prompt(user_prompt: &str, skills_type: Option<String>, is_native: bool) -> String {
     if is_native {
-        return "You are a tool-execution agent. Use the tools provided to fulfill the user's request.".to_string();
+        return format!(
+            "You are a tool-execution agent. Use the tools provided to fulfill the user's request. \
+If the request is ambiguous or you're missing information required to act safely and correctly, \
+call `{}` to ask the user instead of guessing.",
+            ASK_TOOL_NAME
+        );
     }
 
     let skills = build_skills_prompt(user_prompt, &skills_type);
@@ -164,10 +199,12 @@ pub fn build_native_tools(
     skills_type: &Option<String>,
 ) -> Vec<serde_json::Value> {
     let all_skills = load_all_skills();
-    let mut tools = Vec::new();
+    let mut tools = vec![ask_tool_definition()];
+    let mut matched_any_skill = false;
 
     for m in &all_skills {
         if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
+            matched_any_skill = true;
             let parameters = m.call.parameters.clone().unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "object",
@@ -187,7 +224,8 @@ pub fn build_native_tools(
     }
 
     // Fallback: if no specific triggers matched, include all skills so the LLM is never left toolless
-    if tools.is_empty() {
+    // (tools always has ask_user in it now, so this can't key off is_empty() anymore).
+    if !matched_any_skill {
         for m in all_skills {
             let parameters = m.call.parameters.clone().unwrap_or_else(|| {
                 serde_json::json!({

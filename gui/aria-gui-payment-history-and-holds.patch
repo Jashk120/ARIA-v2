@@ -1,0 +1,1037 @@
+diff --git a/src-tauri/src/daemon/mod.rs b/src-tauri/src/daemon/mod.rs
+index 5206d9f..6121565 100644
+--- a/src-tauri/src/daemon/mod.rs
++++ b/src-tauri/src/daemon/mod.rs
+@@ -75,18 +75,17 @@ struct DaemonQueryRequest<'a> {
+     query: &'a str,
+ }
+ 
+-/// Sends a single read-only query and returns the one-line JSON response the
+-/// daemon writes back (tagged `{"type": "query_budget" | "query_holds" |
+-/// "query_allowlist" | "query_wallet_balance" | "query_error", ...}`).
+-/// Unlike `submit_task`, this is a single request/response round trip, not
+-/// an event stream — the daemon closes the socket after the one line.
+-pub fn send_query(query: &str) -> Result<Value, String> {
++/// Serializes `payload`, sends it as a single line over a fresh TCP
++/// connection, and returns the one-line JSON response. Shared plumbing for
++/// every single-shot query/mutation endpoint below (`send_query`,
++/// `mutate_allowlist`, and everything added since) — the daemon closes the
++/// socket after the one line, so there's nothing to keep alive here.
++fn send_request<T: Serialize>(payload: &T) -> Result<Value, String> {
+     let stream = connect_with_retries()?;
+     let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
+ 
+-    let request = DaemonQueryRequest { query };
+     let request_json =
+-        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
++        serde_json::to_string(payload).map_err(|e| format!("Serialization error: {e}"))?;
+ 
+     write_stream
+         .write_all(request_json.as_bytes())
+@@ -110,13 +109,23 @@ pub fn send_query(query: &str) -> Result<Value, String> {
+ 
+     if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
+         let message =
+-            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown query error");
++            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown daemon error");
+         return Err(message.to_string());
+     }
+ 
+     Ok(value)
+ }
+ 
++/// Sends a single read-only query and returns the one-line JSON response the
++/// daemon writes back (tagged `{"type": "query_budget" | "query_holds" |
++/// "query_allowlist" | "query_wallet_balance" | "query_payment_history" |
++/// "query_url_allowlist" | "query_error", ...}`). Unlike `submit_task`, this
++/// is a single request/response round trip, not an event stream — the
++/// daemon closes the socket after the one line.
++pub fn send_query(query: &str) -> Result<Value, String> {
++    send_request(&DaemonQueryRequest { query })
++}
++
+ // ── Allowlist Mutation ────────────────────────────────────────────────────────
+ 
+ /// The JSON request for the `mutate_allowlist` daemon endpoint. Distinct from
+@@ -137,44 +146,92 @@ struct DaemonMutateRequest<'a> {
+ /// `send_query`, this is a single request/response round trip — the daemon
+ /// closes the socket after the one line.
+ pub fn mutate_allowlist(action: &str, account: &str) -> Result<Value, String> {
+-    let stream = connect_with_retries()?;
+-    let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
+-
+-    let request = DaemonMutateRequest {
++    send_request(&DaemonMutateRequest {
+         mutate: "mutate_allowlist",
+         action,
+         account,
+-    };
+-    let request_json =
+-        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
++    })
++}
+ 
+-    write_stream
+-        .write_all(request_json.as_bytes())
+-        .map_err(|e| format!("Write error: {e}"))?;
+-    write_stream
+-        .write_all(b"\n")
+-        .map_err(|e| format!("Write error: {e}"))?;
++// ── URL Allowlist (x402) ──────────────────────────────────────────────────────
++//
++// Distinct from the account allowlist above: this one governs which URLs
++// x402_pay is allowed to autonomously pay, not which Hedera accounts
++// hedera_pay may send to. Kept as its own request/response shape rather
++// than reusing `DaemonMutateRequest`'s `account` field, since conflating
++// the two wire formats would blur the same distinction the GUI is meant to
++// keep visually explicit.
+ 
+-    let mut reader = BufReader::new(stream);
+-    let mut line = String::new();
+-    reader
+-        .read_line(&mut line)
+-        .map_err(|e| format!("Read error: {e}"))?;
+-    let line = line.trim();
+-    if line.is_empty() {
+-        return Err("Empty response from daemon".to_string());
+-    }
++/// The JSON request for the `mutate_url_allowlist` daemon endpoint.
++#[derive(Debug, Serialize)]
++struct UrlAllowlistMutateRequest<'a> {
++    mutate: &'a str,
++    action: &'a str,
++    url: &'a str,
++}
+ 
+-    let value: Value =
+-        serde_json::from_str(line).map_err(|e| format!("Parse error on '{line}': {e}"))?;
++/// Sends a single `mutate_url_allowlist` request ("add" or "remove") and
++/// returns the one-line JSON response the daemon writes back (tagged
++/// `{"type": "mutate_url_allowlist", "action", "url", "changed"}` on
++/// success). Same request/response round trip shape as `mutate_allowlist`.
++pub fn mutate_url_allowlist(action: &str, url: &str) -> Result<Value, String> {
++    send_request(&UrlAllowlistMutateRequest {
++        mutate: "mutate_url_allowlist",
++        action,
++        url,
++    })
++}
+ 
+-    if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
+-        let message =
+-            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown mutation error");
+-        return Err(message.to_string());
+-    }
++/// The JSON request for the `query_url_rate_status` daemon endpoint —
++/// unlike the other read-only queries, this one is scoped to a single URL
++/// rather than returning the whole allowlist, so it carries a `url` field
++/// alongside `query`.
++#[derive(Debug, Serialize)]
++struct UrlRateStatusRequest<'a> {
++    query: &'a str,
++    url: &'a str,
++}
+ 
+-    Ok(value)
++/// Sends a `query_url_rate_status` request for one URL and returns the
++/// one-line JSON response (tagged `{"type": "query_url_rate_status", "url",
++/// ...}`, expected to carry the URL's current request count against its
++/// rate-limit window). Called once per listed URL from the Settings panel.
++pub fn query_url_rate_status(url: &str) -> Result<Value, String> {
++    send_request(&UrlRateStatusRequest {
++        query: "query_url_rate_status",
++        url,
++    })
++}
++
++// ── Hold Mutations (release_hold / approve_hold) ──────────────────────────────
++
++/// The JSON request for the `release_hold` / `approve_hold` daemon
++/// endpoints. Both act on a single outstanding hold, identified the same
++/// way `query_holds` identifies one in its response — by `payment_key`.
++#[derive(Debug, Serialize)]
++struct HoldMutateRequest<'a> {
++    mutate: &'a str,
++    payment_key: &'a str,
++}
++
++/// Approves a pending hold, releasing it into a committed payment. Returns
++/// the daemon's response verbatim; the caller re-queries `query_holds` (and
++/// `query_payment_history`) afterward rather than trusting this response to
++/// update local state.
++pub fn approve_hold(payment_key: &str) -> Result<Value, String> {
++    send_request(&HoldMutateRequest {
++        mutate: "approve_hold",
++        payment_key,
++    })
++}
++
++/// Releases a pending hold without paying it — the funds return to
++/// available budget. Same re-query-after pattern as `approve_hold`.
++pub fn release_hold(payment_key: &str) -> Result<Value, String> {
++    send_request(&HoldMutateRequest {
++        mutate: "release_hold",
++        payment_key,
++    })
+ }
+ 
+ // ── Task Submission ───────────────────────────────────────────────────────────
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index c50ec98..f1bf6d8 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -93,10 +93,13 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
+ }
+ 
+ /// Run one read-only daemon query on demand (`query_budget`, `query_holds`,
+-/// `query_allowlist`, `query_wallet_balance`) for the dashboard panel. Each
+-/// call is its own TCP round trip — there is no background polling; the
+-/// panel calls this once per query on mount and again whenever the user
+-/// hits refresh.
++/// `query_allowlist`, `query_wallet_balance`, `query_payment_history`,
++/// `query_url_allowlist`) for the dashboard/history/settings panels. Every
++/// one of these carries no fields beyond the query name itself, so they all
++/// share this one thin wrapper — `query_url_rate_status` does not, since it
++/// needs a `url` field, and gets its own command below. Each call is its
++/// own TCP round trip — there is no background polling; panels call this
++/// once on mount and again whenever the user hits refresh.
+ #[tauri::command]
+ async fn dashboard_query(query: String) -> Result<Value, String> {
+     tokio::task::spawn_blocking(move || daemon::send_query(&query))
+@@ -118,6 +121,51 @@ async fn mutate_allowlist(action: String, account: String) -> Result<Value, Stri
+         .map_err(|e| format!("Block thread error: {e}"))?
+ }
+ 
++/// Approve a pending hold via the daemon's `approve_hold` TCP endpoint,
++/// converting it into a committed payment. Returns the daemon's response
++/// verbatim — the caller re-queries `query_holds`/`query_payment_history`
++/// afterward rather than trusting this response to update local state.
++#[tauri::command]
++async fn approve_hold(payment_key: String) -> Result<Value, String> {
++    tokio::task::spawn_blocking(move || daemon::approve_hold(&payment_key))
++        .await
++        .map_err(|e| format!("Block thread error: {e}"))?
++}
++
++/// Release a pending hold via the daemon's `release_hold` TCP endpoint
++/// without paying it. Same re-query-after pattern as `approve_hold`.
++#[tauri::command]
++async fn release_hold(payment_key: String) -> Result<Value, String> {
++    tokio::task::spawn_blocking(move || daemon::release_hold(&payment_key))
++        .await
++        .map_err(|e| format!("Block thread error: {e}"))?
++}
++
++/// Add or remove a URL on the x402 URL allowlist via the daemon's
++/// `mutate_url_allowlist` TCP endpoint. This is a distinct mechanism from
++/// `mutate_allowlist` above (which governs hedera_pay account recipients) —
++/// kept as its own command rather than folded into it so the two never get
++/// conflated on the wire or in the Settings UI. The caller re-queries
++/// `query_url_allowlist` afterward rather than trusting this response to
++/// update local state.
++#[tauri::command]
++async fn mutate_url_allowlist(action: String, url: String) -> Result<Value, String> {
++    tokio::task::spawn_blocking(move || daemon::mutate_url_allowlist(&action, &url))
++        .await
++        .map_err(|e| format!("Block thread error: {e}"))?
++}
++
++/// Fetch the current rate-limit status for one URL on the x402 allowlist
++/// via the daemon's `query_url_rate_status` TCP endpoint (e.g. "7/10 this
++/// hour"). Scoped to a single URL, unlike the other dashboard queries, so
++/// it isn't folded into the generic `dashboard_query` command.
++#[tauri::command]
++async fn query_url_rate_status(url: String) -> Result<Value, String> {
++    tokio::task::spawn_blocking(move || daemon::query_url_rate_status(&url))
++        .await
++        .map_err(|e| format!("Block thread error: {e}"))?
++}
++
+ /// Ensure a session exists in the DB (idempotent – safe to call every load).
+ #[tauri::command]
+ async fn create_session(
+@@ -260,6 +308,10 @@ pub fn run() {
+             send_direct_task,
+             dashboard_query,
+             mutate_allowlist,
++            approve_hold,
++            release_hold,
++            mutate_url_allowlist,
++            query_url_rate_status,
+             agent::resume_daemon_task,
+             create_session,
+             save_message,
+diff --git a/src/app.css b/src/app.css
+index 7bd9169..7d63bbd 100644
+--- a/src/app.css
++++ b/src/app.css
+@@ -350,4 +350,145 @@ textarea {
+   border-color: goldenrod;
+   color: goldenrod;
+   margin-bottom: 0.5rem;
++}
++
++/* ── Dashboard holds — Approve/Release (confirm-before-act) ────────────── */
++
++.hold-actions {
++  display: flex;
++  gap: 0.5rem;
++}
++
++.hold-confirm {
++  display: flex;
++  align-items: center;
++  gap: 0.5rem;
++  flex-wrap: wrap;
++  font-size: 0.85rem;
++}
++
++/* ── Settings: two distinct allowlists ──────────────────────────────────── */
++
++.settings-mechanism-note {
++  opacity: 0.8;
++  font-size: 0.85rem;
++  margin-bottom: 1.25rem;
++}
++
++.dash-section-sub {
++  font-weight: normal;
++  opacity: 0.7;
++  font-size: 0.85rem;
++}
++
++.settings-section-account,
++.settings-section-url {
++  border: 1px solid;
++  padding: 1rem;
++}
++
++.settings-section-account {
++  margin-bottom: 1.5rem;
++}
++
++.settings-url {
++  display: flex;
++  flex-direction: column;
++  gap: 0.2rem;
++}
++
++.settings-rate-status {
++  font-size: 0.8rem;
++  opacity: 0.75;
++}
++
++.settings-rate-status-error {
++  color: crimson;
++  opacity: 1;
++}
++
++/* ── History tab: payment trail + HCS decision trail ────────────────────── */
++
++.history-panel {
++  padding: 1rem;
++  overflow-y: auto;
++  display: flex;
++  gap: 1.5rem;
++  align-items: flex-start;
++}
++
++.history-column {
++  flex: 1;
++  min-width: 0;
++}
++
++.history-column h2 {
++  margin: 0 0 0.75rem;
++  font-size: 1rem;
++}
++
++.history-payments-table th,
++.history-payments-table td {
++  vertical-align: top;
++}
++
++.history-txid {
++  overflow-wrap: anywhere;
++}
++
++.history-payment-type {
++  font-weight: bold;
++  font-size: 0.85rem;
++}
++
++.history-badge {
++  font-size: 0.8rem;
++  font-weight: bold;
++  padding: 0.2rem 0.5rem;
++  border: 1px solid;
++  display: inline-block;
++  white-space: nowrap;
++}
++
++.history-badge-verified {
++  border-color: seagreen;
++  color: seagreen;
++}
++
++.history-badge-unverified {
++  border-color: crimson;
++  color: crimson;
++}
++
++.history-hcs-list {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++}
++
++.history-hcs-item {
++  border-bottom: 1px solid;
++  padding: 0.6rem 0;
++}
++
++.history-hcs-header {
++  display: flex;
++  justify-content: space-between;
++  gap: 1rem;
++  font-size: 0.8rem;
++  opacity: 0.75;
++  margin-bottom: 0.35rem;
++}
++
++.history-hcs-record {
++  margin: 0;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++  font-size: 0.8rem;
++}
++
++@media (max-width: 900px) {
++  .history-panel {
++    flex-direction: column;
++  }
+ }
+\ No newline at end of file
+diff --git a/src/routes/+page.svelte b/src/routes/+page.svelte
+index 267b411..d3f1403 100644
+--- a/src/routes/+page.svelte
++++ b/src/routes/+page.svelte
+@@ -66,7 +66,7 @@
+   let dashboardErrors = $state({});
+   let dashboardLoadedOnce = $state(false);
+ 
+-  // ── Settings (allowlist mutation) ────────────────────────────────────────
++  // ── Settings (account allowlist mutation — governs hedera_pay) ───────────
+   let settingsAllowlist = /** @type {string[] | null} */ ($state(null));
+   let settingsLoading = $state(false);
+   let settingsLoadedOnce = $state(false);
+@@ -80,6 +80,48 @@
+    * 0.0.1234" or "0.0.1234 was already on the allowlist". */
+   let settingsMutateNotice = /** @type {string | null} */ ($state(null));
+ 
++  // ── Settings (URL allowlist mutation — governs x402_pay, a wholly
++  // separate mechanism from the account allowlist above) ──────────────────
++  let settingsUrlAllowlist = /** @type {string[] | null} */ ($state(null));
++  let settingsUrlLoading = $state(false);
++  let settingsUrlLoadedOnce = $state(false);
++  let settingsUrlLoadError = /** @type {string | null} */ ($state(null));
++  let settingsNewUrl = $state('');
++  let settingsUrlMutating = $state(false);
++  let settingsUrlMutateError = /** @type {string | null} */ ($state(null));
++  let settingsUrlMutateNotice = /** @type {string | null} */ ($state(null));
++  /** @type {Record<string, { count: number, limit: number, window?: string } | 'error'>} */
++  let settingsUrlRateStatus = $state({});
++
++  // ── Dashboard holds — Approve/Release (confirm-before-act) ───────────────
++  /** @type {{ payment_key: string, action: 'approve' | 'release' } | null} */
++  let holdPendingAction = $state(null);
++  let holdActionInFlight = $state(false);
++  let holdActionError = /** @type {string | null} */ ($state(null));
++
++  // ── History tab ────────────────────────────────────────────────────────
++  /**
++   * @typedef {{
++   *   transaction_id: string,
++   *   recipient: string,
++   *   amount_hbar: number,
++   *   chain_verified: boolean,
++   *   hashscan_url?: string,
++   *   skill_called?: string,
++   *   timestamp?: string
++   * }} PaymentRecord
++   */
++  let historyPayments = /** @type {PaymentRecord[] | null} */ ($state(null));
++  let historyPaymentsLoading = $state(false);
++  let historyPaymentsLoadedOnce = $state(false);
++  let historyPaymentsError = /** @type {string | null} */ ($state(null));
++
++  /** @type {any[] | null} */
++  let historyHcs = $state(null);
++  let historyHcsLoading = $state(false);
++  let historyHcsLoadedOnce = $state(false);
++  let historyHcsError = /** @type {string | null} */ ($state(null));
++
+   let activeDaemonSkillType = /** @type {string | null} */ ($state(null));
+   let msgId = 0;
+   /** Groups every event of the in-flight delegated task under one id so it
+@@ -377,6 +419,9 @@
+           messages = messages;
+           persistEvent('daemon', data.payload?.content ?? '', data.event_type, data.payload, last.groupId ?? currentGroupId);
+         }
++        if (data.event_type === 'payment_settled') {
++          applyPaymentSettled(data.payload ?? {});
++        }
+         scrollBottom();
+         break;
+       }
+@@ -527,7 +572,50 @@
+     dashboardLoading = false;
+   }
+ 
+-  // ── Settings (allowlist mutation) ────────────────────────────────────────
++  /**
++   * First click on Approve/Release just arms the confirmation — no daemon
++   * call yet. A second click on the row's own Confirm button actually
++   * fires it. Mirrors the same confirm-before-act care as the chat
++   * payment-confirmation UI, since these move real funds too.
++   * @param {string} paymentKey
++   * @param {'approve' | 'release'} action
++   */
++  function requestHoldAction(paymentKey, action) {
++    if (holdActionInFlight) return;
++    holdActionError = null;
++    holdPendingAction = { payment_key: paymentKey, action };
++  }
++
++  function cancelHoldAction() {
++    if (holdActionInFlight) return;
++    holdPendingAction = null;
++    holdActionError = null;
++  }
++
++  async function confirmHoldAction() {
++    if (!holdPendingAction || holdActionInFlight || !daemonOnline) return;
++    const { payment_key, action } = holdPendingAction;
++    holdActionInFlight = true;
++    holdActionError = null;
++
++    try {
++      await invoke(action === 'approve' ? 'approve_hold' : 'release_hold', { paymentKey: payment_key });
++      holdPendingAction = null;
++      // Re-query rather than edit dashboardHolds locally — the daemon is
++      // the source of truth for what's still outstanding.
++      await loadDashboard();
++      // A newly-committed (approved) hold is now a payment — refresh the
++      // History payment trail too, if it's already been opened, so it
++      // shows up there without a separate manual refresh.
++      if (historyPaymentsLoadedOnce) await loadHistoryPayments();
++    } catch (e) {
++      holdActionError = String(e);
++    } finally {
++      holdActionInFlight = false;
++    }
++  }
++
++  // ── Settings (account allowlist mutation — governs hedera_pay) ───────────
+ 
+   /**
+    * Loads the allowlist fresh from the daemon. Called on first Settings-tab
+@@ -601,6 +689,186 @@
+     }
+   }
+ 
++  // ── Settings (URL allowlist mutation — governs x402_pay) ─────────────────
++  //
++  // Kept entirely separate from the account allowlist above, both in state
++  // and on screen: these two lists govern different payment paths
++  // (hedera_pay vs x402_pay) and showing them as one combined list would
++  // wrongly imply they're the same mechanism.
++
++  /**
++   * Loads the URL allowlist fresh from the daemon, then kicks off one
++   * query_url_rate_status call per URL (in parallel, best-effort — a
++   * failed rate lookup for one URL doesn't block showing the others).
++   */
++  async function loadSettingsUrlAllowlist() {
++    if (settingsUrlLoading) return;
++    settingsUrlLoading = true;
++    settingsUrlLoadedOnce = true;
++    settingsUrlLoadError = null;
++
++    try {
++      const result = /** @type {any} */ (await invoke('dashboard_query', { query: 'query_url_allowlist' }));
++      settingsUrlAllowlist = result?.urls ?? [];
++      settingsUrlLoading = false;
++      await refreshUrlRateStatuses(settingsUrlAllowlist ?? []);
++    } catch (e) {
++      settingsUrlLoadError = String(e);
++      settingsUrlLoading = false;
++    }
++  }
++
++  /** @param {string[]} urls */
++  async function refreshUrlRateStatuses(urls) {
++    /** @type {Record<string, { count: number, limit: number, window?: string } | 'error'>} */
++    const next = {};
++    await Promise.all(urls.map(async (url) => {
++      try {
++        const status = /** @type {any} */ (await invoke('query_url_rate_status', { url }));
++        next[url] = { count: status?.count, limit: status?.limit, window: status?.window };
++      } catch {
++        next[url] = 'error';
++      }
++    }));
++    settingsUrlRateStatus = next;
++  }
++
++  async function addUrlAllowlistEntry() {
++    const url = settingsNewUrl.trim();
++    if (!url || settingsUrlMutating || !daemonOnline) return;
++
++    settingsUrlMutating = true;
++    settingsUrlMutateError = null;
++    settingsUrlMutateNotice = null;
++
++    try {
++      const result = /** @type {any} */ (await invoke('mutate_url_allowlist', { action: 'add', url }));
++      settingsUrlMutateNotice = result?.changed
++        ? `Added ${url} to the URL allowlist.`
++        : `${url} was already on the URL allowlist.`;
++      settingsNewUrl = '';
++      await loadSettingsUrlAllowlist();
++    } catch (e) {
++      settingsUrlMutateError = String(e);
++    } finally {
++      settingsUrlMutating = false;
++    }
++  }
++
++  /** @param {string} url */
++  async function removeUrlAllowlistEntry(url) {
++    if (settingsUrlMutating || !daemonOnline) return;
++
++    settingsUrlMutating = true;
++    settingsUrlMutateError = null;
++    settingsUrlMutateNotice = null;
++
++    try {
++      const result = /** @type {any} */ (await invoke('mutate_url_allowlist', { action: 'remove', url }));
++      settingsUrlMutateNotice = result?.changed
++        ? `Removed ${url} from the URL allowlist.`
++        : `${url} was not on the URL allowlist.`;
++      await loadSettingsUrlAllowlist();
++    } catch (e) {
++      settingsUrlMutateError = String(e);
++    } finally {
++      settingsUrlMutating = false;
++    }
++  }
++
++  // ── History tab ────────────────────────────────────────────────────────
++  //
++  // Two independent panels — payment trail (left) and HCS decision trail
++  // (right). Each loads and fails on its own; x402 payments never write to
++  // HCS at all (cost per HCS message can exceed a micropayment's value),
++  // so the right panel legitimately has nothing for those rows and that's
++  // not a bug.
++
++  /** Fresh query_payment_history call — always re-fetches, never trusts
++   * local state, per the same pattern as the other daemon-backed panels. */
++  async function loadHistoryPayments() {
++    if (historyPaymentsLoading) return;
++    historyPaymentsLoading = true;
++    historyPaymentsLoadedOnce = true;
++    historyPaymentsError = null;
++
++    try {
++      const result = /** @type {any} */ (await invoke('dashboard_query', { query: 'query_payment_history' }));
++      historyPayments = result?.payments ?? [];
++    } catch (e) {
++      historyPaymentsError = String(e);
++    } finally {
++      historyPaymentsLoading = false;
++    }
++  }
++
++  /**
++   * Fetches the HCS decision trail for the daemon's audit topic directly
++   * from the Hedera Mirror Node REST API and decodes each message's base64
++   * payload as the CurbRecord JSON the daemon writes. hedera_pay decisions
++   * only — x402 never appears here by design.
++   */
++  async function loadHistoryHcs() {
++    if (historyHcsLoading) return;
++    historyHcsLoading = true;
++    historyHcsLoadedOnce = true;
++    historyHcsError = null;
++
++    try {
++      const topicResult = /** @type {any} */ (await invoke('dashboard_query', { query: 'query_audit_topic_id' }));
++      const topicId = topicResult?.audit_topic_id ?? topicResult?.topic_id;
++      if (!topicId) throw new Error('Daemon did not return an audit_topic_id');
++
++      // Mirror Node base matches whichever Hedera network the daemon's
++      // client is configured for — testnet here, since that's the default
++      // for this project. Swap to mainnet-public.mirrornode.hedera.com if
++      // the daemon is pointed at mainnet.
++      const res = await fetch(
++        `https://testnet.mirrornode.hedera.com/api/v1/topics/${encodeURIComponent(topicId)}/messages?order=desc&limit=50`
++      );
++      if (!res.ok) throw new Error(`Mirror Node returned ${res.status}`);
++      const body = await res.json();
++
++      historyHcs = (body?.messages ?? []).map((m) => {
++        try {
++          const decoded = atob(m.message);
++          return { consensus_timestamp: m.consensus_timestamp, sequence_number: m.sequence_number, record: JSON.parse(decoded) };
++        } catch {
++          return { consensus_timestamp: m.consensus_timestamp, sequence_number: m.sequence_number, record: null, decodeError: true };
++        }
++      });
++    } catch (e) {
++      historyHcsError = String(e);
++    } finally {
++      historyHcsLoading = false;
++    }
++  }
++
++  async function loadHistory() {
++    // Independent — one panel's failure never blocks the other from
++    // loading or from being retried on its own.
++    loadHistoryPayments();
++    loadHistoryHcs();
++  }
++
++  /**
++   * Applied when a live AgentEvent::PaymentSettled streams in during an
++   * active chat/direct task, so the matching History row updates without
++   * waiting for a manual refresh. Only fires if the History tab has
++   * already loaded once — otherwise the next open does a fresh
++   * query_payment_history anyway.
++   * @param {Record<string, any>} payload
++   */
++  function applyPaymentSettled(payload) {
++    if (!historyPayments || !payload?.transaction_id) return;
++    const idx = historyPayments.findIndex(p => p.transaction_id === payload.transaction_id);
++    if (idx === -1) {
++      historyPayments = [payload, ...historyPayments];
++    } else {
++      historyPayments = historyPayments.map((p, i) => i === idx ? { ...p, ...payload } : p);
++    }
++  }
++
+   // ── Direct TCP Task ────────────────────────────────────────────────────────
+ 
+   /** @param {any} event */
+@@ -622,6 +890,9 @@
+           event_type: data.event_type,
+           payload: data.payload
+         }];
++        if (data.event_type === 'payment_settled') {
++          applyPaymentSettled(data.payload ?? {});
++        }
+         break;
+ 
+       case 'done':
+@@ -877,9 +1148,17 @@
+         class:active={activeTab === 'dashboard'}
+         onclick={() => { activeTab = 'dashboard'; if (!dashboardLoadedOnce) loadDashboard(); }}
+       >Dashboard</button>
++      <button
++        class:active={activeTab === 'history'}
++        onclick={() => { activeTab = 'history'; if (!historyPaymentsLoadedOnce) loadHistoryPayments(); if (!historyHcsLoadedOnce) loadHistoryHcs(); }}
++      >History</button>
+       <button
+         class:active={activeTab === 'settings'}
+-        onclick={() => { activeTab = 'settings'; if (!settingsLoadedOnce) loadSettingsAllowlist(); }}
++        onclick={() => {
++          activeTab = 'settings';
++          if (!settingsLoadedOnce) loadSettingsAllowlist();
++          if (!settingsUrlLoadedOnce) loadSettingsUrlAllowlist();
++        }}
+       >Settings</button>
+     </div>
+ 
+@@ -1252,23 +1531,30 @@
+           <span>Settings</span>
+         </div>
+         <div class="top-bar-right">
+-          <button onclick={loadSettingsAllowlist} disabled={!daemonOnline || settingsLoading || settingsMutating}>
+-            {settingsLoading ? 'Refreshing…' : '↻ Refresh'}
++          <button
++            onclick={() => { loadSettingsAllowlist(); loadSettingsUrlAllowlist(); }}
++            disabled={!daemonOnline || settingsLoading || settingsMutating || settingsUrlLoading || settingsUrlMutating}
++          >
++            {(settingsLoading || settingsUrlLoading) ? 'Refreshing…' : '↻ Refresh'}
+           </button>
+         </div>
+       </header>
+ 
+       <div class="dashboard-panel">
+         {#if !daemonOnline}
+-          <p>Daemon offline. Start the daemon to manage the allowlist.</p>
++          <p>Daemon offline. Start the daemon to manage allowlists.</p>
+         {:else}
+-          <section class="dash-section">
+-            <h2>Payment allowlist</h2>
++          <p class="settings-mechanism-note">
++            Two separate allowlists govern two separate payment paths — they are not
++            interchangeable and adding an entry to one has no effect on the other.
++          </p>
++
++          <section class="dash-section settings-section-account">
++            <h2>Account allowlist <span class="dash-section-sub">— governs hedera_pay</span></h2>
+             <p class="dash-caps-note">
+-              Only accounts listed here can receive payments the agent initiates. This is the
+-              only place in the GUI that mutates daemon state — every add/remove goes straight
+-              to the daemon and the list below is always re-fetched from it afterward, never
+-              guessed locally.
++              Only Hedera accounts listed here can receive payments the agent initiates via
++              hedera_pay. Every add/remove goes straight to the daemon and the list below is
++              always re-fetched from it afterward, never guessed locally.
+             </p>
+ 
+             <form
+@@ -1316,6 +1602,176 @@
+               </ul>
+             {/if}
+           </section>
++
++          <section class="dash-section settings-section-url">
++            <h2>URL allowlist <span class="dash-section-sub">— governs x402_pay</span></h2>
++            <p class="dash-caps-note">
++              A wholly separate mechanism from the account allowlist above. Only URLs listed
++              here can be autonomously paid via x402_pay's micropayment path. Every add/remove
++              goes straight to the daemon and the list below is always re-fetched from it
++              afterward, never guessed locally.
++            </p>
++
++            <form
++              class="settings-add-form"
++              onsubmit={(e) => { e.preventDefault(); addUrlAllowlistEntry(); }}
++            >
++              <input
++                type="text"
++                bind:value={settingsNewUrl}
++                placeholder="https://api.example.com/resource"
++                disabled={settingsUrlMutating}
++                aria-label="URL to add"
++              />
++              <button type="submit" disabled={settingsUrlMutating || !settingsNewUrl.trim()}>
++                {settingsUrlMutating ? 'Working…' : 'Add'}
++              </button>
++            </form>
++
++            {#if settingsUrlMutateError}
++              <p class="dash-error">⚠ {settingsUrlMutateError}</p>
++            {/if}
++            {#if settingsUrlMutateNotice}
++              <p class="settings-notice">{settingsUrlMutateNotice}</p>
++            {/if}
++
++            {#if settingsUrlLoadError}
++              <p class="dash-error">⚠ {settingsUrlLoadError}</p>
++            {:else if !settingsUrlLoadedOnce || settingsUrlLoading}
++              <p>Loading…</p>
++            {:else if settingsUrlAllowlist && settingsUrlAllowlist.length === 0}
++              <p>No allowlisted URLs.</p>
++            {:else if settingsUrlAllowlist}
++              <ul class="settings-allowlist">
++                {#each settingsUrlAllowlist as url (url)}
++                  <li>
++                    <span class="settings-account settings-url">
++                      {url}
++                      {#if settingsUrlRateStatus[url] === 'error'}
++                        <span class="settings-rate-status settings-rate-status-error">rate status unavailable</span>
++                      {:else if settingsUrlRateStatus[url]}
++                        <span class="settings-rate-status">
++                          {settingsUrlRateStatus[url].count}/{settingsUrlRateStatus[url].limit} {settingsUrlRateStatus[url].window ?? 'this hour'}
++                        </span>
++                      {/if}
++                    </span>
++                    <button
++                      class="settings-remove-btn"
++                      onclick={() => removeUrlAllowlistEntry(url)}
++                      disabled={settingsUrlMutating}
++                      aria-label={`Remove ${url}`}
++                    >Remove</button>
++                  </li>
++                {/each}
++              </ul>
++            {/if}
++          </section>
++        {/if}
++      </div>
++    </section>
++  {:else if activeTab === 'history'}
++    <section class="chat-panel">
++      <header class="top-bar">
++        <div>
++          <span>History</span>
++        </div>
++        <div class="top-bar-right">
++          <button
++            onclick={() => { loadHistoryPayments(); loadHistoryHcs(); }}
++            disabled={!daemonOnline || historyPaymentsLoading || historyHcsLoading}
++          >
++            {(historyPaymentsLoading || historyHcsLoading) ? 'Refreshing…' : '↻ Refresh'}
++          </button>
++        </div>
++      </header>
++
++      <div class="history-panel">
++        {#if !daemonOnline}
++          <p>Daemon offline. Start the daemon to load history.</p>
++        {:else}
++          <!-- LEFT: payment trail (daemon-reported, both hedera_pay and x402_pay) -->
++          <section class="history-column history-column-payments">
++            <h2>Payment trail</h2>
++            {#if historyPaymentsError}
++              <p class="dash-error">⚠ {historyPaymentsError}</p>
++            {:else if !historyPaymentsLoadedOnce || historyPaymentsLoading}
++              <p>Loading…</p>
++            {:else if historyPayments && historyPayments.length === 0}
++              <p>No payments yet.</p>
++            {:else if historyPayments}
++              <table class="dash-table history-payments-table">
++                <thead>
++                  <tr>
++                    <th>Type</th>
++                    <th>Transaction</th>
++                    <th>Recipient</th>
++                    <th>Amount</th>
++                    <th>Verified</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {#each historyPayments as p (p.transaction_id)}
++                    <tr>
++                      <td>
++                        <span class="history-payment-type">
++                          {p.skill_called ?? '—'}
++                        </span>
++                      </td>
++                      <td class="history-txid">
++                        {#if p.hashscan_url}
++                          <a href={p.hashscan_url} target="_blank" rel="noreferrer">{p.transaction_id}</a>
++                        {:else}
++                          {p.transaction_id}
++                        {/if}
++                      </td>
++                      <td>{p.recipient}</td>
++                      <td>{Number(p.amount_hbar ?? 0).toFixed(4)} ℏ</td>
++                      <td>
++                        {#if p.chain_verified === false}
++                          <span class="history-badge history-badge-unverified">⚠ unverified</span>
++                        {:else}
++                          <span class="history-badge history-badge-verified">✓ verified</span>
++                        {/if}
++                      </td>
++                    </tr>
++                  {/each}
++                </tbody>
++              </table>
++            {/if}
++          </section>
++
++          <!-- RIGHT: HCS decision trail — hedera_pay only, by design -->
++          <section class="history-column history-column-hcs">
++            <h2>HCS decision trail</h2>
++            <p class="dash-caps-note">
++              x402 payments are not logged to HCS by design — per-message Mirror Node cost can
++              exceed a micropayment's value, so only hedera_pay decisions ever appear here. A
++              missing x402 row on the left isn't a bug.
++            </p>
++            {#if historyHcsError}
++              <p class="dash-error">⚠ {historyHcsError}</p>
++            {:else if !historyHcsLoadedOnce || historyHcsLoading}
++              <p>Loading…</p>
++            {:else if historyHcs && historyHcs.length === 0}
++              <p>No HCS decision records found on the audit topic.</p>
++            {:else if historyHcs}
++              <ul class="history-hcs-list">
++                {#each historyHcs as msg (msg.sequence_number)}
++                  <li class="history-hcs-item">
++                    {#if msg.decodeError || !msg.record}
++                      <span class="dash-error">⚠ Could not decode message #{msg.sequence_number}</span>
++                    {:else}
++                      <div class="history-hcs-header">
++                        <span class="history-hcs-seq">#{msg.sequence_number}</span>
++                        <span class="history-hcs-ts">{msg.consensus_timestamp}</span>
++                      </div>
++                      <pre class="history-hcs-record">{JSON.stringify(msg.record, null, 2)}</pre>
++                    {/if}
++                  </li>
++                {/each}
++              </ul>
++            {/if}
++          </section>
+         {/if}
+       </div>
+     </section>
+@@ -1342,6 +1798,7 @@
+           <!-- Budget -->
+           <section class="dash-section">
+             <h2>Budget</h2>
++            <p class="dash-caps-note">Per-task/per-day caps apply to both hedera_pay and x402_pay.</p>
+             {#if dashboardErrors.budget}
+               <p class="dash-error">⚠ {dashboardErrors.budget}</p>
+             {:else if dashboardBudget}
+@@ -1392,6 +1849,9 @@
+           <!-- Holds -->
+           <section class="dash-section">
+             <h2>Holds — pending / uncommitted</h2>
++            {#if holdActionError}
++              <p class="dash-error">⚠ {holdActionError}</p>
++            {/if}
+             {#if dashboardErrors.holds}
+               <p class="dash-error">⚠ {dashboardErrors.holds}</p>
+             {:else if dashboardHolds && dashboardHolds.length === 0}
+@@ -1399,14 +1859,36 @@
+             {:else if dashboardHolds}
+               <table class="dash-table">
+                 <thead>
+-                  <tr><th>Payment key</th><th>Amount</th><th>Timestamp</th></tr>
++                  <tr><th>Payment key</th><th>Amount</th><th>Timestamp</th><th>Action</th></tr>
+                 </thead>
+                 <tbody>
+-                  {#each dashboardHolds as hold}
++                  {#each dashboardHolds as hold (hold.payment_key)}
+                     <tr>
+                       <td>{hold.payment_key}</td>
+                       <td>{hold.amount_hbar.toFixed(4)} ℏ</td>
+                       <td>{hold.timestamp}</td>
++                      <td>
++                        {#if holdPendingAction && holdPendingAction.payment_key === hold.payment_key}
++                          <span class="hold-confirm">
++                            Confirm {holdPendingAction.action === 'approve' ? 'approval' : 'release'} of {hold.amount_hbar.toFixed(4)} ℏ?
++                            <button onclick={confirmHoldAction} disabled={holdActionInFlight}>
++                              {holdActionInFlight ? 'Working…' : 'Confirm'}
++                            </button>
++                            <button onclick={cancelHoldAction} disabled={holdActionInFlight}>Cancel</button>
++                          </span>
++                        {:else}
++                          <div class="hold-actions">
++                            <button
++                              onclick={() => requestHoldAction(hold.payment_key, 'approve')}
++                              disabled={!daemonOnline || holdActionInFlight || !!holdPendingAction}
++                            >Approve</button>
++                            <button
++                              onclick={() => requestHoldAction(hold.payment_key, 'release')}
++                              disabled={!daemonOnline || holdActionInFlight || !!holdPendingAction}
++                            >Release</button>
++                          </div>
++                        {/if}
++                      </td>
+                     </tr>
+                   {/each}
+                 </tbody>
+@@ -1416,7 +1898,7 @@
+ 
+           <!-- Allowlist -->
+           <section class="dash-section">
+-            <h2>Allowlist</h2>
++            <h2>Account allowlist <span class="dash-section-sub">(hedera_pay)</span></h2>
+             {#if dashboardErrors.allowlist}
+               <p class="dash-error">⚠ {dashboardErrors.allowlist}</p>
+             {:else if dashboardAllowlist && dashboardAllowlist.length === 0}

@@ -93,10 +93,13 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
 }
 
 /// Run one read-only daemon query on demand (`query_budget`, `query_holds`,
-/// `query_allowlist`, `query_wallet_balance`) for the dashboard panel. Each
-/// call is its own TCP round trip — there is no background polling; the
-/// panel calls this once per query on mount and again whenever the user
-/// hits refresh.
+/// `query_allowlist`, `query_wallet_balance`, `query_payment_history`,
+/// `query_url_allowlist`) for the dashboard/history/settings panels. Every
+/// one of these carries no fields beyond the query name itself, so they all
+/// share this one thin wrapper — `query_url_rate_status` does not, since it
+/// needs a `url` field, and gets its own command below. Each call is its
+/// own TCP round trip — there is no background polling; panels call this
+/// once on mount and again whenever the user hits refresh.
 #[tauri::command]
 async fn dashboard_query(query: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::send_query(&query))
@@ -114,6 +117,51 @@ async fn dashboard_query(query: String) -> Result<Value, String> {
 #[tauri::command]
 async fn mutate_allowlist(action: String, account: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::mutate_allowlist(&action, &account))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Approve a pending hold via the daemon's `approve_hold` TCP endpoint,
+/// converting it into a committed payment. Returns the daemon's response
+/// verbatim — the caller re-queries `query_holds`/`query_payment_history`
+/// afterward rather than trusting this response to update local state.
+#[tauri::command]
+async fn approve_hold(payment_key: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::approve_hold(&payment_key))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Release a pending hold via the daemon's `release_hold` TCP endpoint
+/// without paying it. Same re-query-after pattern as `approve_hold`.
+#[tauri::command]
+async fn release_hold(payment_key: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::release_hold(&payment_key))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Add or remove a URL on the x402 URL allowlist via the daemon's
+/// `mutate_url_allowlist` TCP endpoint. This is a distinct mechanism from
+/// `mutate_allowlist` above (which governs hedera_pay account recipients) —
+/// kept as its own command rather than folded into it so the two never get
+/// conflated on the wire or in the Settings UI. The caller re-queries
+/// `query_url_allowlist` afterward rather than trusting this response to
+/// update local state.
+#[tauri::command]
+async fn mutate_url_allowlist(action: String, url: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::mutate_url_allowlist(&action, &url))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Fetch the current rate-limit status for one URL on the x402 allowlist
+/// via the daemon's `query_url_rate_status` TCP endpoint (e.g. "7/10 this
+/// hour"). Scoped to a single URL, unlike the other dashboard queries, so
+/// it isn't folded into the generic `dashboard_query` command.
+#[tauri::command]
+async fn query_url_rate_status(url: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::query_url_rate_status(&url))
         .await
         .map_err(|e| format!("Block thread error: {e}"))?
 }
@@ -260,6 +308,10 @@ pub fn run() {
             send_direct_task,
             dashboard_query,
             mutate_allowlist,
+            approve_hold,
+            release_hold,
+            mutate_url_allowlist,
+            query_url_rate_status,
             agent::resume_daemon_task,
             create_session,
             save_message,

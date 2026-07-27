@@ -75,18 +75,17 @@ struct DaemonQueryRequest<'a> {
     query: &'a str,
 }
 
-/// Sends a single read-only query and returns the one-line JSON response the
-/// daemon writes back (tagged `{"type": "query_budget" | "query_holds" |
-/// "query_allowlist" | "query_wallet_balance" | "query_error", ...}`).
-/// Unlike `submit_task`, this is a single request/response round trip, not
-/// an event stream — the daemon closes the socket after the one line.
-pub fn send_query(query: &str) -> Result<Value, String> {
+/// Serializes `payload`, sends it as a single line over a fresh TCP
+/// connection, and returns the one-line JSON response. Shared plumbing for
+/// every single-shot query/mutation endpoint below (`send_query`,
+/// `mutate_allowlist`, and everything added since) — the daemon closes the
+/// socket after the one line, so there's nothing to keep alive here.
+fn send_request<T: Serialize>(payload: &T) -> Result<Value, String> {
     let stream = connect_with_retries()?;
     let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
 
-    let request = DaemonQueryRequest { query };
     let request_json =
-        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
+        serde_json::to_string(payload).map_err(|e| format!("Serialization error: {e}"))?;
 
     write_stream
         .write_all(request_json.as_bytes())
@@ -110,11 +109,21 @@ pub fn send_query(query: &str) -> Result<Value, String> {
 
     if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
         let message =
-            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown query error");
+            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown daemon error");
         return Err(message.to_string());
     }
 
     Ok(value)
+}
+
+/// Sends a single read-only query and returns the one-line JSON response the
+/// daemon writes back (tagged `{"type": "query_budget" | "query_holds" |
+/// "query_allowlist" | "query_wallet_balance" | "query_payment_history" |
+/// "query_url_allowlist" | "query_error", ...}`). Unlike `submit_task`, this
+/// is a single request/response round trip, not an event stream — the
+/// daemon closes the socket after the one line.
+pub fn send_query(query: &str) -> Result<Value, String> {
+    send_request(&DaemonQueryRequest { query })
 }
 
 // ── Allowlist Mutation ────────────────────────────────────────────────────────
@@ -137,44 +146,92 @@ struct DaemonMutateRequest<'a> {
 /// `send_query`, this is a single request/response round trip — the daemon
 /// closes the socket after the one line.
 pub fn mutate_allowlist(action: &str, account: &str) -> Result<Value, String> {
-    let stream = connect_with_retries()?;
-    let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
-
-    let request = DaemonMutateRequest {
+    send_request(&DaemonMutateRequest {
         mutate: "mutate_allowlist",
         action,
         account,
-    };
-    let request_json =
-        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
+    })
+}
 
-    write_stream
-        .write_all(request_json.as_bytes())
-        .map_err(|e| format!("Write error: {e}"))?;
-    write_stream
-        .write_all(b"\n")
-        .map_err(|e| format!("Write error: {e}"))?;
+// ── URL Allowlist (x402) ──────────────────────────────────────────────────────
+//
+// Distinct from the account allowlist above: this one governs which URLs
+// x402_pay is allowed to autonomously pay, not which Hedera accounts
+// hedera_pay may send to. Kept as its own request/response shape rather
+// than reusing `DaemonMutateRequest`'s `account` field, since conflating
+// the two wire formats would blur the same distinction the GUI is meant to
+// keep visually explicit.
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| format!("Read error: {e}"))?;
-    let line = line.trim();
-    if line.is_empty() {
-        return Err("Empty response from daemon".to_string());
-    }
+/// The JSON request for the `mutate_url_allowlist` daemon endpoint.
+#[derive(Debug, Serialize)]
+struct UrlAllowlistMutateRequest<'a> {
+    mutate: &'a str,
+    action: &'a str,
+    url: &'a str,
+}
 
-    let value: Value =
-        serde_json::from_str(line).map_err(|e| format!("Parse error on '{line}': {e}"))?;
+/// Sends a single `mutate_url_allowlist` request ("add" or "remove") and
+/// returns the one-line JSON response the daemon writes back (tagged
+/// `{"type": "mutate_url_allowlist", "action", "url", "changed"}` on
+/// success). Same request/response round trip shape as `mutate_allowlist`.
+pub fn mutate_url_allowlist(action: &str, url: &str) -> Result<Value, String> {
+    send_request(&UrlAllowlistMutateRequest {
+        mutate: "mutate_url_allowlist",
+        action,
+        url,
+    })
+}
 
-    if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
-        let message =
-            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown mutation error");
-        return Err(message.to_string());
-    }
+/// The JSON request for the `query_url_rate_status` daemon endpoint —
+/// unlike the other read-only queries, this one is scoped to a single URL
+/// rather than returning the whole allowlist, so it carries a `url` field
+/// alongside `query`.
+#[derive(Debug, Serialize)]
+struct UrlRateStatusRequest<'a> {
+    query: &'a str,
+    url: &'a str,
+}
 
-    Ok(value)
+/// Sends a `query_url_rate_status` request for one URL and returns the
+/// one-line JSON response (tagged `{"type": "query_url_rate_status", "url",
+/// ...}`, expected to carry the URL's current request count against its
+/// rate-limit window). Called once per listed URL from the Settings panel.
+pub fn query_url_rate_status(url: &str) -> Result<Value, String> {
+    send_request(&UrlRateStatusRequest {
+        query: "query_url_rate_status",
+        url,
+    })
+}
+
+// ── Hold Mutations (release_hold / approve_hold) ──────────────────────────────
+
+/// The JSON request for the `release_hold` / `approve_hold` daemon
+/// endpoints. Both act on a single outstanding hold, identified the same
+/// way `query_holds` identifies one in its response — by `payment_key`.
+#[derive(Debug, Serialize)]
+struct HoldMutateRequest<'a> {
+    mutate: &'a str,
+    payment_key: &'a str,
+}
+
+/// Approves a pending hold, releasing it into a committed payment. Returns
+/// the daemon's response verbatim; the caller re-queries `query_holds` (and
+/// `query_payment_history`) afterward rather than trusting this response to
+/// update local state.
+pub fn approve_hold(payment_key: &str) -> Result<Value, String> {
+    send_request(&HoldMutateRequest {
+        mutate: "approve_hold",
+        payment_key,
+    })
+}
+
+/// Releases a pending hold without paying it — the funds return to
+/// available budget. Same re-query-after pattern as `approve_hold`.
+pub fn release_hold(payment_key: &str) -> Result<Value, String> {
+    send_request(&HoldMutateRequest {
+        mutate: "release_hold",
+        payment_key,
+    })
 }
 
 // ── Task Submission ───────────────────────────────────────────────────────────

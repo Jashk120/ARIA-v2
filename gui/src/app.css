@@ -351,3 +351,144 @@ textarea {
   color: goldenrod;
   margin-bottom: 0.5rem;
 }
+
+/* ── Dashboard holds — Approve/Release (confirm-before-act) ────────────── */
+
+.hold-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.hold-confirm {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+}
+
+/* ── Settings: two distinct allowlists ──────────────────────────────────── */
+
+.settings-mechanism-note {
+  opacity: 0.8;
+  font-size: 0.85rem;
+  margin-bottom: 1.25rem;
+}
+
+.dash-section-sub {
+  font-weight: normal;
+  opacity: 0.7;
+  font-size: 0.85rem;
+}
+
+.settings-section-account,
+.settings-section-url {
+  border: 1px solid;
+  padding: 1rem;
+}
+
+.settings-section-account {
+  margin-bottom: 1.5rem;
+}
+
+.settings-url {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.settings-rate-status {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.settings-rate-status-error {
+  color: crimson;
+  opacity: 1;
+}
+
+/* ── History tab: payment trail + HCS decision trail ────────────────────── */
+
+.history-panel {
+  padding: 1rem;
+  overflow-y: auto;
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.history-column {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-column h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.history-payments-table th,
+.history-payments-table td {
+  vertical-align: top;
+}
+
+.history-txid {
+  overflow-wrap: anywhere;
+}
+
+.history-payment-type {
+  font-weight: bold;
+  font-size: 0.85rem;
+}
+
+.history-badge {
+  font-size: 0.8rem;
+  font-weight: bold;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid;
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.history-badge-verified {
+  border-color: seagreen;
+  color: seagreen;
+}
+
+.history-badge-unverified {
+  border-color: crimson;
+  color: crimson;
+}
+
+.history-hcs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.history-hcs-item {
+  border-bottom: 1px solid;
+  padding: 0.6rem 0;
+}
+
+.history-hcs-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.8rem;
+  opacity: 0.75;
+  margin-bottom: 0.35rem;
+}
+
+.history-hcs-record {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+@media (max-width: 900px) {
+  .history-panel {
+    flex-direction: column;
+  }
+}

@@ -39,12 +39,125 @@ use crate::skills::SkillManager;
 
 #[derive(serde::Deserialize)]
 struct DaemonRequest {
+    #[serde(default)]
     task: String,
     #[serde(rename = "Type")]
     skills_type: Option<String>,
     /// If set and the task is awaiting confirmation, resume it with `task`
     /// treated as the human's yes/no reply instead of a new instruction.
     task_id: Option<String>,
+    /// Read-only daemon query, short-circuited before any task/ReAct-loop
+    /// dispatch: "query_budget", "query_holds", "query_allowlist", or
+    /// "query_wallet_balance". When set, `task` is ignored.
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Response envelope for the read-only query endpoints. Mirrors the
+/// internally-tagged `{"type": ..., ...}` shape `AgentEvent` already uses on
+/// this socket, so clients parse both response families the same way.
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum QueryResponse {
+    QueryBudget {
+        agent_did: String,
+        per_task_cap: Option<f64>,
+        per_day_cap: Option<f64>,
+        committed_spend_24h: f64,
+        held_spend: f64,
+        /// None when there's no per-day cap configured (i.e. unlimited).
+        remaining_budget: Option<f64>,
+    },
+    QueryHolds {
+        agent_did: String,
+        holds: Vec<crate::db::PaymentHoldRecord>,
+    },
+    QueryAllowlist {
+        agent_did: String,
+        accounts: Vec<String>,
+    },
+    QueryWalletBalance {
+        agent_did: String,
+        account_id: String,
+        balance_hbar: f64,
+    },
+    QueryError {
+        message: String,
+    },
+}
+
+/// Handles the four read-only TCP query endpoints. Never touches
+/// `react_loop.rs` and never creates a task — answers straight from existing
+/// state (db + governance config), or, for the wallet balance, a live
+/// Hedera network read.
+async fn handle_query(
+    query: &str,
+    agent_did: &str,
+    db: &Db,
+    runtime_cfg: &RuntimeConfig,
+    payment_vault: Option<&crate::payments::direct::PaymentVault>,
+    x402_vault: Option<&crate::payments::x402_vault::X402PaymentVault>,
+) -> QueryResponse {
+    match query {
+        "query_budget" => {
+            let governance = &runtime_cfg.governance;
+            // Same two queries try_reserve_spend already uses — reused
+            // directly rather than re-deriving the SQL here.
+            let committed_spend_24h = db.get_daily_committed_spend(agent_did).unwrap_or(0.0);
+            let held_spend = db.get_daily_held_spend(agent_did).unwrap_or(0.0);
+            let remaining_budget =
+                governance.per_day_cap.map(|cap| cap - committed_spend_24h - held_spend);
+
+            QueryResponse::QueryBudget {
+                agent_did: agent_did.to_string(),
+                per_task_cap: governance.per_task_cap,
+                per_day_cap: governance.per_day_cap,
+                committed_spend_24h,
+                held_spend,
+                remaining_budget,
+            }
+        }
+        "query_holds" => match db.list_payment_holds(agent_did) {
+            Ok(holds) => QueryResponse::QueryHolds { agent_did: agent_did.to_string(), holds },
+            Err(e) => QueryResponse::QueryError { message: format!("failed to load holds: {}", e) },
+        },
+        "query_allowlist" => match db.list_allowlist(agent_did) {
+            Ok(accounts) => {
+                QueryResponse::QueryAllowlist { agent_did: agent_did.to_string(), accounts }
+            }
+            Err(e) => {
+                QueryResponse::QueryError { message: format!("failed to load allowlist: {}", e) }
+            }
+        },
+        "query_wallet_balance" => {
+            use hiero_sdk::AccountBalanceQuery;
+
+            let (client, account_id) = if let Some(pv) = payment_vault {
+                (pv.client(), pv.account_id())
+            } else if let Some(xv) = x402_vault {
+                (xv.client(), xv.account_id())
+            } else {
+                return QueryResponse::QueryError {
+                    message: "no payment vault configured (HEDERA_ACCOUNT_ID / HEDERA_PRIVATE_KEY unset)"
+                        .to_string(),
+                };
+            };
+
+            // Live read against Hedera on every call — intentionally not
+            // cached here.
+            match AccountBalanceQuery::new().account_id(account_id).execute(&client).await {
+                Ok(balance) => QueryResponse::QueryWalletBalance {
+                    agent_did: agent_did.to_string(),
+                    account_id: account_id.to_string(),
+                    balance_hbar: balance.hbars.to_tinybars() as f64 / 100_000_000.0,
+                },
+                Err(e) => {
+                    QueryResponse::QueryError { message: format!("balance query failed: {}", e) }
+                }
+            }
+        }
+        other => QueryResponse::QueryError { message: format!("unknown query type: {}", other) },
+    }
 }
 
 fn print_help() {
@@ -262,6 +375,22 @@ async fn run_daemon() -> anyhow::Result<()> {
                             return;
                         }
                     };
+
+                    if let Some(query_kind) = req.query.as_deref() {
+                        let agent_did = vault.did();
+                        let response = handle_query(
+                            query_kind,
+                            &agent_did,
+                            &db,
+                            &runtime_cfg,
+                            payment_vault.as_deref(),
+                            x402_vault.as_deref(),
+                        )
+                        .await;
+                        let json = serde_json::to_string(&response).unwrap_or_default();
+                        let _ = socket.write_all(format!("{}\n", json).as_bytes()).await;
+                        return;
+                    }
 
                     info!("Received task: {}", req.task);
 

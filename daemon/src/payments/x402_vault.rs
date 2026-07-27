@@ -39,6 +39,11 @@ impl X402PaymentVault {
         self.client.clone()
     }
 
+    /// The operator account this vault pays from / holds balance in.
+    pub fn account_id(&self) -> AccountId {
+        self.operator_id
+    }
+
     pub fn new(
         client: Client,
         operator_id: AccountId,

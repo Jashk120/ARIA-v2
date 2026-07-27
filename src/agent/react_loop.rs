@@ -618,7 +618,7 @@ pub async fn run_react_loop(
 
                         // Check 1c: Approval Tier (curb.approval-tier)
                         let auto_approved = match governance.auto_under {
-                            Some(threshold) if amount_hbar < threshold => true,
+                            Some(threshold) if amount_hbar <= threshold => true,
                             _ => false,
                         };
 
@@ -1270,25 +1270,31 @@ mod tests {
     #[test]
     fn auto_under_match_logic_behaves_safely() {
         let auto_under_none: Option<f64> = None;
-        let auto_under_some: Option<f64> = Some(10.0);
+        let auto_under_some: Option<f64> = Some(2.0);
 
         let is_auto_none = match auto_under_none {
-            Some(threshold) if 5.0 < threshold => true,
+            Some(threshold) if 1.0 <= threshold => true,
             _ => false,
         };
-        assert!(!is_auto_none, "None auto_under must require confirmation");
+        assert!(!is_auto_none, "None auto_under must require confirmation for all amounts");
 
         let is_auto_below = match auto_under_some {
-            Some(threshold) if 5.0 < threshold => true,
+            Some(threshold) if 1.0 <= threshold => true,
             _ => false,
         };
-        assert!(is_auto_below, "Amount below threshold must auto-approve");
+        assert!(is_auto_below, "Amount below AUTO_UNDER threshold must auto-approve");
+
+        let is_auto_equal = match auto_under_some {
+            Some(threshold) if 2.0 <= threshold => true,
+            _ => false,
+        };
+        assert!(is_auto_equal, "Amount equal to AUTO_UNDER threshold must auto-approve");
 
         let is_auto_above = match auto_under_some {
-            Some(threshold) if 15.0 < threshold => true,
+            Some(threshold) if 5.0 <= threshold => true,
             _ => false,
         };
-        assert!(!is_auto_above, "Amount above threshold must require confirmation");
+        assert!(!is_auto_above, "Amount above AUTO_UNDER threshold must require human confirmation");
     }
 }
 

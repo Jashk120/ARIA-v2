@@ -65,6 +65,21 @@
   /** @type {Record<string, string>} */
   let dashboardErrors = $state({});
   let dashboardLoadedOnce = $state(false);
+
+  // ── Settings (allowlist mutation) ────────────────────────────────────────
+  let settingsAllowlist = /** @type {string[] | null} */ ($state(null));
+  let settingsLoading = $state(false);
+  let settingsLoadedOnce = $state(false);
+  let settingsLoadError = /** @type {string | null} */ ($state(null));
+  let settingsNewAccount = $state('');
+  /** True while an add/remove round trip is in flight — disables the whole
+   * panel so a second mutation can't race the re-query of the first. */
+  let settingsMutating = $state(false);
+  let settingsMutateError = /** @type {string | null} */ ($state(null));
+  /** Brief confirmation of the last successful mutation, e.g. "Added
+   * 0.0.1234" or "0.0.1234 was already on the allowlist". */
+  let settingsMutateNotice = /** @type {string | null} */ ($state(null));
+
   let activeDaemonSkillType = /** @type {string | null} */ ($state(null));
   let msgId = 0;
   /** Groups every event of the in-flight delegated task under one id so it
@@ -512,6 +527,80 @@
     dashboardLoading = false;
   }
 
+  // ── Settings (allowlist mutation) ────────────────────────────────────────
+
+  /**
+   * Loads the allowlist fresh from the daemon. Called on first Settings-tab
+   * open, on manual refresh, and after every successful add/remove — this
+   * is the one and only place `settingsAllowlist` is assigned, so the view
+   * always reflects a real re-query rather than an optimistic local edit.
+   */
+  async function loadSettingsAllowlist() {
+    if (settingsLoading) return;
+    settingsLoading = true;
+    settingsLoadedOnce = true;
+    settingsLoadError = null;
+
+    try {
+      const result = /** @type {any} */ (await invoke('dashboard_query', { query: 'query_allowlist' }));
+      settingsAllowlist = result?.accounts ?? [];
+      // Keep the read-only Dashboard copy in sync too, if it's already loaded,
+      // so the two views don't disagree until its own next manual refresh.
+      if (dashboardLoadedOnce) dashboardAllowlist = settingsAllowlist;
+    } catch (e) {
+      settingsLoadError = String(e);
+    } finally {
+      settingsLoading = false;
+    }
+  }
+
+  async function addAllowlistAccount() {
+    const account = settingsNewAccount.trim();
+    if (!account || settingsMutating || !daemonOnline) return;
+
+    settingsMutating = true;
+    settingsMutateError = null;
+    settingsMutateNotice = null;
+
+    try {
+      const result = /** @type {any} */ (await invoke('mutate_allowlist', { action: 'add', account }));
+      settingsMutateNotice = result?.changed
+        ? `Added ${account} to the allowlist.`
+        : `${account} was already on the allowlist.`;
+      settingsNewAccount = '';
+      // Re-query rather than push the new entry into settingsAllowlist
+      // locally — confirms the daemon's own view, not our assumption of it.
+      await loadSettingsAllowlist();
+    } catch (e) {
+      settingsMutateError = String(e);
+    } finally {
+      settingsMutating = false;
+    }
+  }
+
+  /** @param {string} account */
+  async function removeAllowlistAccount(account) {
+    if (settingsMutating || !daemonOnline) return;
+
+    settingsMutating = true;
+    settingsMutateError = null;
+    settingsMutateNotice = null;
+
+    try {
+      const result = /** @type {any} */ (await invoke('mutate_allowlist', { action: 'remove', account }));
+      settingsMutateNotice = result?.changed
+        ? `Removed ${account} from the allowlist.`
+        : `${account} was not on the allowlist.`;
+      // Re-query rather than filter it out of settingsAllowlist locally —
+      // same reasoning as addAllowlistAccount above.
+      await loadSettingsAllowlist();
+    } catch (e) {
+      settingsMutateError = String(e);
+    } finally {
+      settingsMutating = false;
+    }
+  }
+
   // ── Direct TCP Task ────────────────────────────────────────────────────────
 
   /** @param {any} event */
@@ -668,6 +757,75 @@
     return labels[type] ?? type;
   }
 
+  // ── Payment event classification (policy-blocked / pending / auto-approved) ──
+  //
+  // Three distinct outcomes can show up in a daemon block's event log:
+  //   - Policy-blocked: rejected by allowlist/cap/rate-limit before a human
+  //     was ever asked. Terminal — no approve path, nothing to do.
+  //   - Pending approval: the existing `ask` (kind: payment) yes/no flow,
+  //     rendered by the branch above this comment.
+  //   - Auto-approved: executed with zero `ask` event (below the
+  //     curb.approval-tier threshold, or the x402 path, which never asks a
+  //     human at all). Informational only — surfaced here so it's visible
+  //     that money moved even though nothing was asked.
+
+  /** @param {string | undefined} skill */
+  function isPaymentSkill(skill) {
+    // Bundled payment skills are named "<verb>.pay" (transfer.pay, x402.pay);
+    // query.pay is read-only (balance/history) and never moves money.
+    return typeof skill === 'string' && skill.endsWith('.pay') && skill !== 'query.pay';
+  }
+
+  /** @param {string | undefined} content */
+  function isPolicyBlockedError(content) {
+    // react_loop.rs emits this exact prefix for every proposal-time
+    // governance rejection (curb.allowlist / curb.spend-limit) on the
+    // hedera_pay path — the one payment path where the daemon does
+    // return a specific reason to the client.
+    return typeof content === 'string' && content.startsWith('Payment blocked by policy');
+  }
+
+  /** @param {string | undefined} content */
+  function isOpaqueSkillFailure(content) {
+    // Every skill-execution failure (wasm_runtime.rs run_wasm_instance_async)
+    // surfaces as an `observation` (not `error`) whose content is literally
+    // "Skill error: <guest message>". For pay.x402, the guest's own message
+    // for every host-side rejection — policy block, rate limit, or a real
+    // payment failure — is the same generic "host call failed" string
+    // (see skills/pay/x402.pay/src/lib.rs::read_packed and
+    // wasm_runtime.rs::wire_x402_pay, which only eprintln!s the real reason
+    // server-side). There is no structured signal here to tell those apart,
+    // so this helper only detects "something failed", not why.
+    return typeof content === 'string' && content.startsWith('Skill error:');
+  }
+
+  /**
+   * Walks backward from `index` to find the nearest preceding `action`
+   * event and reports whether it called a payment skill — used to decide
+   * whether an opaque failure observation belongs to a payment attempt.
+   * @param {DaemonLogEvent[]} events
+   * @param {number} index
+   */
+  function precedingActionIsPaymentSkill(events, index) {
+    for (let i = index - 1; i >= 0; i--) {
+      if (events[i].event_type === 'action') return isPaymentSkill(events[i].payload?.skill);
+      if (events[i].event_type === 'ask') return false; // a resolved ask already accounts for this
+    }
+    return false;
+  }
+
+  /**
+   * An `action` event for a payment skill counts as auto-approved when it
+   * wasn't immediately preceded by an `ask` — i.e. nothing paused for human
+   * confirmation before this payment fired.
+   * @param {DaemonLogEvent[]} events
+   * @param {number} index
+   */
+  function isAutoApprovedPaymentAction(events, index) {
+    const prev = index > 0 ? events[index - 1] : undefined;
+    return prev?.event_type !== 'ask';
+  }
+
   /**
    * Human-readable outcome for a resolved ask/payment confirmation, so an
    * answered box shows a clear accepted/declined/replied status instead of
@@ -719,6 +877,10 @@
         class:active={activeTab === 'dashboard'}
         onclick={() => { activeTab = 'dashboard'; if (!dashboardLoadedOnce) loadDashboard(); }}
       >Dashboard</button>
+      <button
+        class:active={activeTab === 'settings'}
+        onclick={() => { activeTab = 'settings'; if (!settingsLoadedOnce) loadSettingsAllowlist(); }}
+      >Settings</button>
     </div>
 
     {#if activeTab === 'chat'}
@@ -821,12 +983,41 @@
               </div>
               {#if (msg.daemonEvents?.length ?? 0) > 0}
                 <div class="daemon-log">
-                  {#each msg.daemonEvents ?? [] as ev}
-                    {#if ev.event_type === 'ask'}
+                  {#each msg.daemonEvents ?? [] as ev, evIndex}
+                    {#if ev.event_type === 'error' && isPolicyBlockedError(ev.payload?.content)}
+                      <!-- Outcome 1: policy-blocked. Rejected by allowlist/cap/rate-limit
+                           before a human was ever asked — terminal, no approve path. -->
+                      <div class="payment-outcome-card payment-blocked-card">
+                        <span class="payment-outcome-badge">⛔ Policy-blocked</span>
+                        <pre>{ev.payload?.content}</pre>
+                        <p class="payment-outcome-note">Rejected automatically — there is nothing to approve.</p>
+                      </div>
+                    {:else if ev.event_type === 'observation' && isOpaqueSkillFailure(ev.payload?.content) && precedingActionIsPaymentSkill(msg.daemonEvents ?? [], evIndex)}
+                      <!-- Same terminal outcome, but from a payment path (x402) where the
+                           daemon doesn't expose *why* it failed — flagged as a gap rather
+                           than guessing a reason (could be a policy block, rate limit, or a
+                           genuine payment failure; all look identical today). -->
+                      <div class="payment-outcome-card payment-blocked-card">
+                        <span class="payment-outcome-badge">⛔ Payment failed or blocked</span>
+                        <pre>{ev.payload?.content}</pre>
+                        <p class="payment-outcome-note">The daemon doesn't report a specific reason for this payment path — it may be a policy block, a rate limit, or an execution failure. (Known gap — see Known_Issues.md.)</p>
+                      </div>
+                    {:else if ev.event_type === 'action' && isPaymentSkill(ev.payload?.skill) && isAutoApprovedPaymentAction(msg.daemonEvents ?? [], evIndex)}
+                      <!-- Outcome 3: auto-approved. Executed with zero `ask` event — informational
+                           only, so it's still visible that a payment happened. -->
+                      <div class="payment-outcome-card payment-autoapproved-card">
+                        <span class="payment-outcome-badge">✓ Auto-approved payment</span>
+                        <span class="log-content">{ev.payload.skill}{ev.payload.args ? ' — ' + JSON.stringify(ev.payload.args) : ''}</span>
+                        <p class="payment-outcome-note">Executed without asking — under the auto-approval threshold, or an autonomous payment path (x402).</p>
+                      </div>
+                    {:else if ev.event_type === 'ask'}
                       <!-- Lives in the same event log as everything else so it stays
                            in exact chronological order with events streamed before
                            and after it — whether live or reconstructed on reload. -->
                       <div class="payment-confirmation log-ask-card" class:resolved={ev.resolved}>
+                        {#if ev.payload?.kind === 'payment' && !ev.resolved}
+                          <span class="payment-outcome-badge payment-outcome-badge-pending">⏳ Pending approval</span>
+                        {/if}
                         <pre>{ev.payload?.content}</pre>
                         {#if ev.resolved}
                           <div class="confirmation-status {confirmationStatus(ev.payload?.kind, ev.reply).cls}">
@@ -1052,6 +1243,80 @@
             {/each}
           {/if}
         </div>
+      </div>
+    </section>
+  {:else if activeTab === 'settings'}
+    <section class="chat-panel">
+      <header class="top-bar">
+        <div>
+          <span>Settings</span>
+        </div>
+        <div class="top-bar-right">
+          <button onclick={loadSettingsAllowlist} disabled={!daemonOnline || settingsLoading || settingsMutating}>
+            {settingsLoading ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+        </div>
+      </header>
+
+      <div class="dashboard-panel">
+        {#if !daemonOnline}
+          <p>Daemon offline. Start the daemon to manage the allowlist.</p>
+        {:else}
+          <section class="dash-section">
+            <h2>Payment allowlist</h2>
+            <p class="dash-caps-note">
+              Only accounts listed here can receive payments the agent initiates. This is the
+              only place in the GUI that mutates daemon state — every add/remove goes straight
+              to the daemon and the list below is always re-fetched from it afterward, never
+              guessed locally.
+            </p>
+
+            <form
+              class="settings-add-form"
+              onsubmit={(e) => { e.preventDefault(); addAllowlistAccount(); }}
+            >
+              <input
+                type="text"
+                bind:value={settingsNewAccount}
+                placeholder="0.0.12345"
+                disabled={settingsMutating}
+                aria-label="Account to add"
+              />
+              <button type="submit" disabled={settingsMutating || !settingsNewAccount.trim()}>
+                {settingsMutating ? 'Working…' : 'Add'}
+              </button>
+            </form>
+
+            {#if settingsMutateError}
+              <p class="dash-error">⚠ {settingsMutateError}</p>
+            {/if}
+            {#if settingsMutateNotice}
+              <p class="settings-notice">{settingsMutateNotice}</p>
+            {/if}
+
+            {#if settingsLoadError}
+              <p class="dash-error">⚠ {settingsLoadError}</p>
+            {:else if !settingsLoadedOnce || settingsLoading}
+              <p>Loading…</p>
+            {:else if settingsAllowlist && settingsAllowlist.length === 0}
+              <p>No allowlisted accounts.</p>
+            {:else if settingsAllowlist}
+              <ul class="settings-allowlist">
+                {#each settingsAllowlist as account (account)}
+                  <li>
+                    <span class="settings-account">{account}</span>
+                    <button
+                      class="settings-remove-btn"
+                      onclick={() => removeAllowlistAccount(account)}
+                      disabled={settingsMutating}
+                      aria-label={`Remove ${account}`}
+                    >Remove</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </section>
+        {/if}
       </div>
     </section>
   {:else}

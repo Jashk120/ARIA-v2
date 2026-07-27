@@ -104,6 +104,20 @@ async fn dashboard_query(query: String) -> Result<Value, String> {
         .map_err(|e| format!("Block thread error: {e}"))?
 }
 
+/// Add or remove an account on the payment allowlist via the daemon's
+/// `mutate_allowlist` TCP endpoint. Returns the daemon's response verbatim
+/// (`{ agent_did, action, account, changed }`) so the caller can tell a
+/// real change from a no-op (e.g. adding an already-present account).
+/// The Settings panel re-queries `query_allowlist` after this succeeds
+/// rather than trusting this response to update its list — this call only
+/// reports what the mutation itself did.
+#[tauri::command]
+async fn mutate_allowlist(action: String, account: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::mutate_allowlist(&action, &account))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
 /// Ensure a session exists in the DB (idempotent – safe to call every load).
 #[tauri::command]
 async fn create_session(
@@ -245,6 +259,7 @@ pub fn run() {
             send_message,
             send_direct_task,
             dashboard_query,
+            mutate_allowlist,
             agent::resume_daemon_task,
             create_session,
             save_message,

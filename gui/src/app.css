@@ -259,3 +259,95 @@ textarea {
 .dash-error {
   color: crimson;
 }
+
+/* ── Settings panel (allowlist add/remove) ─────────────────────────────── */
+
+.settings-add-form {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0 1rem;
+}
+
+.settings-add-form input {
+  flex: 1;
+}
+
+.settings-notice {
+  color: seagreen;
+}
+
+.settings-allowlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.settings-allowlist li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid;
+}
+
+.settings-account {
+  overflow-wrap: anywhere;
+}
+
+.settings-remove-btn {
+  flex-shrink: 0;
+}
+
+/* ── Payment-outcome states (blocked / pending / auto-approved) ────────── */
+
+.payment-outcome-card {
+  border: 1px solid;
+  padding: 1rem;
+  margin: 0.5rem 0;
+  max-width: 48rem;
+}
+
+.payment-outcome-card pre {
+  margin: 0.5rem 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.payment-outcome-badge {
+  font-weight: bold;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid;
+  display: inline-block;
+}
+
+.payment-outcome-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+.payment-blocked-card {
+  border-color: crimson;
+}
+
+.payment-blocked-card .payment-outcome-badge {
+  border-color: crimson;
+  color: crimson;
+}
+
+.payment-autoapproved-card {
+  border-color: seagreen;
+}
+
+.payment-autoapproved-card .payment-outcome-badge {
+  border-color: seagreen;
+  color: seagreen;
+}
+
+.payment-outcome-badge-pending {
+  border-color: goldenrod;
+  color: goldenrod;
+  margin-bottom: 0.5rem;
+}

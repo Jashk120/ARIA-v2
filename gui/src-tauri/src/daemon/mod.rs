@@ -117,7 +117,68 @@ pub fn send_query(query: &str) -> Result<Value, String> {
     Ok(value)
 }
 
+// ── Allowlist Mutation ────────────────────────────────────────────────────────
+
+/// The JSON request for the `mutate_allowlist` daemon endpoint. Distinct from
+/// `DaemonQueryRequest` since this carries `mutate`/`action`/`account` instead
+/// of `query` — the daemon short-circuits on the presence of `mutate` the
+/// same way it does for `query`, before touching the ReAct loop.
+#[derive(Debug, Serialize)]
+struct DaemonMutateRequest<'a> {
+    mutate: &'a str,
+    action: &'a str,
+    account: &'a str,
+}
+
+/// Sends a single `mutate_allowlist` request ("add" or "remove") and returns
+/// the one-line JSON response the daemon writes back (tagged
+/// `{"type": "mutate_allowlist", "action", "account", "changed"}` on
+/// success, or `{"type": "query_error", "message"}` on failure). Like
+/// `send_query`, this is a single request/response round trip — the daemon
+/// closes the socket after the one line.
+pub fn mutate_allowlist(action: &str, account: &str) -> Result<Value, String> {
+    let stream = connect_with_retries()?;
+    let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
+
+    let request = DaemonMutateRequest {
+        mutate: "mutate_allowlist",
+        action,
+        account,
+    };
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
+
+    write_stream
+        .write_all(request_json.as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    write_stream
+        .write_all(b"\n")
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read error: {e}"))?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Err("Empty response from daemon".to_string());
+    }
+
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| format!("Parse error on '{line}': {e}"))?;
+
+    if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
+        let message =
+            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown mutation error");
+        return Err(message.to_string());
+    }
+
+    Ok(value)
+}
+
 // ── Task Submission ───────────────────────────────────────────────────────────
+
 
 /// Connect to the daemon, submit a task, and iterate over the event stream.
 /// Calls `on_event` for every `DaemonEvent` received until a `done` or `error` event.

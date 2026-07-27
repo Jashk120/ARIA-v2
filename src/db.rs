@@ -171,6 +171,15 @@ pub struct PaymentRecord {
     pub timestamp: String,
 }
 
+/// A single raw row from `payment_holds`. No approved/denied interpretation —
+/// that state doesn't exist (see `commit_spend_hold`/`release_spend_hold`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaymentHoldRecord {
+    pub payment_key: String,
+    pub amount_hbar: f64,
+    pub timestamp: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskSession {
     pub status: String,
@@ -710,6 +719,28 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(sum)
+    }
+
+    /// Raw list of every current hold for `agent_did` — payment_key, amount,
+    /// timestamp. No interpretation beyond that; approved/denied isn't a
+    /// concept `payment_holds` tracks.
+    pub fn list_payment_holds(&self, agent_did: &str) -> anyhow::Result<Vec<PaymentHoldRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT payment_key, amount_hbar, timestamp FROM payment_holds WHERE agent_did = ? ORDER BY timestamp",
+        )?;
+        let rows = stmt.query_map(params![agent_did], |row| {
+            Ok(PaymentHoldRecord {
+                payment_key: row.get(0)?,
+                amount_hbar: row.get(1)?,
+                timestamp: row.get(2)?,
+            })
+        })?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
     }
 
     pub fn try_reserve_spend(

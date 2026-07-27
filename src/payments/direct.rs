@@ -28,6 +28,11 @@ impl PaymentVault {
         self.client.clone()
     }
 
+    /// The operator account this vault pays from / holds balance in.
+    pub fn account_id(&self) -> AccountId {
+        self.operator_id
+    }
+
     /// Non-fatal variant of `from_env`: returns `None` (with a log line) when
     /// Hedera credentials aren't configured, instead of erroring out. Use this
     /// at daemon startup so direct HBAR payments being unconfigured doesn't

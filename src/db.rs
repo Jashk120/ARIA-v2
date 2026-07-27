@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS payment_holds (
     payment_key     TEXT UNIQUE NOT NULL,
     amount_hbar     REAL NOT NULL,
     timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Rate-limiting log for the x402 autonomous payment path (no human confirm/deny
+-- step exists there). One row per payment ATTEMPT to a given pay_to, regardless
+-- of whether that attempt was ultimately allowed or blocked by allowlist/cap
+-- checks — so a blocked spam loop is still itself rate-limited.
+CREATE TABLE IF NOT EXISTS payment_rate_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_did       TEXT NOT NULL,
+    pay_to          TEXT NOT NULL,
+    timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
 )";
 
 pub struct Db {
@@ -756,6 +767,31 @@ impl Db {
         self.release_spend_hold(agent_did, payment_key)
     }
 
+    /// Records a single x402 payment ATTEMPT to `pay_to`, independent of whether
+    /// the attempt is (or will be) allowed or blocked by allowlist/cap checks.
+    /// Called unconditionally so a blocked spam loop still counts toward its own
+    /// rate limit.
+    pub fn log_x402_payment_attempt(&self, agent_did: &str, pay_to: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO payment_rate_log (agent_did, pay_to) VALUES (?, ?)",
+            params![agent_did, pay_to],
+        )?;
+        Ok(())
+    }
+
+    /// Rolling 1-hour count of x402 payment attempts from `agent_did` to `pay_to`.
+    pub fn count_recent_x402_attempts(&self, agent_did: &str, pay_to: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM payment_rate_log \
+             WHERE agent_did = ? AND pay_to = ? AND timestamp >= datetime('now', '-1 hour')",
+            params![agent_did, pay_to],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Called once on daemon startup. Removes holds that are leftover from a crash that
     /// occurred between a successful payment (which wrote to `payments`) and the hold
     /// release. Matches by agent_did + amount_hbar within a 48-hour window (generous
@@ -1001,6 +1037,136 @@ mod tests {
         let cleaned = db.reconcile_stale_holds()?;
         assert_eq!(cleaned, 1, "exactly one stale hold should be cleaned up");
         assert_eq!(db.get_daily_held_spend(agent)?, 0.0, "hold gone after reconcile");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    // ── x402 autonomous-path governance checks ──────────────────────────────
+    // These exercise the exact db calls wire_x402_pay (wasm_runtime.rs) makes,
+    // since that path never asks a human and runs the whole allowlist/cap/
+    // rate-limit sequence inline against these same functions.
+
+    /// After 10 attempts to the same pay_to within the rolling hour, the 11th
+    /// attempt's rate-limit check must report a count > 10 (the block threshold
+    /// wire_x402_pay uses).
+    #[test]
+    fn test_x402_rate_limit_blocks_after_10_attempts_per_hour() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pay_to = "0.0.4321";
+
+        // 10 attempts within the last hour — none of these should trip the
+        // "> 10" block threshold.
+        for _ in 0..10 {
+            db.log_x402_payment_attempt(agent, pay_to)?;
+            let count = db.count_recent_x402_attempts(agent, pay_to)?;
+            assert!(count <= 10, "count {} should not exceed 10 yet", count);
+        }
+
+        // The 11th attempt pushes the count over the threshold.
+        db.log_x402_payment_attempt(agent, pay_to)?;
+        let count = db.count_recent_x402_attempts(agent, pay_to)?;
+        assert_eq!(count, 11);
+        assert!(count > 10, "11th attempt must trip the rate limit block");
+
+        // A different pay_to is unaffected — rate limiting is per (agent, pay_to).
+        let other_pay_to = "0.0.9999";
+        let other_count = db.count_recent_x402_attempts(agent, other_pay_to)?;
+        assert_eq!(other_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Mirrors wire_x402_pay's allowlist check: a pay_to that was never added to
+    /// the allowlist must be blocked, and adding it must unblock it.
+    #[test]
+    fn test_x402_allowlist_blocks_unlisted_account() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pay_to = "0.0.5555";
+
+        assert!(
+            !db.is_account_allowlisted(agent, pay_to)?,
+            "an unlisted pay_to must be blocked"
+        );
+
+        db.add_allowlist_entry(agent, pay_to)?;
+        assert!(
+            db.is_account_allowlisted(agent, pay_to)?,
+            "allowlisting the account must unblock it"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Mirrors wire_x402_pay's per-day cap check via try_reserve_spend: an x402
+    /// payment that would push the rolling 24h total over the cap must be blocked.
+    #[test]
+    fn test_x402_per_day_cap_blocks() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pay_to = "0.0.7777";
+        let per_day_cap = Some(10.0);
+
+        let pkey1 = crate::payments::governance::compute_payment_key(agent, pay_to, 8.0);
+        let reserved1 = db.try_reserve_spend(agent, &pkey1, 8.0, per_day_cap)?;
+        assert!(reserved1, "8.0 HBAR against a 10.0 cap should be reserved");
+
+        // A second x402 payment of 5.0 (8.0 held + 5.0 new > 10.0 cap) must be blocked.
+        let pkey2 = crate::payments::governance::compute_payment_key(agent, pay_to, 5.0);
+        let reserved2 = db.try_reserve_spend(agent, &pkey2, 5.0, per_day_cap)?;
+        assert!(!reserved2, "payment exceeding the per-day cap must be blocked");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Confirms the ordering wire_x402_pay relies on: the rate-limit log row is
+    /// written before the allow/block decision, so an attempt that ends up
+    /// blocked (e.g. by the allowlist) still counts toward the rate limit —
+    /// otherwise a blocked spam loop would never itself get rate-limited.
+    #[test]
+    fn test_x402_blocked_attempt_still_counts_toward_rate_limit() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pay_to = "0.0.6666"; // never allowlisted — every attempt is blocked
+
+        for _ in 0..3 {
+            // wire_x402_pay logs the attempt unconditionally, then checks the
+            // allowlist; here the allowlist check fails every time.
+            db.log_x402_payment_attempt(agent, pay_to)?;
+            assert!(!db.is_account_allowlisted(agent, pay_to)?);
+        }
+
+        let count = db.count_recent_x402_attempts(agent, pay_to)?;
+        assert_eq!(count, 3, "blocked attempts must still be counted toward the rate limit");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())

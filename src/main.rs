@@ -47,19 +47,23 @@ struct DaemonRequest {
     /// treated as the human's yes/no reply instead of a new instruction.
     task_id: Option<String>,
     /// Read-only daemon query, short-circuited before any task/ReAct-loop
-    /// dispatch: "query_budget", "query_holds", "query_allowlist", or
-    /// "query_wallet_balance". When set, `task` is ignored.
+    /// dispatch: "query_budget", "query_holds", "query_allowlist",
+    /// "query_url_allowlist", or "query_wallet_balance". When set, `task` is
+    /// ignored.
     #[serde(default)]
     query: Option<String>,
     /// Mutating daemon endpoint, short-circuited the same way `query` is:
-    /// currently only "mutate_allowlist". When set, `task` and `query` are
-    /// ignored.
+    /// "mutate_allowlist" or "mutate_url_allowlist". When set, `task` and
+    /// `query` are ignored.
     #[serde(default)]
     mutate: Option<String>,
-    /// For `mutate: "mutate_allowlist"`: "add" or "remove".
+    /// For `mutate: "mutate_allowlist"` / `"mutate_url_allowlist"`: "add" or
+    /// "remove".
     action: Option<String>,
     /// For `mutate: "mutate_allowlist"`: the account to add/remove.
     account: Option<String>,
+    /// For `mutate: "mutate_url_allowlist"`: the url to add/remove.
+    url: Option<String>,
 }
 
 /// Response envelope for the read-only query endpoints. Mirrors the
@@ -85,6 +89,10 @@ enum QueryResponse {
         agent_did: String,
         accounts: Vec<String>,
     },
+    QueryUrlAllowlist {
+        agent_did: String,
+        urls: Vec<String>,
+    },
     QueryWalletBalance {
         agent_did: String,
         account_id: String,
@@ -97,6 +105,13 @@ enum QueryResponse {
         /// true if the allowlist actually changed (account added, or
         /// account was present and got removed); false for a no-op (e.g.
         /// adding an already-present account, or removing an absent one).
+        changed: bool,
+    },
+    MutateUrlAllowlist {
+        agent_did: String,
+        action: String,
+        url: String,
+        /// Same semantics as MutateAllowlist::changed, for the url allowlist.
         changed: bool,
     },
     QueryError {
@@ -123,6 +138,16 @@ fn validate_account_format(account: &str) -> Result<(), String> {
         .map_err(|e| format!("invalid account '{}': {}", account, e))
 }
 
+/// Basic sanity check for a url passed to the url-allowlist endpoints: must
+/// be non-empty and parse as a url. Deliberately not checked against Hedera
+/// account format — this validates request urls, not accounts.
+fn validate_url_format(url: &str) -> Result<(), String> {
+    if url.trim().is_empty() {
+        return Err("url must not be empty".to_string());
+    }
+    reqwest::Url::parse(url).map(|_| ()).map_err(|e| format!("invalid url '{}': {}", url, e))
+}
+
 /// Single code path for mutating the payment allowlist, shared by the
 /// `aria allowlist add/remove` CLI commands and the TCP `mutate_allowlist`
 /// endpoint. Both callers go through this function so behavior can never
@@ -140,6 +165,27 @@ fn mutate_allowlist_entry(
             Ok(true)
         }
         "remove" => db.remove_allowlist_entry(agent_did, account),
+        other => anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other),
+    }
+}
+
+/// Single code path for mutating the x402 url allowlist, shared by the
+/// `aria url-allowlist add/remove` CLI commands and the TCP
+/// `mutate_url_allowlist` endpoint — same pattern as `mutate_allowlist_entry`
+/// above, kept separate since this governs the url-keyed x402 path rather
+/// than hedera_pay's account-based allowlist.
+fn mutate_url_allowlist_entry(
+    db: &Db,
+    agent_did: &str,
+    action: &str,
+    url: &str,
+) -> anyhow::Result<bool> {
+    match action {
+        "add" => {
+            db.add_url_allowlist_entry(agent_did, url)?;
+            Ok(true)
+        }
+        "remove" => db.remove_url_allowlist_entry(agent_did, url),
         other => anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other),
     }
 }
@@ -178,6 +224,45 @@ fn handle_mutate_allowlist(
             changed,
         },
         Err(e) => QueryResponse::QueryError { message: format!("allowlist mutation failed: {}", e) },
+    }
+}
+
+/// Handles the TCP `mutate_url_allowlist` endpoint: validates the url
+/// format, then calls `mutate_url_allowlist_entry` — the same function the
+/// CLI uses — rather than reimplementing allowlist mutation here.
+fn handle_mutate_url_allowlist(
+    action: Option<&str>,
+    url: Option<&str>,
+    agent_did: &str,
+    db: &Db,
+) -> QueryResponse {
+    let Some(action) = action else {
+        return QueryResponse::QueryError {
+            message: "missing \"action\" (expected \"add\" or \"remove\")".to_string(),
+        };
+    };
+    let Some(url) = url else {
+        return QueryResponse::QueryError { message: "missing \"url\"".to_string() };
+    };
+    if action != "add" && action != "remove" {
+        return QueryResponse::QueryError {
+            message: format!("unknown allowlist action: {} (expected \"add\" or \"remove\")", action),
+        };
+    }
+    if let Err(msg) = validate_url_format(url) {
+        return QueryResponse::QueryError { message: msg };
+    }
+
+    match mutate_url_allowlist_entry(db, agent_did, action, url) {
+        Ok(changed) => QueryResponse::MutateUrlAllowlist {
+            agent_did: agent_did.to_string(),
+            action: action.to_string(),
+            url: url.to_string(),
+            changed,
+        },
+        Err(e) => {
+            QueryResponse::QueryError { message: format!("url allowlist mutation failed: {}", e) }
+        }
     }
 }
 
@@ -224,6 +309,12 @@ async fn handle_query(
                 QueryResponse::QueryError { message: format!("failed to load allowlist: {}", e) }
             }
         },
+        "query_url_allowlist" => match db.list_url_allowlist(agent_did) {
+            Ok(urls) => QueryResponse::QueryUrlAllowlist { agent_did: agent_did.to_string(), urls },
+            Err(e) => QueryResponse::QueryError {
+                message: format!("failed to load url allowlist: {}", e),
+            },
+        },
         "query_wallet_balance" => {
             use hiero_sdk::AccountBalanceQuery;
 
@@ -265,6 +356,9 @@ fn print_help() {
     println!("  allowlist add <account>   Add an account to the payment allowlist");
     println!("  allowlist remove <account> Remove an account from the payment allowlist");
     println!("  allowlist list           List allowlisted payment recipients");
+    println!("  url-allowlist add <url>  Add a url to the x402 url allowlist");
+    println!("  url-allowlist remove <url> Remove a url from the x402 url allowlist");
+    println!("  url-allowlist list       List allowlisted x402 urls");
     println!("  install                  Install systemd user service for auto-start");
     println!("  help                     Show this help");
     println!();
@@ -272,6 +366,8 @@ fn print_help() {
     println!("  aria");
     println!("  aria allowlist add 0.0.12345");
     println!("  aria allowlist list");
+    println!("  aria url-allowlist add https://api.example.com/resource");
+    println!("  aria url-allowlist list");
     println!("  aria daemon");
     println!("  aria install");
 }
@@ -477,6 +573,12 @@ async fn run_daemon() -> anyhow::Result<()> {
                             "mutate_allowlist" => handle_mutate_allowlist(
                                 req.action.as_deref(),
                                 req.account.as_deref(),
+                                &agent_did,
+                                &db,
+                            ),
+                            "mutate_url_allowlist" => handle_mutate_url_allowlist(
+                                req.action.as_deref(),
+                                req.url.as_deref(),
                                 &agent_did,
                                 &db,
                             ),
@@ -733,6 +835,47 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ => {
                     println!("Usage: aria allowlist <add|remove|list> [account]");
+                }
+            }
+            Ok(())
+        }
+        "url-allowlist" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+            let db = bootstrap_db()?;
+            let (agent_did, _) =
+                db.get_identity()?.unwrap_or(("did:aria:jayesh".into(), String::new()));
+            match subcmd {
+                "add" => {
+                    let url = args.get(3).ok_or_else(|| {
+                        anyhow::anyhow!("Url required: aria url-allowlist add <url>")
+                    })?;
+                    mutate_url_allowlist_entry(&db, &agent_did, "add", url)?;
+                    println!("✓ Url '{}' added to url allowlist for {}", url, agent_did);
+                }
+                "remove" => {
+                    let url = args.get(3).ok_or_else(|| {
+                        anyhow::anyhow!("Url required: aria url-allowlist remove <url>")
+                    })?;
+                    let removed = mutate_url_allowlist_entry(&db, &agent_did, "remove", url)?;
+                    if removed {
+                        println!("✓ Url '{}' removed from url allowlist for {}", url, agent_did);
+                    } else {
+                        println!("Url '{}' was not on url allowlist for {}", url, agent_did);
+                    }
+                }
+                "list" => {
+                    let list = db.list_url_allowlist(&agent_did)?;
+                    println!("Allowlisted urls for {}:", agent_did);
+                    if list.is_empty() {
+                        println!("  (none)");
+                    } else {
+                        for url in list {
+                            println!("  • {}", url);
+                        }
+                    }
+                }
+                _ => {
+                    println!("Usage: aria url-allowlist <add|remove|list> [url]");
                 }
             }
             Ok(())

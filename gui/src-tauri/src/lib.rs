@@ -92,6 +92,18 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
     }
 }
 
+/// Run one read-only daemon query on demand (`query_budget`, `query_holds`,
+/// `query_allowlist`, `query_wallet_balance`) for the dashboard panel. Each
+/// call is its own TCP round trip — there is no background polling; the
+/// panel calls this once per query on mount and again whenever the user
+/// hits refresh.
+#[tauri::command]
+async fn dashboard_query(query: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::send_query(&query))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
 /// Ensure a session exists in the DB (idempotent – safe to call every load).
 #[tauri::command]
 async fn create_session(
@@ -232,6 +244,7 @@ pub fn run() {
             check_daemon,
             send_message,
             send_direct_task,
+            dashboard_query,
             agent::resume_daemon_task,
             create_session,
             save_message,

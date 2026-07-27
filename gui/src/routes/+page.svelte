@@ -46,6 +46,25 @@
   let directTask = $state('');
   let directEvents = /** @type {DaemonLogEvent[]} */ ($state([]));
   let isDirectSending = $state(false);
+
+  /**
+   * @typedef {{
+   *   per_task_cap: number | null,
+   *   per_day_cap: number | null,
+   *   committed_spend_24h: number,
+   *   held_spend: number,
+   *   remaining_budget: number | null
+   * }} BudgetInfo
+   * @typedef {{ payment_key: string, amount_hbar: number, timestamp: string }} HoldRecord
+   */
+  let dashboardBudget = /** @type {BudgetInfo | null} */ ($state(null));
+  let dashboardHolds = /** @type {HoldRecord[] | null} */ ($state(null));
+  let dashboardAllowlist = /** @type {string[] | null} */ ($state(null));
+  let dashboardWallet = /** @type {{ account_id: string, balance_hbar: number } | null} */ ($state(null));
+  let dashboardLoading = $state(false);
+  /** @type {Record<string, string>} */
+  let dashboardErrors = $state({});
+  let dashboardLoadedOnce = $state(false);
   let activeDaemonSkillType = /** @type {string | null} */ ($state(null));
   let msgId = 0;
   /** Groups every event of the in-flight delegated task under one id so it
@@ -464,6 +483,35 @@
     if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
+  // ── Dashboard (read-only) ────────────────────────────────────────────────────
+
+  /**
+   * Runs the four read-only daemon queries on demand. Called once when the
+   * Dashboard tab is first opened and again on manual refresh — no
+   * background polling interval.
+   */
+  async function loadDashboard() {
+    if (dashboardLoading) return;
+    dashboardLoading = true;
+    dashboardLoadedOnce = true;
+    /** @type {Record<string, string>} */
+    const errors = {};
+
+    const [budget, holds, allowlist, wallet] = await Promise.all([
+      invoke('dashboard_query', { query: 'query_budget' }).catch((e) => { errors.budget = String(e); return null; }),
+      invoke('dashboard_query', { query: 'query_holds' }).catch((e) => { errors.holds = String(e); return null; }),
+      invoke('dashboard_query', { query: 'query_allowlist' }).catch((e) => { errors.allowlist = String(e); return null; }),
+      invoke('dashboard_query', { query: 'query_wallet_balance' }).catch((e) => { errors.wallet = String(e); return null; }),
+    ]);
+
+    dashboardBudget = /** @type {any} */ (budget);
+    dashboardHolds = /** @type {any} */ (holds)?.holds ?? null;
+    dashboardAllowlist = /** @type {any} */ (allowlist)?.accounts ?? null;
+    dashboardWallet = /** @type {any} */ (wallet);
+    dashboardErrors = errors;
+    dashboardLoading = false;
+  }
+
   // ── Direct TCP Task ────────────────────────────────────────────────────────
 
   /** @param {any} event */
@@ -667,6 +715,10 @@
     <div class="tabs">
       <button class:active={activeTab === 'chat'} onclick={() => activeTab = 'chat'}>Chatbot</button>
       <button class:active={activeTab === 'direct'} onclick={() => activeTab = 'direct'}>Direct TCP</button>
+      <button
+        class:active={activeTab === 'dashboard'}
+        onclick={() => { activeTab = 'dashboard'; if (!dashboardLoadedOnce) loadDashboard(); }}
+      >Dashboard</button>
     </div>
 
     {#if activeTab === 'chat'}
@@ -938,7 +990,7 @@
       <p class="input-hint">Enter to send · Shift+Enter for newline</p>
     </div>
   </section>
-  {:else}
+  {:else if activeTab === 'direct'}
     <section class="chat-panel">
       <header class="top-bar">
         <div>
@@ -1000,6 +1052,121 @@
             {/each}
           {/if}
         </div>
+      </div>
+    </section>
+  {:else}
+    <section class="chat-panel">
+      <header class="top-bar">
+        <div>
+          <span>Dashboard</span>
+        </div>
+        <div class="top-bar-right">
+          <button onclick={loadDashboard} disabled={!daemonOnline || dashboardLoading}>
+            {dashboardLoading ? 'Refreshing…' : '↻ Refresh'}
+          </button>
+        </div>
+      </header>
+
+      <div class="dashboard-panel">
+        {#if !daemonOnline}
+          <p>Daemon offline. Start the daemon to load dashboard data.</p>
+        {:else if !dashboardLoadedOnce}
+          <p>Loading…</p>
+        {:else}
+
+          <!-- Budget -->
+          <section class="dash-section">
+            <h2>Budget</h2>
+            {#if dashboardErrors.budget}
+              <p class="dash-error">⚠ {dashboardErrors.budget}</p>
+            {:else if dashboardBudget}
+              <div class="budget-bar">
+                <div class="budget-stat">
+                  <span class="budget-label">Committed (24h)</span>
+                  <span class="budget-value">{dashboardBudget.committed_spend_24h.toFixed(4)} ℏ</span>
+                </div>
+                <div class="budget-stat">
+                  <span class="budget-label">Held</span>
+                  <span class="budget-value">{dashboardBudget.held_spend.toFixed(4)} ℏ</span>
+                </div>
+                <div class="budget-stat">
+                  <span class="budget-label">Remaining</span>
+                  <span class="budget-value">
+                    {dashboardBudget.remaining_budget === null ? 'Unlimited' : `${dashboardBudget.remaining_budget.toFixed(4)} ℏ`}
+                  </span>
+                </div>
+                <div class="budget-stat">
+                  <span class="budget-label">Day cap</span>
+                  <span class="budget-value">
+                    {dashboardBudget.per_day_cap === null ? 'None' : `${dashboardBudget.per_day_cap.toFixed(4)} ℏ`}
+                  </span>
+                </div>
+              </div>
+              <p class="dash-caps-note">
+                Per-task cap: {dashboardBudget.per_task_cap === null ? 'None' : `${dashboardBudget.per_task_cap.toFixed(4)} ℏ`}
+                &nbsp;·&nbsp;
+                Per-day cap: {dashboardBudget.per_day_cap === null ? 'None' : `${dashboardBudget.per_day_cap.toFixed(4)} ℏ`}
+                &nbsp;(config-only — not editable here)
+              </p>
+            {/if}
+          </section>
+
+          <!-- Wallet -->
+          <section class="dash-section">
+            <h2>Wallet</h2>
+            {#if dashboardErrors.wallet}
+              <p class="dash-error">⚠ {dashboardErrors.wallet}</p>
+            {:else if dashboardWallet}
+              <p class="dash-wallet">
+                <span class="dash-wallet-account">{dashboardWallet.account_id}</span>
+                <span class="dash-wallet-balance">{dashboardWallet.balance_hbar.toFixed(4)} ℏ</span>
+              </p>
+            {/if}
+          </section>
+
+          <!-- Holds -->
+          <section class="dash-section">
+            <h2>Holds — pending / uncommitted</h2>
+            {#if dashboardErrors.holds}
+              <p class="dash-error">⚠ {dashboardErrors.holds}</p>
+            {:else if dashboardHolds && dashboardHolds.length === 0}
+              <p>No holds.</p>
+            {:else if dashboardHolds}
+              <table class="dash-table">
+                <thead>
+                  <tr><th>Payment key</th><th>Amount</th><th>Timestamp</th></tr>
+                </thead>
+                <tbody>
+                  {#each dashboardHolds as hold}
+                    <tr>
+                      <td>{hold.payment_key}</td>
+                      <td>{hold.amount_hbar.toFixed(4)} ℏ</td>
+                      <td>{hold.timestamp}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+          </section>
+
+          <!-- Allowlist -->
+          <section class="dash-section">
+            <h2>Allowlist</h2>
+            {#if dashboardErrors.allowlist}
+              <p class="dash-error">⚠ {dashboardErrors.allowlist}</p>
+            {:else if dashboardAllowlist && dashboardAllowlist.length === 0}
+              <p>No allowlisted accounts.</p>
+            {:else if dashboardAllowlist}
+              <ul class="dash-list">
+                {#each dashboardAllowlist as account}
+                  <li>{account}</li>
+                {/each}
+              </ul>
+            {/if}
+            <p class="dash-caps-note">Display only — manage entries from Settings.</p>
+          </section>
+
+        {/if}
       </div>
     </section>
   {/if}

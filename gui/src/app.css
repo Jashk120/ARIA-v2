@@ -186,3 +186,76 @@ textarea {
   min-width: 3rem;
   min-height: 3rem;
 }
+
+.dashboard-panel {
+  padding: 1rem;
+  overflow-y: auto;
+}
+
+.dash-section {
+  margin-bottom: 2rem;
+}
+
+.dash-section h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.budget-bar {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
+.budget-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.budget-label {
+  opacity: 0.7;
+  font-size: 0.8rem;
+}
+
+.budget-value {
+  font-weight: bold;
+}
+
+.dash-caps-note {
+  opacity: 0.7;
+  font-size: 0.85rem;
+}
+
+.dash-wallet {
+  display: flex;
+  gap: 1rem;
+  align-items: baseline;
+}
+
+.dash-wallet-balance {
+  font-weight: bold;
+}
+
+.dash-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.dash-table th,
+.dash-table td {
+  text-align: left;
+  padding: 0.35rem 0.75rem 0.35rem 0;
+  border-bottom: 1px solid;
+  overflow-wrap: anywhere;
+}
+
+.dash-list {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.dash-error {
+  color: crimson;
+}

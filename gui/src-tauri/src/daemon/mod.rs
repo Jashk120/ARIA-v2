@@ -64,6 +64,59 @@ fn connect_with_retries() -> Result<TcpStream, String> {
     unreachable!()
 }
 
+// ── Read-Only Queries ─────────────────────────────────────────────────────────
+
+/// The JSON request for a read-only daemon query (`query_budget`,
+/// `query_holds`, `query_allowlist`, `query_wallet_balance`). Distinct from
+/// `DaemonRequest` above since these carry no `task`/`Type` — the daemon
+/// short-circuits on the presence of `query` before touching the ReAct loop.
+#[derive(Debug, Serialize)]
+struct DaemonQueryRequest<'a> {
+    query: &'a str,
+}
+
+/// Sends a single read-only query and returns the one-line JSON response the
+/// daemon writes back (tagged `{"type": "query_budget" | "query_holds" |
+/// "query_allowlist" | "query_wallet_balance" | "query_error", ...}`).
+/// Unlike `submit_task`, this is a single request/response round trip, not
+/// an event stream — the daemon closes the socket after the one line.
+pub fn send_query(query: &str) -> Result<Value, String> {
+    let stream = connect_with_retries()?;
+    let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
+
+    let request = DaemonQueryRequest { query };
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
+
+    write_stream
+        .write_all(request_json.as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    write_stream
+        .write_all(b"\n")
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Read error: {e}"))?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Err("Empty response from daemon".to_string());
+    }
+
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| format!("Parse error on '{line}': {e}"))?;
+
+    if value.get("type").and_then(|t| t.as_str()) == Some("query_error") {
+        let message =
+            value.get("message").and_then(|m| m.as_str()).unwrap_or("unknown query error");
+        return Err(message.to_string());
+    }
+
+    Ok(value)
+}
+
 // ── Task Submission ───────────────────────────────────────────────────────────
 
 /// Connect to the daemon, submit a task, and iterate over the event stream.

@@ -50,12 +50,18 @@
   }
 
   /**
+   * Returns true only if no 'ask' event precedes this action — meaning
+   * the payment was auto-approved and never surfaced a human confirmation prompt.
+   * If there is any 'ask' in the events before this index (whether resolved or
+   * pending), the payment went through the manual-confirmation path.
    * @param {DaemonLogEvent[]} events
    * @param {number} index
    */
   function isAutoApprovedPaymentAction(events, index) {
-    const prev = index > 0 ? events[index - 1] : undefined;
-    return prev?.event_type !== 'ask';
+    for (let i = index - 1; i >= 0; i--) {
+      if (events[i].event_type === 'ask') return false;
+    }
+    return true;
   }
 
   /**

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use super::prompt::system_prompt;
 use crate::config::CONFIG;
+use crate::payments::governance::compute_payment_key;
 use crate::skills::manifest::{
     Capabilities,
     ReactConfig,
@@ -1525,12 +1526,6 @@ async fn call_llm_streaming(
     }
 
     Ok((full_content, final_tool_calls))
-}
-
-fn compute_payment_key(agent_did: &str, recipient: &str, amount_hbar: f64) -> String {
-    let raw = format!("{}:{}:{}", agent_did, recipient, amount_hbar);
-    let hash = crate::crypto::sha256_hex_str(&raw);
-    hash[..16].to_string()
 }
 
 fn extract_payment_recipient_and_amount(

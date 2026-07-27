@@ -867,11 +867,85 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     }
                 };
 
+                // Step 1.5: Governance checks (allowlist, per-task cap, per-day cap,
+                // rate limit). x402 never asks a human to confirm — this whole check
+                // runs autonomously — so everything hedera_pay does at proposal time
+                // (react_loop.rs) has to happen here instead, now that pay_to/amount
+                // are finally known from `requirements`.
+                let pay_to = requirements.pay_to.clone();
+                // Same tinybar-to-HBAR conversion as x402_vault.rs's own bookkeeping.
+                // Do not reintroduce a magnitude-based unit heuristic here.
+                let amount_hbar: f64 =
+                    requirements.amount.parse::<f64>().unwrap_or(0.0) / 100_000_000.0;
+
+                let db = match caller.data().db.clone() {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("[host_x402_pay] db not available; cannot run payment governance checks");
+                        return 0;
+                    }
+                };
+                let agent_did = caller.data().agent_did.clone();
+
+                // Log the attempt unconditionally, before any allow/block decision,
+                // so a blocked spam loop still counts toward its own rate limit.
+                if let Err(e) = db.log_x402_payment_attempt(&agent_did, &pay_to) {
+                    eprintln!("[host_x402_pay] failed to log payment attempt: {}", e);
+                }
+
+                let recent_attempts =
+                    db.count_recent_x402_attempts(&agent_did, &pay_to).unwrap_or(0);
+                if recent_attempts > 10 {
+                    eprintln!(
+                        "[host_x402_pay] blocked by rate limit: {} attempts to '{}' in the last hour (max 10)",
+                        recent_attempts, pay_to
+                    );
+                    return 0;
+                }
+
+                let is_allowed = db.is_account_allowlisted(&agent_did, &pay_to).unwrap_or(false);
+                if !is_allowed {
+                    eprintln!(
+                        "[host_x402_pay] blocked by policy (curb.allowlist): account '{}' is not on the allowlist",
+                        pay_to
+                    );
+                    return 0;
+                }
+
+                let runtime_cfg = crate::config::RuntimeConfig::load(&db);
+                let governance = &runtime_cfg.governance;
+
+                if let Some(per_task) = governance.per_task_cap {
+                    if amount_hbar > per_task {
+                        eprintln!(
+                            "[host_x402_pay] blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR",
+                            amount_hbar, per_task
+                        );
+                        return 0;
+                    }
+                }
+
+                let pkey = crate::payments::governance::compute_payment_key(&agent_did, &pay_to, amount_hbar);
+                let reserved = db
+                    .try_reserve_spend(&agent_did, &pkey, amount_hbar, governance.per_day_cap)
+                    .unwrap_or(false);
+                if !reserved {
+                    eprintln!(
+                        "[host_x402_pay] blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap",
+                        amount_hbar
+                    );
+                    return 0;
+                }
+
                 // Step 2: Pay via X402PaymentVault
                 let vault: Arc<crate::payments::x402_vault::X402PaymentVault> =
                     match caller.data().x402_vault.clone() {
                     Some(v) => v,
-                    None => { eprintln!("[host_x402_pay] x402_pay capability not enabled"); return 0; }
+                    None => {
+                        let _ = db.release_spend_hold(&agent_did, &pkey);
+                        eprintln!("[host_x402_pay] x402_pay capability not enabled");
+                        return 0;
+                    }
                 };
 
                 let (skill_called, task_id) = {
@@ -879,9 +953,20 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     (st.skill_name.clone(), st.task_id.clone())
                 };
 
+                // No separate confirm/deny step exists on this path, so the hold must
+                // be committed or released right here — immediately after the pay
+                // attempt — rather than deferred to a later resume (the fix already
+                // applied to hedera_pay's premature-release bug).
                 let payment_result = match vault.pay(requirements.clone(), &skill_called, task_id.as_deref(), None).await {
-                    Ok(r) => r,
-                    Err(e) => { eprintln!("[host_x402_pay] payment failed: {}", e); return 0; }
+                    Ok(r) => {
+                        let _ = db.commit_spend_hold(&agent_did, &pkey);
+                        r
+                    }
+                    Err(e) => {
+                        let _ = db.release_spend_hold(&agent_did, &pkey);
+                        eprintln!("[host_x402_pay] payment failed: {}", e);
+                        return 0;
+                    }
                 };
 
                 // Step 3: Retry with PAYMENT-SIGNATURE header

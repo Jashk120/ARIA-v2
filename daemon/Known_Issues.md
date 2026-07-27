@@ -185,6 +185,59 @@ responses should not be printed in normal operation.
 **Fix**: build the client with a timeout and replace unconditional prints with
 `tracing::debug!` or structured, redacted logs.
 
+### 15. `pay.x402` policy-block/failure reasons never reach the client
+
+`src/skills/wasm_runtime.rs::wire_x402_pay` (around lines 896-938) rejects a
+payment for rate-limit, allowlist, or spend-cap reasons by `eprintln!`-ing the
+specific reason server-side and then returning a bare `0` to the guest. The
+guest (`skills/pay/x402.pay/src/lib.rs::read_packed`) turns *any* `ptr == 0`
+into the same literal string, `"host call failed"`, with no way to
+distinguish a policy block from a rate-limit hit or a genuine payment
+failure. `run_wasm_instance_async` then wraps that as
+`"Skill error: host call failed"` and it is sent to the client as a plain
+`observation` event (not even `error`) — indistinguishable from an unrelated
+transient failure.
+
+This is asymmetric with the `hedera_pay` confirm/deny path: those same
+governance checks run earlier, in `src/agent/react_loop.rs`, and *do* emit a
+specific reason (e.g. `"Payment blocked by policy (curb.allowlist): ..."`) as
+an `AgentEvent::Error`. Only the autonomous x402 path loses the reason.
+
+Found while building the Aria-GUI payment-confirmation UI (three-outcome
+policy-blocked / pending / auto-approved display): the GUI can reliably label
+a `hedera_pay` block with its real reason, but for `pay.x402` it can only
+show "failed or blocked, reason not exposed" — deliberately not guessing,
+since today's data genuinely can't distinguish the cases.
+
+**Fix**: give `wire_x402_pay` a structured failure channel back to the guest
+(e.g. always write `{"error": "<reason>"}` bytes via `write_wasm_bytes`
+instead of returning bare `0` for the allowlist/rate-limit/cap branches), and
+update `pay.x402`'s `read_packed` to surface that string instead of the
+hardcoded `"host call failed"`. Once that's in place, the daemon can emit the
+same `AgentEvent::Error`-with-reason shape it already uses for `hedera_pay`.
+
+### 16. `pay.x402` proposals likely never reach `wire_x402_pay` at all
+
+`src/agent/react_loop.rs::skill_requires_confirmation` returns `true` for any
+skill with `capabilities.x402_pay`, which routes `pay.x402` calls through the
+same proposal-time gate as `hedera_pay` (`extract_payment_recipient_and_amount`
+at `react_loop.rs:1551-1573`). For x402, that function requires a non-empty
+`pay_to` in the *proposed* arguments — but the LLM only ever proposes `{url}`
+for `pay.x402` (per its manifest); `pay_to`/`amount` are only discovered from
+the target's 402 response inside `wire_x402_pay` itself. So a normal
+`pay.x402` call looks likely to fail at proposal time with `"Payment proposal
+for pay.x402 is missing recipient account."` before ever reaching the
+autonomous governance/payment code in `wasm_runtime.rs`.
+
+Not confirmed at runtime (found by static tracing while building the GUI's
+auto-approved-payment display), but worth a real end-to-end test — if
+correct, x402 payments may not currently execute via the react loop at all.
+
+**Fix**: skip the `react_loop.rs` proposal-time recipient/amount gate for
+`x402_pay`-only skills (it's redundant with, and incompatible with, the
+inline checks `wire_x402_pay` already performs once `pay_to`/`amount` are
+known from the 402 response).
+
 ---
 
 ## Lower Priority / Cleanup

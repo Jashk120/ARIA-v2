@@ -117,14 +117,32 @@ CREATE TABLE IF NOT EXISTS payment_holds (
 );
 
 -- Rate-limiting log for the x402 autonomous payment path (no human confirm/deny
--- step exists there). One row per payment ATTEMPT to a given pay_to, regardless
+-- step exists there). One row per payment ATTEMPT to a given url, regardless
 -- of whether that attempt was ultimately allowed or blocked by allowlist/cap
 -- checks — so a blocked spam loop is still itself rate-limited.
+--
+-- Keyed on url (not the resolved pay_to account) as of the URL-keyed x402
+-- governance change: one provider can legitimately serve multiple distinct
+-- resources from the same payout account, so account-keyed rate limiting
+-- conflated unrelated resources into one bucket. This table is only ever
+-- used by the x402 path (hedera_pay's governance is entirely account-based
+-- and untouched), so the column was repurposed in place rather than adding
+-- a parallel table.
 CREATE TABLE IF NOT EXISTS payment_rate_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_did       TEXT NOT NULL,
-    pay_to          TEXT NOT NULL,
+    url             TEXT NOT NULL,
     timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- URL-based allowlist for the x402 autonomous payment path. Separate from
+-- payment_allowlist (which is account-based and still governs hedera_pay)
+-- because x402 governance now keys on the request URL, not the resolved
+-- pay_to account — see payment_rate_log's comment for the rationale.
+CREATE TABLE IF NOT EXISTS payment_url_allowlist (
+    agent_did       TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    PRIMARY KEY(agent_did, url)
 )";
 
 pub struct Db {
@@ -701,6 +719,54 @@ impl Db {
         Ok(res)
     }
 
+    // ── Payment Governance — x402 URL-keyed allowlist ───────────────────────────
+    // x402's allowlist and rate limit key on the request URL rather than the
+    // resolved pay_to account (one provider can legitimately serve multiple
+    // distinct resources from the same payout account). hedera_pay's
+    // account-based allowlist above is untouched by this — these are a
+    // separate table/functions for the x402 path only.
+
+    pub fn is_url_allowlisted(&self, agent_did: &str, url: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM payment_url_allowlist WHERE agent_did = ? AND url = ?",
+            params![agent_did, url],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn add_url_allowlist_entry(&self, agent_did: &str, url: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO payment_url_allowlist (agent_did, url) VALUES (?, ?)",
+            params![agent_did, url],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_url_allowlist_entry(&self, agent_did: &str, url: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM payment_url_allowlist WHERE agent_did = ? AND url = ?",
+            params![agent_did, url],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn list_url_allowlist(&self, agent_did: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url FROM payment_url_allowlist WHERE agent_did = ? ORDER BY url",
+        )?;
+        let rows = stmt.query_map([agent_did], |row| row.get(0))?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
     pub fn get_daily_committed_spend(&self, agent_did: &str) -> anyhow::Result<f64> {
         let conn = self.conn.lock().unwrap();
         let sum: f64 = conn.query_row(
@@ -798,26 +864,27 @@ impl Db {
         self.release_spend_hold(agent_did, payment_key)
     }
 
-    /// Records a single x402 payment ATTEMPT to `pay_to`, independent of whether
+    /// Records a single x402 payment ATTEMPT to `url`, independent of whether
     /// the attempt is (or will be) allowed or blocked by allowlist/cap checks.
     /// Called unconditionally so a blocked spam loop still counts toward its own
-    /// rate limit.
-    pub fn log_x402_payment_attempt(&self, agent_did: &str, pay_to: &str) -> anyhow::Result<()> {
+    /// rate limit. Keyed on url, not the resolved pay_to account — see
+    /// payment_rate_log's schema comment for why.
+    pub fn log_url_payment_attempt(&self, agent_did: &str, url: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO payment_rate_log (agent_did, pay_to) VALUES (?, ?)",
-            params![agent_did, pay_to],
+            "INSERT INTO payment_rate_log (agent_did, url) VALUES (?, ?)",
+            params![agent_did, url],
         )?;
         Ok(())
     }
 
-    /// Rolling 1-hour count of x402 payment attempts from `agent_did` to `pay_to`.
-    pub fn count_recent_x402_attempts(&self, agent_did: &str, pay_to: &str) -> anyhow::Result<i64> {
+    /// Rolling 1-hour count of x402 payment attempts from `agent_did` to `url`.
+    pub fn count_recent_url_attempts(&self, agent_did: &str, url: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
             "SELECT count(*) FROM payment_rate_log \
-             WHERE agent_did = ? AND pay_to = ? AND timestamp >= datetime('now', '-1 hour')",
-            params![agent_did, pay_to],
+             WHERE agent_did = ? AND url = ? AND timestamp >= datetime('now', '-1 hour')",
+            params![agent_did, url],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -1078,7 +1145,7 @@ mod tests {
     // since that path never asks a human and runs the whole allowlist/cap/
     // rate-limit sequence inline against these same functions.
 
-    /// After 10 attempts to the same pay_to within the rolling hour, the 11th
+    /// After 10 attempts to the same url within the rolling hour, the 11th
     /// attempt's rate-limit check must report a count > 10 (the block threshold
     /// wire_x402_pay uses).
     #[test]
@@ -1091,35 +1158,37 @@ mod tests {
         let db = Db { conn: std::sync::Mutex::new(conn) };
 
         let agent = "did:aria:test";
-        let pay_to = "0.0.4321";
+        let url = "https://api.example.com/resource-a";
 
         // 10 attempts within the last hour — none of these should trip the
         // "> 10" block threshold.
         for _ in 0..10 {
-            db.log_x402_payment_attempt(agent, pay_to)?;
-            let count = db.count_recent_x402_attempts(agent, pay_to)?;
+            db.log_url_payment_attempt(agent, url)?;
+            let count = db.count_recent_url_attempts(agent, url)?;
             assert!(count <= 10, "count {} should not exceed 10 yet", count);
         }
 
         // The 11th attempt pushes the count over the threshold.
-        db.log_x402_payment_attempt(agent, pay_to)?;
-        let count = db.count_recent_x402_attempts(agent, pay_to)?;
+        db.log_url_payment_attempt(agent, url)?;
+        let count = db.count_recent_url_attempts(agent, url)?;
         assert_eq!(count, 11);
         assert!(count > 10, "11th attempt must trip the rate limit block");
 
-        // A different pay_to is unaffected — rate limiting is per (agent, pay_to).
-        let other_pay_to = "0.0.9999";
-        let other_count = db.count_recent_x402_attempts(agent, other_pay_to)?;
+        // A different url is unaffected — rate limiting is per (agent, url).
+        let other_url = "https://api.example.com/resource-b";
+        let other_count = db.count_recent_url_attempts(agent, other_url)?;
         assert_eq!(other_count, 0);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 
-    /// Mirrors wire_x402_pay's allowlist check: a pay_to that was never added to
-    /// the allowlist must be blocked, and adding it must unblock it.
+    /// The whole reason for the url-keyed change: two distinct urls served by
+    /// the same payout account must NOT share a rate-limit bucket. Without
+    /// this, a provider serving multiple resources from one account would
+    /// have those resources' attempts conflated together.
     #[test]
-    fn test_x402_allowlist_blocks_unlisted_account() -> anyhow::Result<()> {
+    fn test_x402_rate_limit_buckets_are_per_url_not_per_pay_to() -> anyhow::Result<()> {
         let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
         std::fs::create_dir_all(&temp_dir)?;
         let db_path = temp_dir.join("test.db");
@@ -1128,18 +1197,64 @@ mod tests {
         let db = Db { conn: std::sync::Mutex::new(conn) };
 
         let agent = "did:aria:test";
-        let pay_to = "0.0.5555";
+        // Both urls are served by the same payout account (not tracked in
+        // payment_rate_log at all anymore — the point is the rate limit
+        // logic never keys on it, so two urls sharing one account stay
+        // independent regardless of what that shared account is).
+        let url_a = "https://api.example.com/resource-a";
+        let url_b = "https://api.example.com/resource-b";
 
-        assert!(
-            !db.is_account_allowlisted(agent, pay_to)?,
-            "an unlisted pay_to must be blocked"
-        );
+        // Push url_a's bucket to the block threshold.
+        for _ in 0..11 {
+            db.log_url_payment_attempt(agent, url_a)?;
+        }
+        let count_a = db.count_recent_url_attempts(agent, url_a)?;
+        assert!(count_a > 10, "url_a should be rate-limited after 11 attempts");
 
-        db.add_allowlist_entry(agent, pay_to)?;
-        assert!(
-            db.is_account_allowlisted(agent, pay_to)?,
-            "allowlisting the account must unblock it"
-        );
+        // url_b, despite sharing the same pay_to account in practice, starts
+        // at zero and is completely unaffected by url_a's attempts.
+        let count_b = db.count_recent_url_attempts(agent, url_b)?;
+        assert_eq!(count_b, 0, "url_b must not share url_a's rate-limit bucket");
+
+        // A couple of attempts against url_b confirm it tracks independently.
+        db.log_url_payment_attempt(agent, url_b)?;
+        db.log_url_payment_attempt(agent, url_b)?;
+        let count_b_after = db.count_recent_url_attempts(agent, url_b)?;
+        assert_eq!(count_b_after, 2);
+        assert!(count_b_after <= 10, "url_b is nowhere near its own block threshold");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Mirrors wire_x402_pay's allowlist check: a url that was never added to
+    /// the url allowlist must be blocked, and adding it must unblock it.
+    /// hedera_pay's account-based allowlist (is_account_allowlisted) is a
+    /// separate table/functions entirely and is unaffected — see
+    /// test_allowlist_crud, which still passes unmodified.
+    #[test]
+    fn test_x402_url_allowlist_blocks_unlisted_url() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let url = "https://api.example.com/paid-resource";
+
+        assert!(!db.is_url_allowlisted(agent, url)?, "an unlisted url must be blocked");
+
+        db.add_url_allowlist_entry(agent, url)?;
+        assert!(db.is_url_allowlisted(agent, url)?, "allowlisting the url must unblock it");
+
+        let list = db.list_url_allowlist(agent)?;
+        assert_eq!(list, vec![url.to_string()]);
+
+        let removed = db.remove_url_allowlist_entry(agent, url)?;
+        assert!(removed);
+        assert!(!db.is_url_allowlisted(agent, url)?);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())
@@ -1187,16 +1302,16 @@ mod tests {
         let db = Db { conn: std::sync::Mutex::new(conn) };
 
         let agent = "did:aria:test";
-        let pay_to = "0.0.6666"; // never allowlisted — every attempt is blocked
+        let url = "https://api.example.com/never-allowlisted"; // every attempt is blocked
 
         for _ in 0..3 {
             // wire_x402_pay logs the attempt unconditionally, then checks the
-            // allowlist; here the allowlist check fails every time.
-            db.log_x402_payment_attempt(agent, pay_to)?;
-            assert!(!db.is_account_allowlisted(agent, pay_to)?);
+            // url allowlist; here the allowlist check fails every time.
+            db.log_url_payment_attempt(agent, url)?;
+            assert!(!db.is_url_allowlisted(agent, url)?);
         }
 
-        let count = db.count_recent_x402_attempts(agent, pay_to)?;
+        let count = db.count_recent_url_attempts(agent, url)?;
         assert_eq!(count, 3, "blocked attempts must still be counted toward the rate limit");
 
         let _ = std::fs::remove_dir_all(&temp_dir);

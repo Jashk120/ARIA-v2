@@ -889,25 +889,31 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                 // Log the attempt unconditionally, before any allow/block decision,
                 // so a blocked spam loop still counts toward its own rate limit.
-                if let Err(e) = db.log_x402_payment_attempt(&agent_did, &pay_to) {
+                // Keyed on the request url, not pay_to — one provider can serve
+                // multiple distinct resources from the same payout account, so
+                // account-keyed rate limiting/allowlisting conflated unrelated
+                // resources into one bucket. This intentionally means a url
+                // that's reconfigured or MITM'd to redirect payment to a
+                // different account is no longer caught by this check.
+                if let Err(e) = db.log_url_payment_attempt(&agent_did, &url) {
                     eprintln!("[host_x402_pay] failed to log payment attempt: {}", e);
                 }
 
                 let recent_attempts =
-                    db.count_recent_x402_attempts(&agent_did, &pay_to).unwrap_or(0);
+                    db.count_recent_url_attempts(&agent_did, &url).unwrap_or(0);
                 if recent_attempts > 10 {
                     eprintln!(
                         "[host_x402_pay] blocked by rate limit: {} attempts to '{}' in the last hour (max 10)",
-                        recent_attempts, pay_to
+                        recent_attempts, url
                     );
                     return 0;
                 }
 
-                let is_allowed = db.is_account_allowlisted(&agent_did, &pay_to).unwrap_or(false);
+                let is_allowed = db.is_url_allowlisted(&agent_did, &url).unwrap_or(false);
                 if !is_allowed {
                     eprintln!(
-                        "[host_x402_pay] blocked by policy (curb.allowlist): account '{}' is not on the allowlist",
-                        pay_to
+                        "[host_x402_pay] blocked by policy (curb.allowlist): url '{}' is not on the allowlist (pay_to='{}', amount={} HBAR)",
+                        url, pay_to, amount_hbar
                     );
                     return 0;
                 }

@@ -51,6 +51,15 @@ struct DaemonRequest {
     /// "query_wallet_balance". When set, `task` is ignored.
     #[serde(default)]
     query: Option<String>,
+    /// Mutating daemon endpoint, short-circuited the same way `query` is:
+    /// currently only "mutate_allowlist". When set, `task` and `query` are
+    /// ignored.
+    #[serde(default)]
+    mutate: Option<String>,
+    /// For `mutate: "mutate_allowlist"`: "add" or "remove".
+    action: Option<String>,
+    /// For `mutate: "mutate_allowlist"`: the account to add/remove.
+    account: Option<String>,
 }
 
 /// Response envelope for the read-only query endpoints. Mirrors the
@@ -81,9 +90,95 @@ enum QueryResponse {
         account_id: String,
         balance_hbar: f64,
     },
+    MutateAllowlist {
+        agent_did: String,
+        action: String,
+        account: String,
+        /// true if the allowlist actually changed (account added, or
+        /// account was present and got removed); false for a no-op (e.g.
+        /// adding an already-present account, or removing an absent one).
+        changed: bool,
+    },
     QueryError {
         message: String,
     },
+}
+
+/// Validates that `account` looks like a Hedera account ID, the same shape
+/// check (`AccountId::from_str`) already used to validate account strings
+/// elsewhere in ARIA (e.g. `build_x402_vault`, `payments/direct.rs`). The
+/// `aria allowlist add/remove` CLI commands don't apply any validation today,
+/// but the TCP endpoint accepts input over the network, so malformed input
+/// is rejected here instead of silently corrupting the allowlist.
+fn validate_account_format(account: &str) -> Result<(), String> {
+    use std::str::FromStr;
+
+    use hiero_sdk::AccountId;
+
+    if account.trim().is_empty() {
+        return Err("account must not be empty".to_string());
+    }
+    AccountId::from_str(account)
+        .map(|_| ())
+        .map_err(|e| format!("invalid account '{}': {}", account, e))
+}
+
+/// Single code path for mutating the payment allowlist, shared by the
+/// `aria allowlist add/remove` CLI commands and the TCP `mutate_allowlist`
+/// endpoint. Both callers go through this function so behavior can never
+/// diverge between them; it calls the exact same `Db` methods the CLI
+/// always has.
+fn mutate_allowlist_entry(
+    db: &Db,
+    agent_did: &str,
+    action: &str,
+    account: &str,
+) -> anyhow::Result<bool> {
+    match action {
+        "add" => {
+            db.add_allowlist_entry(agent_did, account)?;
+            Ok(true)
+        }
+        "remove" => db.remove_allowlist_entry(agent_did, account),
+        other => anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other),
+    }
+}
+
+/// Handles the TCP `mutate_allowlist` endpoint: validates the account
+/// format, then calls `mutate_allowlist_entry` — the same function the CLI
+/// uses — rather than reimplementing allowlist mutation here.
+fn handle_mutate_allowlist(
+    action: Option<&str>,
+    account: Option<&str>,
+    agent_did: &str,
+    db: &Db,
+) -> QueryResponse {
+    let Some(action) = action else {
+        return QueryResponse::QueryError {
+            message: "missing \"action\" (expected \"add\" or \"remove\")".to_string(),
+        };
+    };
+    let Some(account) = account else {
+        return QueryResponse::QueryError { message: "missing \"account\"".to_string() };
+    };
+    if action != "add" && action != "remove" {
+        return QueryResponse::QueryError {
+            message: format!("unknown allowlist action: {} (expected \"add\" or \"remove\")", action),
+        };
+    }
+    if let Err(msg) = validate_account_format(account) {
+        return QueryResponse::QueryError { message: msg };
+    }
+
+    match mutate_allowlist_entry(db, agent_did, action, account) {
+        Ok(changed) => QueryResponse::MutateAllowlist {
+            agent_did: agent_did.to_string(),
+            action: action.to_string(),
+            account: account.to_string(),
+            changed,
+        },
+        Err(e) => QueryResponse::QueryError { message: format!("allowlist mutation failed: {}", e) },
+    }
 }
 
 /// Handles the four read-only TCP query endpoints. Never touches
@@ -376,6 +471,24 @@ async fn run_daemon() -> anyhow::Result<()> {
                         }
                     };
 
+                    if let Some(mutate_kind) = req.mutate.as_deref() {
+                        let agent_did = vault.did();
+                        let response = match mutate_kind {
+                            "mutate_allowlist" => handle_mutate_allowlist(
+                                req.action.as_deref(),
+                                req.account.as_deref(),
+                                &agent_did,
+                                &db,
+                            ),
+                            other => QueryResponse::QueryError {
+                                message: format!("unknown mutate type: {}", other),
+                            },
+                        };
+                        let json = serde_json::to_string(&response).unwrap_or_default();
+                        let _ = socket.write_all(format!("{}\n", json).as_bytes()).await;
+                        return;
+                    }
+
                     if let Some(query_kind) = req.query.as_deref() {
                         let agent_did = vault.did();
                         let response = handle_query(
@@ -593,14 +706,14 @@ async fn main() -> anyhow::Result<()> {
                     let account = args.get(3).ok_or_else(|| {
                         anyhow::anyhow!("Account required: aria allowlist add <account>")
                     })?;
-                    db.add_allowlist_entry(&agent_did, account)?;
+                    mutate_allowlist_entry(&db, &agent_did, "add", account)?;
                     println!("✓ Account '{}' added to allowlist for {}", account, agent_did);
                 }
                 "remove" => {
                     let account = args.get(3).ok_or_else(|| {
                         anyhow::anyhow!("Account required: aria allowlist remove <account>")
                     })?;
-                    let removed = db.remove_allowlist_entry(&agent_did, account)?;
+                    let removed = mutate_allowlist_entry(&db, &agent_did, "remove", account)?;
                     if removed {
                         println!("✓ Account '{}' removed from allowlist for {}", account, agent_did);
                     } else {

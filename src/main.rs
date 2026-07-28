@@ -125,6 +125,12 @@ enum QueryResponse {
         agent_did: String,
         payments: Vec<PaymentHistoryEntry>,
     },
+    /// Returned for `query: "query_audit_topic_id"`. `audit_topic_id` is
+    /// `None` when no HCS audit topic has been configured or auto-created yet.
+    QueryAuditTopicId {
+        agent_did: String,
+        audit_topic_id: Option<String>,
+    },
     MutateAllowlist {
         agent_did: String,
         action: String,
@@ -395,6 +401,10 @@ async fn handle_query(
                 },
             }
         }
+        "query_audit_topic_id" => QueryResponse::QueryAuditTopicId {
+            agent_did: agent_did.to_string(),
+            audit_topic_id: runtime_cfg.governance.audit_topic_id.clone(),
+        },
         "query_wallet_balance" => {
             use hiero_sdk::AccountBalanceQuery;
 

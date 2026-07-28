@@ -1024,12 +1024,19 @@ fn skill_capabilities(skill: &str) -> Option<Capabilities> {
     skill_dir(skill).ok().and_then(|dir| load_manifest(&dir).ok()).map(|m| m.capabilities)
 }
 
-/// Skills that can move real money (direct HBAR transfer or x402) must not
-/// fire without an explicit human "yes" — the LLM proposing the call is not
-/// sufficient authorization on its own.
+/// Skills that can move real money via a direct Hedera transfer (`hedera_pay`)
+/// must not fire without an explicit human "yes" — the LLM proposing the call
+/// is not sufficient authorization on its own.
+///
+/// `x402_pay` skills are intentionally excluded here: their recipient and amount
+/// are unknown at proposal time (they come from the server's HTTP 402 response),
+/// so the pre-flight check that works for `hedera_pay` would always fail.
+/// x402 governance (allowlist, per-task cap, per-day cap, rate limit) is
+/// enforced autonomously inside `host_x402_pay()` in `wasm_runtime.rs` after
+/// the 402 response has been parsed — that path must not be duplicated here.
 fn skill_requires_confirmation(skill: &str) -> bool {
     skill_capabilities(skill)
-        .map(|capabilities| capabilities.hedera_pay || capabilities.x402_pay)
+        .map(|capabilities| capabilities.hedera_pay)
         .unwrap_or(false)
 }
 

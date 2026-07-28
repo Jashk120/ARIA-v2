@@ -24,6 +24,42 @@ use crate::skills::paths::{
 
 pub const MAX_REACT_STEPS: usize = 8;
 
+/// How long the background settlement watcher (see `spawn_payment_settlement_watch`)
+/// keeps polling the mirror node before giving up on a transaction.
+const PAYMENT_SETTLEMENT_MAX_POLLS: usize = 20;
+const PAYMENT_SETTLEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// If `transaction_id` is `Some` (i.e. the skill that just ran was a payment
+/// skill that actually submitted), spawns a detached background task that
+/// polls the mirror node until the transaction reaches a final state. The
+/// result is always persisted to `payments.status` — so `query_payment_history`
+/// and any caller with no live event stream (e.g. the TCP `approve_hold`
+/// endpoint, which returns and closes before settlement) still see the final
+/// state on their next read. When `tx` is available, the same result is also
+/// pushed as `AgentEvent::PaymentSettled` so a connection still streaming
+/// this task sees it live, without polling itself.
+fn spawn_payment_settlement_watch(
+    db: std::sync::Arc<crate::db::Db>,
+    tx: Option<mpsc::Sender<AgentEvent>>,
+    transaction_id: Option<String>,
+) {
+    let Some(transaction_id) = transaction_id else { return };
+    tokio::spawn(async move {
+        if let Some(status) = crate::payments::mirror::poll_until_final(
+            &transaction_id,
+            PAYMENT_SETTLEMENT_MAX_POLLS,
+            PAYMENT_SETTLEMENT_POLL_INTERVAL,
+        )
+        .await
+        {
+            let _ = db.update_payment_status(&transaction_id, &status);
+            if let Some(tx) = tx {
+                let _ = tx.send(AgentEvent::PaymentSettled { transaction_id, status }).await;
+            }
+        }
+    });
+}
+
 // ── Agent event / response types ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -73,6 +109,14 @@ pub enum AgentEvent {
     Error {
         content: String,
     },
+    /// Pushed by a background mirror-node poll once an in-flight payment
+    /// transaction reaches a final on-chain state. Not sent inline with
+    /// `Observation` — the skill call returns as soon as it *submits*, this
+    /// arrives later, on the same connection, once it *settles*.
+    PaymentSettled {
+        transaction_id: String,
+        status: String,
+    },
     Done,
 }
 
@@ -89,6 +133,148 @@ enum ConfirmationDecision {
     Confirmed,
     Denied,
     ContinueConversation,
+}
+
+/// Releases a pending payment confirmation's spend hold and clears the
+/// pending action — the exact effect of a human replying "no" to a payment
+/// confirmation in chat. Shared by `ConfirmationDecision::Denied` below and
+/// the TCP `release_hold` endpoint in `main.rs`, so the two code paths can
+/// never diverge. Returns the "Cancelled" message text the caller should
+/// surface (as an `AgentEvent::Final` in chat, or as the TCP response body).
+pub fn release_hold(
+    db: &crate::db::Db,
+    agent_did: &str,
+    task_id: &str,
+    skill: &str,
+    args: &serde_json::Value,
+) -> String {
+    if let Ok((rec, amt)) = extract_payment_recipient_and_amount(skill, args) {
+        let pkey = compute_payment_key(agent_did, &rec, amt);
+        let _ = db.release_spend_hold(agent_did, &pkey);
+    }
+    let _ = db.clear_pending_action(task_id);
+    format!("Cancelled — {} was not executed.", skill)
+}
+
+/// Outcome of attempting to execute a pending payment confirmation — the
+/// exact effect of a human replying "yes" in chat. Returned by
+/// [`approve_hold`] so callers (the chat resume path below, and the TCP
+/// `approve_hold` endpoint in `main.rs`) can react appropriately without
+/// duplicating the underlying fingerprint-check / execute / commit-or-release
+/// logic.
+pub enum ApproveHoldOutcome {
+    /// The pending action failed static validation (e.g. missing recipient)
+    /// before anything executed. The hold was already released and the
+    /// pending action already cleared.
+    Invalid { message: String },
+    /// The stored fingerprint no longer matches the current one (skill
+    /// config changed since the hold was placed). The old hold was released
+    /// and a fresh confirmation (`refreshed_pending`) is ready to be saved;
+    /// nothing executed. Caller should surface `question` and ask again.
+    FingerprintChanged { question: String, refreshed_pending: serde_json::Value },
+    /// The skill actually ran. `tx_id` is `Some` when the skill's result
+    /// included a `transaction_id` field, as every payment skill's output
+    /// does on success.
+    Executed { success: bool, observation: String, tx_id: Option<String> },
+}
+
+/// Executes a pending payment confirmation — the exact effect of a human
+/// replying "yes" to a payment confirmation in chat: fingerprint check,
+/// `run_skill_raw`, then commit the spend hold on success or release it on
+/// failure. Shared by `ConfirmationDecision::Confirmed` below and the TCP
+/// `approve_hold` endpoint in `main.rs`, so the two code paths can never
+/// diverge.
+///
+/// `tx`, when provided, receives the same `AgentEvent::Action` chat already
+/// emits right before executing — passed through so this stays a genuine
+/// UI-side effect rather than something baked into the shared logic. The TCP
+/// caller has no stream to emit to and passes `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_hold(
+    db: &std::sync::Arc<crate::db::Db>,
+    skills: &std::sync::Arc<crate::skills::SkillManager>,
+    payment_vault: Option<std::sync::Arc<crate::payments::direct::PaymentVault>>,
+    x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    injected_config: &HashMap<String, HashMap<String, String>>,
+    agent_did: &str,
+    task_id: &str,
+    skill: &str,
+    args: &serde_json::Value,
+    stored_fingerprint: &str,
+    tx: Option<&mpsc::Sender<AgentEvent>>,
+) -> ApproveHoldOutcome {
+    if let Some(error) = payment_proposal_error(skill, args) {
+        if let Ok((rec, amt)) = extract_payment_recipient_and_amount(skill, args) {
+            let pkey = compute_payment_key(agent_did, &rec, amt);
+            let _ = db.release_spend_hold(agent_did, &pkey);
+        }
+        let _ = db.clear_pending_action(task_id);
+        return ApproveHoldOutcome::Invalid { message: error };
+    }
+
+    let current_fingerprint = payment_fingerprint(skill, args, injected_config);
+    if stored_fingerprint != current_fingerprint {
+        if let Ok((rec, amt)) = extract_payment_recipient_and_amount(skill, args) {
+            let old_pkey = compute_payment_key(agent_did, &rec, amt);
+            let _ = db.release_spend_hold(agent_did, &old_pkey);
+        }
+        let refreshed = pending_payment_action(skill, args.clone(), injected_config);
+        let question = payment_confirmation_message(skill, args);
+        return ApproveHoldOutcome::FingerprintChanged { question, refreshed_pending: refreshed };
+    }
+
+    // Extract payment key now so we can commit/release after run_skill_raw.
+    let payment_key_for_hold = extract_payment_recipient_and_amount(skill, args)
+        .ok()
+        .map(|(rec, amt)| compute_payment_key(agent_did, &rec, amt));
+
+    let _ = db.clear_pending_action(task_id);
+
+    if let Some(tx) = tx {
+        let _ = tx.send(AgentEvent::Action { skill: skill.to_string(), args: args.clone() }).await;
+    }
+
+    let mut enriched = args.clone();
+    if let Some(obj) = enriched.as_object_mut()
+        && let Some(skill_config) = injected_config.get(skill)
+    {
+        for (k, v) in skill_config {
+            obj.insert(k.clone(), json!(v));
+        }
+    }
+
+    let (observation, tx_id, is_error): (String, Option<String>, bool) = match skills
+        .run_skill_raw(
+            skill,
+            &enriched,
+            Some(db.clone()),
+            payment_vault,
+            x402_vault,
+            agent_did.to_string(),
+            Some(task_id.to_string()),
+        )
+        .await
+    {
+        Ok(val) => {
+            let tx_id = val.get("transaction_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            (val.to_string(), tx_id, false)
+        }
+        Err(e) => (e.to_string(), None, true),
+    };
+
+    if let Some(ref pkey) = payment_key_for_hold {
+        if is_error {
+            let _ = db.release_spend_hold(agent_did, pkey);
+        } else {
+            let _ = db.commit_spend_hold(agent_did, pkey);
+        }
+    }
+
+    if !is_error {
+        spawn_payment_settlement_watch(db.clone(), tx.cloned(), tx_id.clone());
+    }
+
+    ApproveHoldOutcome::Executed { success: !is_error, observation, tx_id }
 }
 
 // ── Model Capability Allowlist ────────────────────────────────────────────────
@@ -180,122 +366,74 @@ pub async fn run_react_loop(
 
         match confirmation_decision(&user_prompt) {
             ConfirmationDecision::Confirmed => {
-                if let Some(error) = payment_proposal_error(&skill, &args) {
-                    if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
-                        let pkey = compute_payment_key(&agent_did, &rec, amt);
-                        let _ = db.release_spend_hold(&agent_did, &pkey);
-                    }
-                    let _ = db.clear_pending_action(&task_id);
-                    let _ = tx.send(AgentEvent::Error { content: error }).await;
-                    let _ = tx.send(AgentEvent::Done).await;
-                    return Ok(());
-                }
-
-                let current_fingerprint = payment_fingerprint(&skill, &args, &injected_config);
-                if stored_fingerprint != current_fingerprint {
-                    if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
-                        let old_pkey = compute_payment_key(&agent_did, &rec, amt);
-                        let _ = db.release_spend_hold(&agent_did, &old_pkey);
-                    }
-
-                    let refreshed = pending_payment_action(&skill, args.clone(), &injected_config);
-                    let question = payment_confirmation_message(&skill, &args);
-                    let _ = tx
-                        .send(AgentEvent::Ask {
-                            content: question,
-                            task_id: task_id.clone(),
-                            kind: Some(AskKind::Payment),
-                        })
-                        .await;
-
-                    history.push(json!({
-                        "role": "assistant",
-                        "content": format!(
-                            "Payment confirmation refreshed because the pending transaction fingerprint changed: {}",
-                            payment_action_summary(&skill, &args)
-                        )
-                    }));
-
-                    let history_json = serde_json::to_string(&history).unwrap_or_default();
-                    let pending_json = serde_json::to_string(&refreshed).unwrap_or_default();
-                    let _ = db.save_awaiting_confirmation(&task_id, &history_json, &pending_json);
-
-                    let _ = tx.send(AgentEvent::Done).await;
-                    return Ok(());
-                }
-
-                // Extract payment key now so we can commit/release after run_skill_raw.
-                let payment_key_for_hold =
-                    extract_payment_recipient_and_amount(&skill, &args)
-                        .ok()
-                        .map(|(rec, amt)| compute_payment_key(&agent_did, &rec, amt));
-
-                let _ = db.clear_pending_action(&task_id);
-
-                let _ =
-                    tx.send(AgentEvent::Action { skill: skill.clone(), args: args.clone() }).await;
-
-                let mut enriched = args.clone();
-                if let Some(obj) = enriched.as_object_mut()
-                    && let Some(skill_config) = injected_config.get(&skill)
+                match approve_hold(
+                    &db,
+                    &skills,
+                    payment_vault.clone(),
+                    x402_vault.clone(),
+                    &injected_config,
+                    &agent_did,
+                    &task_id,
+                    &skill,
+                    &args,
+                    stored_fingerprint,
+                    Some(&tx),
+                )
+                .await
                 {
-                    for (k, v) in skill_config {
-                        obj.insert(k.clone(), json!(v));
+                    ApproveHoldOutcome::Invalid { message } => {
+                        let _ = tx.send(AgentEvent::Error { content: message }).await;
+                        let _ = tx.send(AgentEvent::Done).await;
+                        return Ok(());
+                    }
+                    ApproveHoldOutcome::FingerprintChanged { question, refreshed_pending } => {
+                        let _ = tx
+                            .send(AgentEvent::Ask {
+                                content: question,
+                                task_id: task_id.clone(),
+                                kind: Some(AskKind::Payment),
+                            })
+                            .await;
+
+                        history.push(json!({
+                            "role": "assistant",
+                            "content": format!(
+                                "Payment confirmation refreshed because the pending transaction fingerprint changed: {}",
+                                payment_action_summary(&skill, &args)
+                            )
+                        }));
+
+                        let history_json = serde_json::to_string(&history).unwrap_or_default();
+                        let pending_json =
+                            serde_json::to_string(&refreshed_pending).unwrap_or_default();
+                        let _ =
+                            db.save_awaiting_confirmation(&task_id, &history_json, &pending_json);
+
+                        let _ = tx.send(AgentEvent::Done).await;
+                        return Ok(());
+                    }
+                    ApproveHoldOutcome::Executed { success, observation, .. } => {
+                        let _ =
+                            tx.send(AgentEvent::Observation { content: observation.clone() }).await;
+
+                        if !success {
+                            let _ = tx.send(AgentEvent::Error { content: observation }).await;
+                            let _ = tx.send(AgentEvent::Done).await;
+                            return Ok(());
+                        }
+
+                        history.push(json!({
+                            "role": "user",
+                            "content": format!("User confirmed. Result of {}: {}", skill, observation)
+                        }));
+                        // Falls through into the normal loop below so the LLM can
+                        // synthesize a final user-facing response from the observation.
                     }
                 }
-
-                let (observation, is_error): (String, bool) = match skills
-                    .run_skill_raw(
-                        &skill,
-                        &enriched,
-                        Some(db.clone()),
-                        payment_vault.clone(),
-                        x402_vault.clone(),
-                        agent_did.clone(),
-                        Some(task_id.clone()),
-                    )
-                    .await
-                {
-                    Ok(val) => (val.to_string(), false),
-                    Err(e) => (e.to_string(), true),
-                };
-                let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
-
-                // Commit the hold on success (insert_payment already ran inside run_skill_raw,
-                // so the payments table has the row — the hold's only remaining job is to stop
-                // double-counting). Release on failure so the budget isn't stuck.
-                if let Some(ref pkey) = payment_key_for_hold {
-                    if is_error {
-                        let _ = db.release_spend_hold(&agent_did, pkey);
-                    } else {
-                        let _ = db.commit_spend_hold(&agent_did, pkey);
-                    }
-                }
-
-                if is_error {
-                    let _ = tx.send(AgentEvent::Error { content: observation }).await;
-                    let _ = tx.send(AgentEvent::Done).await;
-                    return Ok(());
-                }
-
-                history.push(json!({
-                    "role": "user",
-                    "content": format!("User confirmed. Result of {}: {}", skill, observation)
-                }));
-                // Falls through into the normal loop below so the LLM can
-                // synthesize a final user-facing response from the observation.
             }
             ConfirmationDecision::Denied => {
-                if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args) {
-                    let pkey = compute_payment_key(&agent_did, &rec, amt);
-                    let _ = db.release_spend_hold(&agent_did, &pkey);
-                }
-                let _ = db.clear_pending_action(&task_id);
-                let _ = tx
-                    .send(AgentEvent::Final {
-                        content: format!("Cancelled — {} was not executed.", skill),
-                    })
-                    .await;
+                let message = release_hold(&db, &agent_did, &task_id, &skill, &args);
+                let _ = tx.send(AgentEvent::Final { content: message }).await;
                 let _ = tx.send(AgentEvent::Done).await;
                 return Ok(());
             }
@@ -708,28 +846,34 @@ pub async fn run_react_loop(
                         }
                     }
 
-                    let (observation, is_error): (String, bool) = match skills
-                        .run_skill_raw(
-                            &skill,
-                            &enriched,
-                            Some(db.clone()),
-                            payment_vault.clone(),
-                            x402_vault.clone(),
-                            agent_did.clone(),
-                            Some(task_id.clone()),
-                        )
-                        .await
-                    {
-                        Ok(val) => (val.to_string(), false),
-                        Err(e) => (e.to_string(), true),
-                    };
+                    let (observation, tx_id, is_error): (String, Option<String>, bool) =
+                        match skills
+                            .run_skill_raw(
+                                &skill,
+                                &enriched,
+                                Some(db.clone()),
+                                payment_vault.clone(),
+                                x402_vault.clone(),
+                                agent_did.clone(),
+                                Some(task_id.clone()),
+                            )
+                            .await
+                        {
+                            Ok(val) => {
+                                let tx_id = val
+                                    .get("transaction_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                (val.to_string(), tx_id, false)
+                            }
+                            Err(e) => (e.to_string(), None, true),
+                        };
                     let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
 
                     // For payment skills (both auto-approved and confirmed-after-policy),
                     // commit the hold on success or release it on failure.
                     if skill_requires_confirmation(&skill) {
-                        if let Ok((rec, amt)) =
-                            extract_payment_recipient_and_amount(&skill, &args)
+                        if let Ok((rec, amt)) = extract_payment_recipient_and_amount(&skill, &args)
                         {
                             let pkey = compute_payment_key(&agent_did, &rec, amt);
                             if is_error {
@@ -738,6 +882,14 @@ pub async fn run_react_loop(
                                 let _ = db.commit_spend_hold(&agent_did, &pkey);
                             }
                         }
+                    }
+
+                    // Applies to any payment skill that just submitted (auto-approved
+                    // hedera_pay or autonomous x402_pay) — a no-op for non-payment
+                    // skills, since tx_id is only Some when the result had a
+                    // "transaction_id" field.
+                    if !is_error {
+                        spawn_payment_settlement_watch(db.clone(), Some(tx.clone()), tx_id);
                     }
 
                     if react_meta.terminal && !is_error {
@@ -798,11 +950,8 @@ pub async fn run_react_loop(
                         "content": format!("Asked the user: {}", question)
                     }));
                     let history_json = serde_json::to_string(&history).unwrap_or_default();
-                    let _ = db.save_awaiting_confirmation(
-                        &task_id,
-                        &history_json,
-                        r#"{"kind":"ask"}"#,
-                    );
+                    let _ =
+                        db.save_awaiting_confirmation(&task_id, &history_json, r#"{"kind":"ask"}"#);
 
                     should_continue = false;
                 }
@@ -935,10 +1084,7 @@ fn payment_confirmation_message(skill: &str, args: &serde_json::Value) -> String
         lines.push(value);
         lines.push(String::new());
     }
-    lines.push("Reply:".to_string());
-    lines.push("• yes — execute exactly this transaction".to_string());
-    lines.push("• no — cancel".to_string());
-    lines.push("• anything else — ask a question or modify the transaction".to_string());
+
     lines.join("\n")
 }
 
@@ -1294,7 +1440,10 @@ mod tests {
             Some(threshold) if 5.0 <= threshold => true,
             _ => false,
         };
-        assert!(!is_auto_above, "Amount above AUTO_UNDER threshold must require human confirmation");
+        assert!(
+            !is_auto_above,
+            "Amount above AUTO_UNDER threshold must require human confirmation"
+        );
     }
 }
 
@@ -1540,12 +1689,8 @@ fn extract_payment_recipient_and_amount(
 ) -> Result<(String, f64), String> {
     let capabilities = skill_capabilities(skill).unwrap_or_default();
     if capabilities.hedera_pay {
-        let recipient = args
-            .get("recipient")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let recipient =
+            args.get("recipient").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if recipient.is_empty() {
             return Err(format!("Payment proposal for {} is missing recipient.", skill));
         }

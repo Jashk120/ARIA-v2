@@ -48,8 +48,8 @@ struct DaemonRequest {
     task_id: Option<String>,
     /// Read-only daemon query, short-circuited before any task/ReAct-loop
     /// dispatch: "query_budget", "query_holds", "query_allowlist",
-    /// "query_url_allowlist", or "query_wallet_balance". When set, `task` is
-    /// ignored.
+    /// "query_url_allowlist", "query_payment_history", or
+    /// "query_wallet_balance". When set, `task` is ignored.
     #[serde(default)]
     query: Option<String>,
     /// Mutating daemon endpoint, short-circuited the same way `query` is:
@@ -64,6 +64,29 @@ struct DaemonRequest {
     account: Option<String>,
     /// For `mutate: "mutate_url_allowlist"`: the url to add/remove.
     url: Option<String>,
+    /// For `query: "query_payment_history"`: max rows to return (default 50).
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// One row of `query_payment_history`'s response. `status`/`chain_verified`
+/// reflect a live Hedera Mirror Node lookup for `transaction_id` when the
+/// mirror node was reachable; otherwise `status` falls back to the locally
+/// cached value and `chain_verified` is `false` — a single unreachable
+/// mirror node entry never fails the whole request.
+#[derive(serde::Serialize)]
+struct PaymentHistoryEntry {
+    transaction_id: String,
+    hashscan_url: String,
+    recipient: String,
+    amount_hbar: f64,
+    status: String,
+    chain_verified: bool,
+    timestamp: String,
+    /// Distinguishes a `hedera_pay` row (account-allowlist governed) from an
+    /// `x402_pay` row (url-allowlist governed) — see `payment_url_allowlist`'s
+    /// doc comment in `db.rs` for why the two are governed separately.
+    skill_called: String,
 }
 
 /// Response envelope for the read-only query endpoints. Mirrors the
@@ -97,6 +120,10 @@ enum QueryResponse {
         agent_did: String,
         account_id: String,
         balance_hbar: f64,
+    },
+    QueryPaymentHistory {
+        agent_did: String,
+        payments: Vec<PaymentHistoryEntry>,
     },
     MutateAllowlist {
         agent_did: String,
@@ -165,7 +192,9 @@ fn mutate_allowlist_entry(
             Ok(true)
         }
         "remove" => db.remove_allowlist_entry(agent_did, account),
-        other => anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other),
+        other => {
+            anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other)
+        }
     }
 }
 
@@ -186,7 +215,9 @@ fn mutate_url_allowlist_entry(
             Ok(true)
         }
         "remove" => db.remove_url_allowlist_entry(agent_did, url),
-        other => anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other),
+        other => {
+            anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other)
+        }
     }
 }
 
@@ -209,7 +240,10 @@ fn handle_mutate_allowlist(
     };
     if action != "add" && action != "remove" {
         return QueryResponse::QueryError {
-            message: format!("unknown allowlist action: {} (expected \"add\" or \"remove\")", action),
+            message: format!(
+                "unknown allowlist action: {} (expected \"add\" or \"remove\")",
+                action
+            ),
         };
     }
     if let Err(msg) = validate_account_format(account) {
@@ -223,7 +257,9 @@ fn handle_mutate_allowlist(
             account: account.to_string(),
             changed,
         },
-        Err(e) => QueryResponse::QueryError { message: format!("allowlist mutation failed: {}", e) },
+        Err(e) => {
+            QueryResponse::QueryError { message: format!("allowlist mutation failed: {}", e) }
+        }
     }
 }
 
@@ -246,7 +282,10 @@ fn handle_mutate_url_allowlist(
     };
     if action != "add" && action != "remove" {
         return QueryResponse::QueryError {
-            message: format!("unknown allowlist action: {} (expected \"add\" or \"remove\")", action),
+            message: format!(
+                "unknown allowlist action: {} (expected \"add\" or \"remove\")",
+                action
+            ),
         };
     }
     if let Err(msg) = validate_url_format(url) {
@@ -266,7 +305,7 @@ fn handle_mutate_url_allowlist(
     }
 }
 
-/// Handles the four read-only TCP query endpoints. Never touches
+/// Handles the read-only TCP query endpoints. Never touches
 /// `react_loop.rs` and never creates a task — answers straight from existing
 /// state (db + governance config), or, for the wallet balance, a live
 /// Hedera network read.
@@ -277,6 +316,7 @@ async fn handle_query(
     runtime_cfg: &RuntimeConfig,
     payment_vault: Option<&crate::payments::direct::PaymentVault>,
     x402_vault: Option<&crate::payments::x402_vault::X402PaymentVault>,
+    limit: Option<i64>,
 ) -> QueryResponse {
     match query {
         "query_budget" => {
@@ -315,6 +355,46 @@ async fn handle_query(
                 message: format!("failed to load url allowlist: {}", e),
             },
         },
+        "query_payment_history" => {
+            let limit = limit.unwrap_or(50);
+            match db.list_payment_history(agent_did, limit) {
+                Ok(rows) => {
+                    let mut payments = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        // Chain-verify against the mirror node; a single
+                        // unreachable/unindexed entry degrades to the
+                        // locally-cached status rather than failing the
+                        // whole request.
+                        let (status, chain_verified) =
+                            match crate::payments::mirror::fetch_transaction_result(
+                                &row.transaction_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(result)) => (result, true),
+                                Ok(None) | Err(_) => (row.status.clone(), false),
+                            };
+                        payments.push(PaymentHistoryEntry {
+                            transaction_id: row.transaction_id,
+                            hashscan_url: row.hashscan_url,
+                            recipient: row.recipient,
+                            amount_hbar: row.amount_hbar,
+                            status,
+                            chain_verified,
+                            timestamp: row.timestamp,
+                            skill_called: row.skill_called,
+                        });
+                    }
+                    QueryResponse::QueryPaymentHistory {
+                        agent_did: agent_did.to_string(),
+                        payments,
+                    }
+                }
+                Err(e) => QueryResponse::QueryError {
+                    message: format!("failed to load payment history: {}", e),
+                },
+            }
+        }
         "query_wallet_balance" => {
             use hiero_sdk::AccountBalanceQuery;
 
@@ -324,8 +404,9 @@ async fn handle_query(
                 (xv.client(), xv.account_id())
             } else {
                 return QueryResponse::QueryError {
-                    message: "no payment vault configured (HEDERA_ACCOUNT_ID / HEDERA_PRIVATE_KEY unset)"
-                        .to_string(),
+                    message:
+                        "no payment vault configured (HEDERA_ACCOUNT_ID / HEDERA_PRIVATE_KEY unset)"
+                            .to_string(),
                 };
             };
 
@@ -513,21 +594,25 @@ async fn run_daemon() -> anyhow::Result<()> {
     // hold release — they would otherwise permanently squat on daily budget).
     match db.reconcile_stale_holds() {
         Ok(0) => {}
-        Ok(n) => info!("Startup: reconciled {} stale payment hold(s) that matched SUCCESS payments.", n),
+        Ok(n) => {
+            info!("Startup: reconciled {} stale payment hold(s) that matched SUCCESS payments.", n)
+        }
         Err(e) => tracing::warn!("Startup: hold reconciliation failed (non-fatal): {}", e),
     }
 
     if runtime_cfg.governance.audit_topic_id.is_none() {
         if let Some(ref pv) = payment_vault {
             let client = pv.client();
-            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await {
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await
+            {
                 info!("Provisioned new HCS payment audit topic: {}", tid);
                 println!("HCS Payment Audit Topic ID: {}", tid);
                 let _ = db.set_config("hedera_payment_audit_topic", &tid);
             }
         } else if let Some(ref xv) = x402_vault {
             let client = xv.client();
-            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await {
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await
+            {
                 info!("Provisioned new HCS payment audit topic: {}", tid);
                 println!("HCS Payment Audit Topic ID: {}", tid);
                 let _ = db.set_config("hedera_payment_audit_topic", &tid);
@@ -600,6 +685,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                             &runtime_cfg,
                             payment_vault.as_deref(),
                             x402_vault.as_deref(),
+                            req.limit,
                         )
                         .await;
                         let json = serde_json::to_string(&response).unwrap_or_default();
@@ -817,7 +903,10 @@ async fn main() -> anyhow::Result<()> {
                     })?;
                     let removed = mutate_allowlist_entry(&db, &agent_did, "remove", account)?;
                     if removed {
-                        println!("✓ Account '{}' removed from allowlist for {}", account, agent_did);
+                        println!(
+                            "✓ Account '{}' removed from allowlist for {}",
+                            account, agent_did
+                        );
                     } else {
                         println!("Account '{}' was not on allowlist for {}", account, agent_did);
                     }

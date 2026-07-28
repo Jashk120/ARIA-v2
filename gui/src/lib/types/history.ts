@@ -3,6 +3,7 @@ export interface PaymentRecord {
   recipient: string;
   amount_hbar: number;
   chain_verified: boolean;
+  status?: string;
   hashscan_url?: string;
   skill_called?: string;
   timestamp?: string;

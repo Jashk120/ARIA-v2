@@ -1258,47 +1258,7 @@ select:focus {
 
 /* ── History ──────────────────────────────────────────────────────────── */
 
-.history-panel {
-  padding: 1.5rem;
-  overflow-y: auto;
-  display: flex;
-  gap: 1.5rem;
-  align-items: flex-start;
-}
-
-.history-column {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 1.1rem 1.3rem;
-}
-
-.history-column h2 {
-  margin: 0 0 0.85rem;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: var(--text);
-}
-
-.history-payments-table th,
-.history-payments-table td {
-  vertical-align: top;
-}
-
-.history-txid {
-  overflow-wrap: anywhere;
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.78rem;
-}
-
-.history-payment-type {
-  font-weight: 700;
-  font-size: 0.8rem;
-  color: var(--text);
-}
-
+/* Keep legacy badge classes (referenced in PaymentTrail detail panel) */
 .history-badge {
   font-size: 0.72rem;
   font-weight: 700;
@@ -1321,45 +1281,520 @@ select:focus {
   background: var(--red-tint);
 }
 
-.history-hcs-list {
+/* ── History v2: Tabs + Trail ─────────────────────────────────────────── */
+
+.history-offline {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 4rem 2rem;
+  color: var(--text-faint);
+}
+.history-offline-icon {
+  font-size: 2.5rem;
+  opacity: 0.5;
+}
+
+/* Tab switcher */
+.history-tabs {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.9rem 1.2rem 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+}
+
+.history-tab-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.9rem;
+  border: none;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  position: relative;
+  bottom: -1px;
+  border-bottom: 2px solid transparent;
+}
+
+.history-tab-btn:hover {
+  color: var(--text);
+  background: var(--bg-input);
+}
+
+.history-tab-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background: var(--bg-input);
+}
+
+.history-tab-icon { font-size: 0.9rem; }
+
+.history-tab-count {
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0.05rem 0.42rem;
+  color: var(--text-faint);
+  min-width: 18px;
+  text-align: center;
+}
+
+.history-tab-active .history-tab-count {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--accent);
+}
+
+.history-trail-panel {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Trail two-column layout */
+.trail-layout {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  flex: 1;
+}
+
+.trail-list {
+  width: 340px;
+  min-width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.trail-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.65rem 1rem;
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+  flex-shrink: 0;
+}
+
+.trail-list-note {
+  font-size: 0.68rem;
+  opacity: 0.7;
+  max-width: 140px;
+  text-align: right;
+  line-height: 1.3;
+}
+
+.trail-items {
   list-style: none;
   margin: 0;
   padding: 0;
+  overflow-y: auto;
+  flex: 1;
 }
 
-.history-hcs-item {
-  border-bottom: 1px solid var(--border);
-  padding: 0.75rem 0;
-}
-
-.history-hcs-item:last-child {
-  border-bottom: none;
-}
-
-.history-hcs-header {
+/* Trail row */
+.trail-item {
   display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  font-size: 0.75rem;
-  color: var(--text-faint);
-  margin-bottom: 0.4rem;
+  align-items: stretch;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.12s;
+  outline: none;
 }
 
-.history-hcs-record {
+.trail-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.trail-item:hover { background: var(--bg-input); }
+.trail-item-selected { background: color-mix(in srgb, var(--accent) 8%, var(--bg-input)); }
+.trail-item-error { cursor: default; opacity: 0.65; }
+
+/* Colored left border accent */
+.trail-item-accent {
+  width: 3px;
+  flex-shrink: 0;
+  background: var(--border);
+}
+
+.trail-item-accent.trail-status-success,
+.trail-item-accent.hcs-decision-approved  { background: var(--green); }
+
+.trail-item-accent.trail-status-failed,
+.trail-item-accent.hcs-decision-rejected  { background: var(--red); }
+
+.trail-item-accent.trail-status-pending,
+.trail-item-accent.hcs-decision-pending   { background: color-mix(in srgb, var(--accent) 80%, transparent); }
+
+.trail-item-accent.trail-status-unknown   { background: var(--text-faint); }
+.trail-item-accent.hcs-accent             { background: color-mix(in srgb, var(--accent) 60%, transparent); }
+
+.trail-item-body {
+  flex: 1;
+  min-width: 0;
+  padding: 0.65rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.trail-item-top {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.trail-item-type {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0.1rem 0.45rem;
+  white-space: nowrap;
+}
+
+.trail-item-txid {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trail-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.trail-item-recipient {
+  font-size: 0.7rem;
+  color: var(--text-faint);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+}
+
+.trail-item-amount {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.trail-item-ts {
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.trail-item-arrow {
+  display: flex;
+  align-items: center;
+  padding: 0 0.6rem;
+  color: var(--text-faint);
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+/* Status badges */
+.trail-status-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--radius-pill);
+  border: 1px solid;
+  white-space: nowrap;
+  text-transform: uppercase;
+}
+
+.trail-status-success {
+  color: var(--green);
+  background: var(--green-tint);
+  border-color: rgba(124, 174, 135, 0.4);
+}
+
+.trail-status-failed {
+  color: var(--red);
+  background: var(--red-tint);
+  border-color: rgba(224, 112, 95, 0.4);
+}
+
+.trail-status-pending {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.trail-status-unknown {
+  color: var(--text-faint);
+  background: var(--bg-input);
+  border-color: var(--border);
+}
+
+/* HCS badges */
+.hcs-seq-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--text-dim);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0.1rem 0.45rem;
+}
+
+.hcs-summary-label {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+
+/* Detail panel */
+.trail-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 1.1rem 1.3rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.trail-detail-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  color: var(--text-faint);
+}
+
+.trail-detail-empty-icon {
+  font-size: 2.2rem;
+  opacity: 0.35;
+}
+
+.trail-detail-empty p {
+  font-size: 0.82rem;
   margin: 0;
+  text-align: center;
+}
+
+.trail-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.trail-detail-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.trail-detail-close {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 0.15rem 0.45rem;
+  transition: background 0.12s, color 0.12s;
+}
+
+.trail-detail-close:hover {
+  background: var(--bg-input);
+  color: var(--text);
+}
+
+.trail-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.trail-detail-section:last-child { border-bottom: none; }
+
+.trail-detail-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.trail-detail-value {
+  font-size: 0.82rem;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.trail-detail-mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.trail-detail-amount {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.trail-detail-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.82rem;
+}
+
+.trail-detail-link:hover { text-decoration: underline; }
+
+.trail-detail-json {
+  margin: 0.4rem 0 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   color: var(--text-dim);
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 0.6rem 0.75rem;
+  padding: 0.65rem 0.85rem;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  line-height: 1.5;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.trail-copy-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0.05rem 0.3rem;
+  color: var(--text-faint);
+  transition: background 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+
+.trail-copy-btn:hover {
+  background: var(--bg-input);
+  color: var(--text);
+}
+
+/* Trail utility states */
+.trail-loading,
+.trail-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 3.5rem 2rem;
+  font-size: 0.84rem;
+  color: var(--text-faint);
+  text-align: center;
+  flex: 1;
+}
+
+.trail-error {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 1.2rem 1.5rem;
+  font-size: 0.82rem;
+  color: var(--red);
+  background: var(--red-tint);
+  border: 1px solid rgba(224, 112, 95, 0.3);
+  border-radius: var(--radius-md);
+  margin: 1rem;
+}
+
+.trail-error-icon { font-size: 1.1rem; flex-shrink: 0; }
+
+.trail-empty-icon {
+  font-size: 2.5rem;
+  opacity: 0.35;
+}
+
+.trail-empty p,
+.trail-empty-note {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.trail-empty-note {
+  font-size: 0.74rem;
+  opacity: 0.7;
+  max-width: 340px;
+  line-height: 1.5;
+}
+
+.trail-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: trail-spin 0.7s linear infinite;
+}
+
+@keyframes trail-spin {
+  to { transform: rotate(360deg); }
 }
 
 @media (max-width: 900px) {
-  .history-panel {
+  .trail-layout {
     flex-direction: column;
+  }
+  .trail-list {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: 320px;
   }
 }

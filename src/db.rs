@@ -189,6 +189,23 @@ pub struct PaymentRecord {
     pub timestamp: String,
 }
 
+/// A single raw row for the TCP `query_payment_history` endpoint — unlike
+/// `PaymentRecord`, this includes `skill_called` so the caller (GUI/history
+/// view) can tell a `hedera_pay` row (account-allowlist governed) apart from
+/// an `x402_pay` row (url-allowlist governed) without guessing from shape.
+/// `status` here is the *locally cached* value; `query_payment_history`
+/// overlays a chain-verified read on top of it before returning to callers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaymentHistoryRow {
+    pub skill_called: String,
+    pub recipient: String,
+    pub amount_hbar: f64,
+    pub transaction_id: String,
+    pub hashscan_url: String,
+    pub status: String,
+    pub timestamp: String,
+}
+
 /// A single raw row from `payment_holds`. No approved/denied interpretation —
 /// that state doesn't exist (see `commit_spend_hold`/`release_spend_hold`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -379,7 +396,8 @@ impl Db {
                             .as_secs();
                         let current_flag =
                             val.get("status_flag").and_then(|v| v.as_str()).unwrap_or("pending");
-                        if now_secs.saturating_sub(asked_at) >= 300 && current_flag != "unresponsive"
+                        if now_secs.saturating_sub(asked_at) >= 300
+                            && current_flag != "unresponsive"
                         {
                             if let Some(obj) = val.as_object_mut() {
                                 obj.insert(
@@ -676,6 +694,37 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Most recent `limit` payments for `agent_did`, most recent first — used
+    /// by the TCP `query_payment_history` endpoint. Includes `skill_called`
+    /// (unlike `list_recent_payments`) so callers can distinguish `hedera_pay`
+    /// rows from `x402_pay` rows.
+    pub fn list_payment_history(
+        &self,
+        agent_did: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<PaymentHistoryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT skill_called, recipient, amount_hbar, transaction_id, hashscan_url, status, timestamp
+         FROM payments
+         WHERE agent_did = ?1
+         ORDER BY timestamp DESC
+         LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent_did, limit], |row| {
+            Ok(PaymentHistoryRow {
+                skill_called: row.get(0)?,
+                recipient: row.get(1)?,
+                amount_hbar: row.get(2)?,
+                transaction_id: row.get(3)?,
+                hashscan_url: row.get(4)?,
+                status: row.get(5)?,
+                timestamp: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     // ── Payment Governance (Curb Port) ──────────────────────────────────────────
 
     pub fn is_account_allowlisted(&self, agent_did: &str, account: &str) -> anyhow::Result<bool> {
@@ -756,9 +805,8 @@ impl Db {
 
     pub fn list_url_allowlist(&self, agent_did: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT url FROM payment_url_allowlist WHERE agent_did = ? ORDER BY url",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT url FROM payment_url_allowlist WHERE agent_did = ? ORDER BY url")?;
         let rows = stmt.query_map([agent_did], |row| row.get(0))?;
         let mut res = Vec::new();
         for r in rows {
@@ -900,11 +948,15 @@ impl Db {
 
         // Collect all current holds.
         let hold_rows: Vec<(i64, String, String, f64)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, agent_did, payment_key, amount_hbar FROM payment_holds",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT id, agent_did, payment_key, amount_hbar FROM payment_holds")?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, f64>(3)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -1129,7 +1181,11 @@ mod tests {
 
         // At this point the hold is orphaned: a SUCCESS row exists but the hold was
         // never deleted (crash happened between run_skill_raw returning and hold release).
-        assert_eq!(db.get_daily_held_spend(agent)?, 3.0, "orphaned hold still present before reconcile");
+        assert_eq!(
+            db.get_daily_held_spend(agent)?,
+            3.0,
+            "orphaned hold still present before reconcile"
+        );
 
         // Reconcile should remove the stale hold.
         let cleaned = db.reconcile_stale_holds()?;

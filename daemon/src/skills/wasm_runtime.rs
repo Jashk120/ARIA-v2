@@ -805,10 +805,23 @@ fn dispatch_query(
 }
 // ── x402 payment capability ──────────────────────────────────────────────────
 //
-// host_x402_pay(url_ptr, url_len) -> packed(ptr,len) of JSON result, or 0 on error
+// host_x402_pay(url_ptr, url_len) -> packed(ptr,len) of JSON result
 // Fetches a URL via do_fetch_with_402_detection. If the URL requires payment
 // (402), pays via X402PaymentVault and retries with PAYMENT-SIGNATURE header.
 // If the URL is freely accessible (2xx), returns the data directly without payment.
+//
+// On any error or policy block, writes a JSON {"error":"<reason>"} into WASM
+// memory and returns its packed ptr — the guest skill surfaces this to the LLM
+// as a structured error instead of the opaque "host call failed" that a 0 return
+// would produce.
+
+/// Write a JSON `{"error": "<msg>"}` into WASM guest memory and return the
+/// packed (ptr << 32 | len) result, or 0 if writing fails.
+async fn write_wasm_error(caller: &mut Caller<'_, HostState>, msg: &str) -> i64 {
+    let json = serde_json::json!({ "error": msg });
+    let bytes = serde_json::to_vec(&json).unwrap_or_default();
+    write_wasm_bytes(caller, &bytes).await.unwrap_or(0)
+}
 
 fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap_async(
@@ -818,7 +831,10 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             Box::new(async move {
                 let url = match read_wasm_str(&mut caller, url_ptr, url_len) {
                     Ok(s) => s,
-                    Err(e) => { eprintln!("[host_x402_pay] failed to read url: {}", e); return 0; }
+                    Err(e) => {
+                        eprintln!("[host_x402_pay] failed to read url: {}", e);
+                        return write_wasm_error(&mut caller, &format!("x402.pay: could not read url argument: {}", e)).await;
+                    }
                 };
 
                 // Step 1: GET the URL using the shared fetch+402-detection primitive.
@@ -855,15 +871,24 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 
                     FetchResult::PaymentRequiredUnparseable => {
                         eprintln!("[host_x402_pay] 402 received but PaymentRequirements unparseable for {}", url);
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("x402.pay: server at '{}' returned HTTP 402 but the payment requirements could not be parsed — the server may not support the x402/Hedera protocol", url)
+                        ).await;
                     }
                     FetchResult::HttpError(status) => {
                         eprintln!("[host_x402_pay] initial GET returned non-402 error: {} for {}", status, url);
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("x402.pay: HTTP {} from '{}' — not a payment-gated resource", status, url)
+                        ).await;
                     }
                     FetchResult::NetworkError(e) => {
                         eprintln!("[host_x402_pay] initial GET failed: {}", e);
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("x402.pay: network error reaching '{}': {}", url, e)
+                        ).await;
                     }
                 };
 
@@ -882,7 +907,7 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Some(d) => d,
                     None => {
                         eprintln!("[host_x402_pay] db not available; cannot run payment governance checks");
-                        return 0;
+                        return write_wasm_error(&mut caller, "x402.pay: internal error — database not available for governance checks").await;
                     }
                 };
                 let agent_did = caller.data().agent_did.clone();
@@ -906,7 +931,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         "[host_x402_pay] blocked by rate limit: {} attempts to '{}' in the last hour (max 10)",
                         recent_attempts, url
                     );
-                    return 0;
+                    return write_wasm_error(
+                        &mut caller,
+                        &format!(
+                            "x402.pay blocked by rate limit: {} payment attempts to '{}' in the last hour (max 10). Wait before retrying.",
+                            recent_attempts, url
+                        )
+                    ).await;
                 }
 
                 let is_allowed = db.is_url_allowlisted(&agent_did, &url).unwrap_or(false);
@@ -915,7 +946,14 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         "[host_x402_pay] blocked by policy (curb.allowlist): url '{}' is not on the allowlist (pay_to='{}', amount={} HBAR)",
                         url, pay_to, amount_hbar
                     );
-                    return 0;
+                    return write_wasm_error(
+                        &mut caller,
+                        &format!(
+                            "x402.pay blocked by policy (curb.url-allowlist): '{}' is not on the approved URL allowlist. \
+                             Add it in Settings → URL Allowlist before paying.",
+                            url
+                        )
+                    ).await;
                 }
 
                 let runtime_cfg = crate::config::RuntimeConfig::load(&db);
@@ -927,7 +965,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                             "[host_x402_pay] blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR",
                             amount_hbar, per_task
                         );
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!(
+                                "x402.pay blocked by policy (curb.spend-limit): {:.6} HBAR exceeds the per-task cap of {:.6} HBAR",
+                                amount_hbar, per_task
+                            )
+                        ).await;
                     }
                 }
 
@@ -940,7 +984,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         "[host_x402_pay] blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap",
                         amount_hbar
                     );
-                    return 0;
+                    return write_wasm_error(
+                        &mut caller,
+                        &format!(
+                            "x402.pay blocked by policy (curb.spend-limit): {:.6} HBAR exceeds the rolling 24-hour daily budget cap",
+                            amount_hbar
+                        )
+                    ).await;
                 }
 
                 // Step 2: Pay via X402PaymentVault
@@ -950,7 +1000,10 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     None => {
                         let _ = db.release_spend_hold(&agent_did, &pkey);
                         eprintln!("[host_x402_pay] x402_pay capability not enabled");
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            "x402.pay: payment vault not configured — set HEDERA_ACCOUNT_ID and HEDERA_PRIVATE_KEY in the daemon environment"
+                        ).await;
                     }
                 };
 
@@ -971,7 +1024,10 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     Err(e) => {
                         let _ = db.release_spend_hold(&agent_did, &pkey);
                         eprintln!("[host_x402_pay] payment failed: {}", e);
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("x402.pay: Hedera payment failed: {}", e)
+                        ).await;
                     }
                 };
 
@@ -989,7 +1045,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                             && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                                  eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                             }
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!(
+                                "x402.pay: payment sent (tx: {}) but content delivery failed: {}",
+                                payment_result.transaction_id, e
+                            )
+                        ).await;
                     }
                 };
 
@@ -999,7 +1061,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                             eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                         }
-                    return 0;
+                    return write_wasm_error(
+                        &mut caller,
+                        &format!(
+                            "x402.pay: payment sent (tx: {}) but server returned HTTP {} after payment — content not delivered",
+                            payment_result.transaction_id, retry_resp.status()
+                        )
+                    ).await;
                 }
 
                 // READING THE SETTLEMENT CONFIRMATION — check for PAYMENT-RESPONSE header on successful response:
@@ -1038,7 +1106,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                             && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                                 eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
                             }
-                        return 0;
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!(
+                                "x402.pay: payment sent (tx: {}) but failed to read response body: {}",
+                                payment_result.transaction_id, e
+                            )
+                        ).await;
                     }
                 };
 
@@ -1067,7 +1141,6 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
 }
 
 // ── Hedera payment capability ────────────────────────────────────────────────
-
 fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap_async(
         "aria",

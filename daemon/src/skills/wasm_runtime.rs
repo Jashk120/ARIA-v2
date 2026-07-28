@@ -912,6 +912,15 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
                 let agent_did = caller.data().agent_did.clone();
 
+                // Resolve HCS audit client + topic once, used across all governance checks below.
+                // Mirrors what react_loop.rs does for hedera_pay.
+                let audit_client = caller.data().x402_vault.as_ref().map(|v| v.client());
+                let topic_id = crate::config::RuntimeConfig::load(&db).governance.audit_topic_id.clone();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
                 // Log the attempt unconditionally, before any allow/block decision,
                 // so a blocked spam loop still counts toward its own rate limit.
                 // Keyed on the request url, not pay_to — one provider can serve
@@ -931,6 +940,20 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         "[host_x402_pay] blocked by rate limit: {} attempts to '{}' in the last hour (max 10)",
                         recent_attempts, url
                     );
+                    crate::payments::audit::write_payment_decision(
+                        audit_client.clone(), topic_id.clone(),
+                        crate::payments::audit::CurbRecord {
+                            v: 1, agent: agent_did.clone(), ts: now_ms,
+                            policy: Some("curb.rate-limit".to_string()),
+                            method: Some("x402.pay".to_string()),
+                            amount: Some(0.0),
+                            currency: Some("HBAR".to_string()),
+                            counterparty: Some(url.clone()),
+                            allowed: Some(false),
+                            reason: Some(format!("rate_limit_exceeded:{}", recent_attempts)),
+                            request_id: None,
+                        },
+                    );
                     return write_wasm_error(
                         &mut caller,
                         &format!(
@@ -941,6 +964,24 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
 
                 let is_allowed = db.is_url_allowlisted(&agent_did, &url).unwrap_or(false);
+                crate::payments::audit::write_payment_decision(
+                    audit_client.clone(), topic_id.clone(),
+                    crate::payments::audit::CurbRecord {
+                        v: 1, agent: agent_did.clone(), ts: now_ms,
+                        policy: Some("curb.allowlist".to_string()),
+                        method: Some("x402.pay".to_string()),
+                        amount: Some(amount_hbar),
+                        currency: Some("HBAR".to_string()),
+                        counterparty: Some(url.clone()),
+                        allowed: Some(is_allowed),
+                        reason: Some(if is_allowed {
+                            "allowlisted".to_string()
+                        } else {
+                            format!("not_allowlisted:{}", url)
+                        }),
+                        request_id: None,
+                    },
+                );
                 if !is_allowed {
                     eprintln!(
                         "[host_x402_pay] blocked by policy (curb.allowlist): url '{}' is not on the allowlist (pay_to='{}', amount={} HBAR)",
@@ -965,6 +1006,20 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                             "[host_x402_pay] blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR",
                             amount_hbar, per_task
                         );
+                        crate::payments::audit::write_payment_decision(
+                            audit_client.clone(), topic_id.clone(),
+                            crate::payments::audit::CurbRecord {
+                                v: 1, agent: agent_did.clone(), ts: now_ms,
+                                policy: Some("curb.spend-limit".to_string()),
+                                method: Some("x402.pay".to_string()),
+                                amount: Some(amount_hbar),
+                                currency: Some("HBAR".to_string()),
+                                counterparty: Some(pay_to.clone()),
+                                allowed: Some(false),
+                                reason: Some("per_task_exceeded".to_string()),
+                                request_id: None,
+                            },
+                        );
                         return write_wasm_error(
                             &mut caller,
                             &format!(
@@ -979,6 +1034,24 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 let reserved = db
                     .try_reserve_spend(&agent_did, &pkey, amount_hbar, governance.per_day_cap)
                     .unwrap_or(false);
+                crate::payments::audit::write_payment_decision(
+                    audit_client.clone(), topic_id.clone(),
+                    crate::payments::audit::CurbRecord {
+                        v: 1, agent: agent_did.clone(), ts: now_ms,
+                        policy: Some("curb.spend-limit".to_string()),
+                        method: Some("x402.pay".to_string()),
+                        amount: Some(amount_hbar),
+                        currency: Some("HBAR".to_string()),
+                        counterparty: Some(pay_to.clone()),
+                        allowed: Some(reserved),
+                        reason: Some(if reserved {
+                            "within_budget".to_string()
+                        } else {
+                            "per_day_exceeded".to_string()
+                        }),
+                        request_id: None,
+                    },
+                );
                 if !reserved {
                     eprintln!(
                         "[host_x402_pay] blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap",
@@ -992,6 +1065,22 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         )
                     ).await;
                 }
+
+                // x402 is always auto-approved (no human confirmation step) — log it.
+                crate::payments::audit::write_payment_decision(
+                    audit_client.clone(), topic_id.clone(),
+                    crate::payments::audit::CurbRecord {
+                        v: 1, agent: agent_did.clone(), ts: now_ms,
+                        policy: Some("curb.approval-tier".to_string()),
+                        method: Some("x402.pay".to_string()),
+                        amount: Some(amount_hbar),
+                        currency: Some("HBAR".to_string()),
+                        counterparty: Some(pay_to.clone()),
+                        allowed: Some(true),
+                        reason: Some("auto_approved".to_string()),
+                        request_id: None,
+                    },
+                );
 
                 // Step 2: Pay via X402PaymentVault
                 let vault: Arc<crate::payments::x402_vault::X402PaymentVault> =

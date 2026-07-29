@@ -2,6 +2,7 @@
   import DaemonBlock from './DaemonBlock.svelte';
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { chatState } from '$lib/domains/chat/chatState.svelte.js';
+  import { marked } from 'marked';
 
   /**
    * @typedef {import('$lib/types/chat.js').UiMessage} UiMessage
@@ -33,8 +34,8 @@
 {:else if msg.role === 'assistant'}
   <div class="row row-ai">
     <div class="avatar avatar-ai">✦</div>
-    <div class="bubble bubble-ai">
-      {msg.content}{#if msg.streaming}<span class="caret">█</span>{/if}
+    <div class="bubble bubble-ai md-body">
+      {@html marked.parse(msg.content ?? '', { async: false })}{#if msg.streaming}<span class="caret">█</span>{/if}
     </div>
   </div>
 

@@ -1626,6 +1626,20 @@ select:focus {
   line-height: 1.3;
 }
 
+.x402-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+}
+
+.x402-toggle input {
+  cursor: pointer;
+}
+
 .trail-items {
   list-style: none;
   margin: 0;

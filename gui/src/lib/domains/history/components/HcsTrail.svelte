@@ -8,6 +8,17 @@
   /** @type {Set<number>} */
   let expandedSeqs = $state(new Set());
 
+  /** @type {boolean} */
+  let showX402 = $state(true);
+
+  const filteredHcs = $derived(
+    (historyState.historyHcs ?? []).filter((msg) => {
+      if (showX402) return true;
+      const method = msg.record?.method;
+      return method !== 'x402.pay';
+    })
+  );
+
   /**
    * @param {number} seq
    */
@@ -92,7 +103,7 @@
     <span class="trail-empty-icon">🔗</span>
     <p>No HCS decision records found on the audit topic.</p>
     <p class="trail-empty-note">
-      x402 payments are not logged to HCS by design — only <code>hedera_pay</code> decisions appear here.
+      Each message is an on-chain audit record of a payment governance decision.
     </p>
   </div>
 {:else}
@@ -100,11 +111,14 @@
     <!-- HCS trail list -->
     <div class="trail-list">
       <div class="trail-list-header">
-        <span>{historyState.historyHcs.length} HCS message{historyState.historyHcs.length !== 1 ? 's' : ''}</span>
-        <span class="trail-list-note">x402 payments excluded by design</span>
+        <span>{filteredHcs.length} HCS message{filteredHcs.length !== 1 ? 's' : ''}</span>
+        <label class="x402-toggle">
+          <input type="checkbox" bind:checked={showX402} />
+          <span>Show x402</span>
+        </label>
       </div>
       <ul class="trail-items">
-        {#each historyState.historyHcs as msg (msg.sequence_number)}
+        {#each filteredHcs as msg (msg.sequence_number)}
           {@const isSelected = selectedHcs?.sequence_number === msg.sequence_number}
           <li
             class="trail-item {isSelected ? 'trail-item-selected' : ''} {msg.decodeError ? 'trail-item-error' : ''}"

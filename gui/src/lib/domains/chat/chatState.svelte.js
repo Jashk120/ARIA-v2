@@ -432,6 +432,46 @@ class ChatState {
     );
   }
 
+  /**
+   * Called when a hold is approved or released from the Dashboard tab.
+   * Resolves active chat confirmation prompts and updates chat history so the agent knows.
+   * @param {'approve' | 'release'} action
+   */
+  handleDashboardHoldAction(action) {
+    for (const msg of this.messages) {
+      if (msg.role === 'awaiting_confirmation' && !msg.resolved) {
+        msg.resolved = true;
+        msg.resolutionReply = action === 'approve' ? 'yes' : 'no';
+      }
+      if (msg.daemonEvents) {
+        for (const ev of msg.daemonEvents) {
+          if (ev.event_type === 'ask' && !ev.resolved) {
+            ev.resolved = true;
+            ev.reply = action === 'approve' ? 'yes' : 'no';
+          }
+        }
+      }
+    }
+    this.messages = this.messages;
+
+    if (this.currentSession) {
+      tauriInvoke('clear_pending_confirmation', { sessionId: this.currentSession }).catch(() => {});
+    }
+
+    const note = action === 'approve'
+      ? '[System Notice]: Payment hold was approved and executed from the Dashboard.'
+      : '[System Notice]: Payment hold was released (cancelled) from the Dashboard.';
+
+    this.history = [
+      ...this.history,
+      { role: 'user', content: note }
+    ];
+
+    if (this.currentSession) {
+      this.persistEvent('user', note, 'user_reply', { content: note }, this.#currentGroupId);
+    }
+  }
+
   async scrollBottom() {
     setTimeout(() => {
       if (this.messagesEl) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;

@@ -191,6 +191,12 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_all_pending_confirmations(&self) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET pending_confirmation = NULL", [])?;
+        Ok(())
+    }
+
     // ── Message Operations ────────────────────────────────────────────────────
 
     /// Persist any event the agent produces — plain text, a daemon

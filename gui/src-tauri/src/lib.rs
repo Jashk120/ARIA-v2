@@ -126,19 +126,23 @@ async fn mutate_allowlist(action: String, account: String) -> Result<Value, Stri
 /// verbatim — the caller re-queries `query_holds`/`query_payment_history`
 /// afterward rather than trusting this response to update local state.
 #[tauri::command]
-async fn approve_hold(payment_key: String) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || daemon::approve_hold(&payment_key))
+async fn approve_hold(state: State<'_, AppState>, payment_key: String) -> Result<Value, String> {
+    let res = tokio::task::spawn_blocking(move || daemon::approve_hold(&payment_key))
         .await
-        .map_err(|e| format!("Block thread error: {e}"))?
+        .map_err(|e| format!("Block thread error: {e}"))??;
+    let _ = state.db.clear_all_pending_confirmations();
+    Ok(res)
 }
 
 /// Release a pending hold via the daemon's `release_hold` TCP endpoint
 /// without paying it. Same re-query-after pattern as `approve_hold`.
 #[tauri::command]
-async fn release_hold(payment_key: String) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || daemon::release_hold(&payment_key))
+async fn release_hold(state: State<'_, AppState>, payment_key: String) -> Result<Value, String> {
+    let res = tokio::task::spawn_blocking(move || daemon::release_hold(&payment_key))
         .await
-        .map_err(|e| format!("Block thread error: {e}"))?
+        .map_err(|e| format!("Block thread error: {e}"))??;
+    let _ = state.db.clear_all_pending_confirmations();
+    Ok(res)
 }
 
 /// Add or remove a URL on the x402 URL allowlist via the daemon's
@@ -263,6 +267,17 @@ async fn load_pending_confirmation(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn clear_pending_confirmation(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .db
+        .clear_pending_confirmation(&session_id)
+        .map_err(|e| e.to_string())
+}
+
 /// List all sessions.
 #[tauri::command]
 async fn list_sessions(
@@ -319,6 +334,7 @@ pub fn run() {
             load_messages,
             save_pending_confirmation,
             load_pending_confirmation,
+            clear_pending_confirmation,
             list_sessions,
             delete_session
         ])

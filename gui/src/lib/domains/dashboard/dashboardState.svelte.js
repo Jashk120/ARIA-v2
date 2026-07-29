@@ -1,6 +1,7 @@
 import { tauriInvoke } from '$lib/services/tauri.js';
 import { daemonState } from '$lib/services/daemonState.svelte.js';
 import { historyState } from '$lib/domains/history/historyState.svelte.js';
+import { chatState } from '$lib/domains/chat/chatState.svelte.js';
 
 /**
  * @typedef {import('$lib/types/dashboard.js').BudgetInfo} BudgetInfo
@@ -75,6 +76,7 @@ class DashboardState {
 
     try {
       await tauriInvoke(action === 'approve' ? 'approve_hold' : 'release_hold', { paymentKey: payment_key });
+      chatState.handleDashboardHoldAction(action);
       this.holdPendingAction = null;
       await this.loadDashboard();
       if (historyState.historyPaymentsLoadedOnce) {

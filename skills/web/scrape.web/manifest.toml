@@ -13,5 +13,16 @@ http = true
 args_schema   = '{"url":"string","max_chars":4000}'
 output_schema = '{"url":"string","text":"string","chars":"number"}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.url]
+type = "string"
+description = "Full URL of the web page to fetch and extract text from"
+
+[call.parameters.properties.max_chars]
+type = "integer"
+description = "Maximum number of characters to extract (default: 4000)"
+
 [react]
-max_steps = 3
+max_steps = 5

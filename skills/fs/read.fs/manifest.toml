@@ -14,6 +14,17 @@ fs = true
 args_schema   = '{"path":"string","max_chars":4000}'
 output_schema = '{"path":"string","text":"string","chars":"number","truncated":"bool"}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path to the text file to read on the local filesystem"
+
+[call.parameters.properties.max_chars]
+type = "integer"
+description = "Maximum number of characters to read (default: 4000)"
+
 [react]
 max_steps = 3
 

@@ -14,6 +14,25 @@ fs = true
 args_schema   = '{"path":"string","query":"string","mode":"name|content","max_results":20}'
 output_schema = '{"matches":[{"path":"string","preview":"string"}],"truncated":"bool"}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Root directory path to start searching in"
+
+[call.parameters.properties.query]
+type = "string"
+description = "Search string or filename pattern to match"
+
+[call.parameters.properties.mode]
+type = "string"
+description = "Search mode: 'name' to search by filename pattern or 'content' to search file contents"
+
+[call.parameters.properties.max_results]
+type = "integer"
+description = "Maximum number of matching results to return (default: 20)"
+
 [react]
 max_steps = 3
 

@@ -646,17 +646,17 @@ pub async fn run_react_loop(
                                 }
                             };
 
-                        // Check 1a: Allowlist (curb.allowlist)
+                        // Check 1a: Allowlist (aria.allowlist)
                         let is_allowed =
                             db.is_account_allowlisted(&agent_did, &recipient).unwrap_or(false);
                         crate::payments::audit::write_payment_decision(
                             audit_client.clone(),
                             topic_id.clone(),
-                            crate::payments::audit::CurbRecord {
+                            crate::payments::audit::AriaRecord {
                                 v: 1,
                                 agent: agent_did.clone(),
                                 ts: now_ms,
-                                policy: Some("curb.allowlist".to_string()),
+                                policy: Some("aria.allowlist".to_string()),
                                 method: Some(skill.clone()),
                                 amount: Some(amount_hbar),
                                 currency: Some("HBAR".to_string()),
@@ -673,7 +673,7 @@ pub async fn run_react_loop(
 
                         if !is_allowed {
                             let err_msg = format!(
-                                "Payment blocked by policy (curb.allowlist): account '{}' is not on the allowlist.",
+                                "Payment blocked by policy (aria.allowlist): account '{}' is not on the allowlist.",
                                 recipient
                             );
                             let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
@@ -681,17 +681,17 @@ pub async fn run_react_loop(
                             break;
                         }
 
-                        // Check 1b: Spend Limit (curb.spend-limit)
+                        // Check 1b: Spend Limit (aria.spend-limit)
                         if let Some(per_task) = governance.per_task_cap {
                             if amount_hbar > per_task {
                                 crate::payments::audit::write_payment_decision(
                                     audit_client.clone(),
                                     topic_id.clone(),
-                                    crate::payments::audit::CurbRecord {
+                                    crate::payments::audit::AriaRecord {
                                         v: 1,
                                         agent: agent_did.clone(),
                                         ts: now_ms,
-                                        policy: Some("curb.spend-limit".to_string()),
+                                        policy: Some("aria.spend-limit".to_string()),
                                         method: Some(skill.clone()),
                                         amount: Some(amount_hbar),
                                         currency: Some("HBAR".to_string()),
@@ -703,7 +703,7 @@ pub async fn run_react_loop(
                                 );
 
                                 let err_msg = format!(
-                                    "Payment blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR.",
+                                    "Payment blocked by policy (aria.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR.",
                                     amount_hbar, per_task
                                 );
                                 let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
@@ -725,11 +725,11 @@ pub async fn run_react_loop(
                         crate::payments::audit::write_payment_decision(
                             audit_client.clone(),
                             topic_id.clone(),
-                            crate::payments::audit::CurbRecord {
+                            crate::payments::audit::AriaRecord {
                                 v: 1,
                                 agent: agent_did.clone(),
                                 ts: now_ms,
-                                policy: Some("curb.spend-limit".to_string()),
+                                policy: Some("aria.spend-limit".to_string()),
                                 method: Some(skill.clone()),
                                 amount: Some(amount_hbar),
                                 currency: Some("HBAR".to_string()),
@@ -746,7 +746,7 @@ pub async fn run_react_loop(
 
                         if !reserved {
                             let err_msg = format!(
-                                "Payment blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap.",
+                                "Payment blocked by policy (aria.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap.",
                                 amount_hbar
                             );
                             let _ = tx.send(AgentEvent::Error { content: err_msg }).await;
@@ -754,7 +754,7 @@ pub async fn run_react_loop(
                             break;
                         }
 
-                        // Check 1c: Approval Tier (curb.approval-tier)
+                        // Check 1c: Approval Tier (aria.approval-tier)
                         let auto_approved = match governance.auto_under {
                             Some(threshold) if amount_hbar <= threshold => true,
                             _ => false,
@@ -764,11 +764,11 @@ pub async fn run_react_loop(
                             crate::payments::audit::write_payment_decision(
                                 audit_client.clone(),
                                 topic_id.clone(),
-                                crate::payments::audit::CurbRecord {
+                                crate::payments::audit::AriaRecord {
                                     v: 1,
                                     agent: agent_did.clone(),
                                     ts: now_ms,
-                                    policy: Some("curb.approval-tier".to_string()),
+                                    policy: Some("aria.approval-tier".to_string()),
                                     method: Some(skill.clone()),
                                     amount: Some(amount_hbar),
                                     currency: Some("HBAR".to_string()),
@@ -784,11 +784,11 @@ pub async fn run_react_loop(
                             crate::payments::audit::write_payment_decision(
                                 audit_client.clone(),
                                 topic_id.clone(),
-                                crate::payments::audit::CurbRecord {
+                                crate::payments::audit::AriaRecord {
                                     v: 1,
                                     agent: agent_did.clone(),
                                     ts: now_ms,
-                                    policy: Some("curb.approval-tier".to_string()),
+                                    policy: Some("aria.approval-tier".to_string()),
                                     method: Some(skill.clone()),
                                     amount: Some(amount_hbar),
                                     currency: Some("HBAR".to_string()),

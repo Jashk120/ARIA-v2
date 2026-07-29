@@ -14,6 +14,13 @@ fs = true
 args_schema   = '{"path":"string"}'
 output_schema = '{"path":"string","entries":[{"name":"string","is_dir":"bool","size":"number"}]}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Directory path to list files and subdirectories from"
+
 [react]
 max_steps = 3
 

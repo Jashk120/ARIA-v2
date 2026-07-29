@@ -795,7 +795,7 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    // ── Payment Governance (Curb Port) ──────────────────────────────────────────
+    // ── Payment Governance (ARIA Port) ──────────────────────────────────────────
 
     pub fn is_account_allowlisted(&self, agent_did: &str, account: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
@@ -845,14 +845,26 @@ impl Db {
     // account-based allowlist above is untouched by this — these are a
     // separate table/functions for the x402 path only.
 
+    /// Returns `true` if `url` matches any allowlisted entry for `agent_did`.
+    ///
+    /// Matching is **prefix-based**: an allowlisted entry of `https://api.example.com`
+    /// will permit requests to `https://api.example.com/a`, `https://api.example.com/b`,
+    /// etc., without requiring each route to be added separately. An exact match
+    /// (entry == url) is also accepted. Rust-side `starts_with` is used instead of
+    /// SQL `LIKE` to avoid pattern-injection issues with URLs containing `%` or `_`.
     pub fn is_url_allowlisted(&self, agent_did: &str, url: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT count(*) FROM payment_url_allowlist WHERE agent_did = ? AND url = ?",
-            params![agent_did, url],
-            |row| row.get(0),
+        let mut stmt = conn.prepare(
+            "SELECT url FROM payment_url_allowlist WHERE agent_did = ?",
         )?;
-        Ok(count > 0)
+        let mut rows = stmt.query([agent_did])?;
+        while let Some(row) = rows.next()? {
+            let entry: String = row.get(0)?;
+            if url.starts_with(&entry as &str) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn add_url_allowlist_entry(&self, agent_did: &str, url: &str) -> anyhow::Result<()> {
@@ -1355,6 +1367,8 @@ mod tests {
 
     /// Mirrors wire_x402_pay's allowlist check: a url that was never added to
     /// the url allowlist must be blocked, and adding it must unblock it.
+    /// Also verifies prefix-matching: allowlisting a base URL permits all
+    /// sub-paths without requiring each route to be added individually.
     /// hedera_pay's account-based allowlist (is_account_allowlisted) is a
     /// separate table/functions entirely and is unaffected — see
     /// test_allowlist_crud, which still passes unmodified.
@@ -1368,19 +1382,35 @@ mod tests {
         let db = Db { conn: std::sync::Mutex::new(conn) };
 
         let agent = "did:aria:test";
-        let url = "https://api.example.com/paid-resource";
+        let base_url = "https://api.example.com";
+        let sub_url_a = "https://api.example.com/paid-resource";
+        let sub_url_b = "https://api.example.com/other";
+        let unrelated = "https://evil.example.com/paid-resource";
 
-        assert!(!db.is_url_allowlisted(agent, url)?, "an unlisted url must be blocked");
+        // Nothing allowlisted yet — all URLs must be blocked.
+        assert!(!db.is_url_allowlisted(agent, base_url)?,  "unlisted base must be blocked");
+        assert!(!db.is_url_allowlisted(agent, sub_url_a)?, "unlisted sub-path must be blocked");
+        assert!(!db.is_url_allowlisted(agent, unrelated)?, "unlisted unrelated must be blocked");
 
-        db.add_url_allowlist_entry(agent, url)?;
-        assert!(db.is_url_allowlisted(agent, url)?, "allowlisting the url must unblock it");
+        // Add only the base URL.
+        db.add_url_allowlist_entry(agent, base_url)?;
+
+        // Exact match and all sub-paths must now pass.
+        assert!(db.is_url_allowlisted(agent, base_url)?,  "exact base match must be allowed");
+        assert!(db.is_url_allowlisted(agent, sub_url_a)?, "sub-path /paid-resource must be allowed by prefix");
+        assert!(db.is_url_allowlisted(agent, sub_url_b)?, "sub-path /other must be allowed by prefix");
+
+        // A URL that merely contains the base as a substring (but different origin)
+        // must NOT be allowed.
+        assert!(!db.is_url_allowlisted(agent, unrelated)?, "different origin must still be blocked");
 
         let list = db.list_url_allowlist(agent)?;
-        assert_eq!(list, vec![url.to_string()]);
+        assert_eq!(list, vec![base_url.to_string()]);
 
-        let removed = db.remove_url_allowlist_entry(agent, url)?;
+        let removed = db.remove_url_allowlist_entry(agent, base_url)?;
         assert!(removed);
-        assert!(!db.is_url_allowlisted(agent, url)?);
+        assert!(!db.is_url_allowlisted(agent, base_url)?);
+        assert!(!db.is_url_allowlisted(agent, sub_url_a)?);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())

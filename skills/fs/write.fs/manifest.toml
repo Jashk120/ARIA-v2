@@ -14,6 +14,21 @@ fs = true
 args_schema   = '{"path":"string","content":"string","mode":"overwrite|append"}'
 output_schema = '{"path":"string","bytes_written":"number"}'
 
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path to the text file to write on the local filesystem"
+
+[call.parameters.properties.content]
+type = "string"
+description = "The text content to write to the file"
+
+[call.parameters.properties.mode]
+type = "string"
+description = "Write mode: 'overwrite' to replace file content or 'append' to append (default: 'overwrite')"
+
 [react]
 max_steps = 1
 

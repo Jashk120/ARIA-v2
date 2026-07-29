@@ -105,7 +105,7 @@ pub fn build_payment_transaction(
     client_private_key: &PrivateKey,
     requirements: &PaymentRequirements,
     _hedera_client: &Client,
-) -> Result<String, PaymentError> {
+) -> Result<(String, String), PaymentError> {
     let amount: i64 = requirements.amount.parse().map_err(|_| PaymentError::InvalidAmount)?;
     if amount <= 0 {
         return Err(PaymentError::InvalidAmount);
@@ -131,7 +131,8 @@ pub fn build_payment_transaction(
     let fee_payer = AccountId::from_str(fee_payer_str)
         .map_err(|e| PaymentError::HederaSdkError(e.to_string()))?;
 
-    tx.transaction_id(TransactionId::generate(fee_payer));
+    let generated_tx_id = TransactionId::generate(fee_payer);
+    tx.transaction_id(generated_tx_id);
 
     // Pin to a single node to ensure we don't generate a multi-node transaction list.
     // The facilitator JS SDK only supports decoding a 1-element list.
@@ -154,7 +155,7 @@ pub fn build_payment_transaction(
         .to_signed_transaction_bytes()
         .map_err(|e| PaymentError::HederaSdkError(e.to_string()))?;
 
-    Ok(STANDARD.encode(encode_as_transaction_list(signed_bytes)))
+    Ok((STANDARD.encode(encode_as_transaction_list(signed_bytes)), generated_tx_id.to_string()))
 }
 
 /// Wraps raw `SignedTransaction` protobuf bytes into the single-entry
@@ -226,8 +227,9 @@ mod tests {
         );
 
         assert!(res.is_ok(), "Expected Ok transaction, got: {:?}", res);
-        let tx_b64 = res.unwrap();
+        let (tx_b64, tx_id) = res.unwrap();
         assert!(!tx_b64.is_empty(), "Transaction base64 should not be empty");
+        assert!(!tx_id.is_empty(), "Transaction ID should not be empty");
     }
 
     #[tokio::test]
@@ -259,8 +261,9 @@ mod tests {
         );
 
         assert!(res.is_ok(), "Expected Ok transaction, got: {:?}", res);
-        let tx_b64 = res.unwrap();
+        let (tx_b64, tx_id) = res.unwrap();
         assert!(!tx_b64.is_empty(), "Transaction base64 should not be empty");
+        assert!(!tx_id.is_empty(), "Transaction ID should not be empty");
 
         // BUG-2 regression coverage: explicitly decode the bytes and verify.
         let raw = base64::engine::general_purpose::STANDARD.decode(&tx_b64).unwrap();

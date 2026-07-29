@@ -53,8 +53,8 @@ struct DaemonRequest {
     #[serde(default)]
     query: Option<String>,
     /// Mutating daemon endpoint, short-circuited the same way `query` is:
-    /// "mutate_allowlist" or "mutate_url_allowlist". When set, `task` and
-    /// `query` are ignored.
+    /// "mutate_allowlist", "mutate_url_allowlist", "approve_hold", or
+    /// "release_hold". When set, `task` and `query` are ignored.
     #[serde(default)]
     mutate: Option<String>,
     /// For `mutate: "mutate_allowlist"` / `"mutate_url_allowlist"`: "add" or
@@ -64,6 +64,9 @@ struct DaemonRequest {
     account: Option<String>,
     /// For `mutate: "mutate_url_allowlist"`: the url to add/remove.
     url: Option<String>,
+    /// For `mutate: "approve_hold"` / `"release_hold"`: the payment key
+    /// identifying the hold to act on.
+    payment_key: Option<String>,
     /// For `query: "query_payment_history"`: max rows to return (default 50).
     #[serde(default)]
     limit: Option<i64>,
@@ -147,6 +150,12 @@ enum QueryResponse {
         /// Same semantics as MutateAllowlist::changed, for the url allowlist.
         changed: bool,
     },
+    MutateHold {
+        agent_did: String,
+        payment_key: String,
+        /// "approved" or "released" — mirrors the action requested.
+        action: String,
+    },
     QueryError {
         message: String,
     },
@@ -224,6 +233,212 @@ fn mutate_url_allowlist_entry(
         other => {
             anyhow::bail!("unknown allowlist action: {} (expected \"add\" or \"remove\")", other)
         }
+    }
+}
+
+/// Handles the TCP `approve_hold` endpoint from the dashboard.
+/// Looks up the `awaiting_confirmation` task that owns this payment_key,
+/// then runs the ReAct loop with "yes" so the agent executes the payment,
+/// logs to HCS audit log, continues any remaining steps in the prompt,
+/// and seals the task as done when finished.
+#[allow(clippy::too_many_arguments)]
+async fn handle_approve_hold(
+    payment_key: Option<&str>,
+    agent_did: &str,
+    db: &std::sync::Arc<crate::db::Db>,
+    skills: &std::sync::Arc<crate::skills::SkillManager>,
+    payment_vault: Option<std::sync::Arc<crate::payments::direct::PaymentVault>>,
+    x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    injected_config: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    api_key: String,
+    vault: &std::sync::Arc<std::sync::Arc<dyn crate::identity::IdentityVault>>,
+) -> QueryResponse {
+    let Some(key) = payment_key else {
+        return QueryResponse::QueryError {
+            message: "approve_hold requires a payment_key".to_string(),
+        };
+    };
+
+    let task = match db.find_task_awaiting_by_payment_key(agent_did, key) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return QueryResponse::QueryError {
+                message: format!("no awaiting task found for payment_key '{key}'"),
+            };
+        }
+        Err(e) => {
+            return QueryResponse::QueryError {
+                message: format!("DB error looking up hold: {e}"),
+            };
+        }
+    };
+
+    let (task_id, pending_json, history) = task;
+    let pending_action: Option<serde_json::Value> = serde_json::from_str(&pending_json).ok();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let db_for_loop = db.clone();
+    let did_for_loop = agent_did.to_string();
+    let task_id_for_loop = task_id.clone();
+    let injected_config_cloned = injected_config.clone();
+    let skills_cloned = skills.clone();
+    let payment_vault_cloned = payment_vault.clone();
+    let x402_vault_cloned = x402_vault.clone();
+
+    let handle = tokio::spawn(async move {
+        crate::agent::react_loop::run_react_loop(
+            api_key, history, injected_config_cloned, skills_cloned, tx, "yes".to_string(), None,
+            db_for_loop, payment_vault_cloned, x402_vault_cloned, did_for_loop, task_id_for_loop, pending_action
+        ).await
+    });
+
+    let mut last_action: Option<(String, serde_json::Value)> = None;
+
+    while let Some(event) = rx.recv().await {
+        match &event {
+            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+                last_action = Some((skill.clone(), args.clone()));
+            }
+            crate::agent::react_loop::AgentEvent::Observation { content } |
+            crate::agent::react_loop::AgentEvent::Error { content } => {
+                let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
+                if let Some((skill, args)) = last_action.take()
+                    && let Ok((step, prev_hash, timestamp)) = db.get_next_step_info(&task_id) {
+                        let input_hash = crate::crypto::sha256_hex_str(&args.to_string());
+                        let result_hash = crate::crypto::sha256_hex_str(content);
+                        let chain_hash = crate::crypto::compute_chain_hash(
+                            &prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp
+                        );
+
+                        if let Ok(sig) = vault.sign(chain_hash.as_bytes()).await {
+                            let _ = db.log_task_step(&task_id, agent_did, &skill, &args.to_string(), content, success, &sig);
+                        }
+                    }
+            }
+            _ => {}
+        }
+    }
+
+    let status = match handle.await {
+        Ok(Ok(())) => crate::db::TaskStatus::Done,
+        _ => crate::db::TaskStatus::Failed,
+    };
+
+    if let Ok(Some(session)) = db.get_task_session(&task_id) {
+        if session.status != "awaiting_confirmation" {
+            let _ = db.seal_task(&task_id, status);
+        }
+    }
+
+    QueryResponse::MutateHold {
+        agent_did: agent_did.to_string(),
+        payment_key: key.to_string(),
+        action: "approved".to_string(),
+    }
+}
+
+/// Handles the TCP `release_hold` endpoint from the dashboard.
+/// Looks up the `awaiting_confirmation` task that owns this payment_key,
+/// then runs the ReAct loop with "no" so the hold is released, the pending action
+/// cleared, and the task completed.
+#[allow(clippy::too_many_arguments)]
+async fn handle_release_hold(
+    payment_key: Option<&str>,
+    agent_did: &str,
+    db: &std::sync::Arc<crate::db::Db>,
+    skills: &std::sync::Arc<crate::skills::SkillManager>,
+    payment_vault: Option<std::sync::Arc<crate::payments::direct::PaymentVault>>,
+    x402_vault: Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    injected_config: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    api_key: String,
+    vault: &std::sync::Arc<std::sync::Arc<dyn crate::identity::IdentityVault>>,
+) -> QueryResponse {
+    let Some(key) = payment_key else {
+        return QueryResponse::QueryError {
+            message: "release_hold requires a payment_key".to_string(),
+        };
+    };
+
+    let task = match db.find_task_awaiting_by_payment_key(agent_did, key) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            // No awaiting task found — the hold may be stale (from a crash).
+            // Release it from payment_holds directly so budget is freed.
+            let _ = db.release_spend_hold(agent_did, key);
+            return QueryResponse::MutateHold {
+                agent_did: agent_did.to_string(),
+                payment_key: key.to_string(),
+                action: "released".to_string(),
+            };
+        }
+        Err(e) => {
+            return QueryResponse::QueryError {
+                message: format!("DB error looking up hold: {e}"),
+            };
+        }
+    };
+
+    let (task_id, pending_json, history) = task;
+    let pending_action: Option<serde_json::Value> = serde_json::from_str(&pending_json).ok();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let db_for_loop = db.clone();
+    let did_for_loop = agent_did.to_string();
+    let task_id_for_loop = task_id.clone();
+    let injected_config_cloned = injected_config.clone();
+    let skills_cloned = skills.clone();
+    let payment_vault_cloned = payment_vault.clone();
+    let x402_vault_cloned = x402_vault.clone();
+
+    let handle = tokio::spawn(async move {
+        crate::agent::react_loop::run_react_loop(
+            api_key, history, injected_config_cloned, skills_cloned, tx, "no".to_string(), None,
+            db_for_loop, payment_vault_cloned, x402_vault_cloned, did_for_loop, task_id_for_loop, pending_action
+        ).await
+    });
+
+    let mut last_action: Option<(String, serde_json::Value)> = None;
+
+    while let Some(event) = rx.recv().await {
+        match &event {
+            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+                last_action = Some((skill.clone(), args.clone()));
+            }
+            crate::agent::react_loop::AgentEvent::Observation { content } |
+            crate::agent::react_loop::AgentEvent::Error { content } => {
+                let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
+                if let Some((skill, args)) = last_action.take()
+                    && let Ok((step, prev_hash, timestamp)) = db.get_next_step_info(&task_id) {
+                        let input_hash = crate::crypto::sha256_hex_str(&args.to_string());
+                        let result_hash = crate::crypto::sha256_hex_str(content);
+                        let chain_hash = crate::crypto::compute_chain_hash(
+                            &prev_hash, &step.to_string(), &skill, &input_hash, &result_hash, &timestamp
+                        );
+
+                        if let Ok(sig) = vault.sign(chain_hash.as_bytes()).await {
+                            let _ = db.log_task_step(&task_id, agent_did, &skill, &args.to_string(), content, success, &sig);
+                        }
+                    }
+            }
+            _ => {}
+        }
+    }
+
+    let status = match handle.await {
+        Ok(Ok(())) => crate::db::TaskStatus::Done,
+        _ => crate::db::TaskStatus::Failed,
+    };
+
+    if let Ok(Some(session)) = db.get_task_session(&task_id) {
+        if session.status != "awaiting_confirmation" {
+            let _ = db.seal_task(&task_id, status);
+        }
+    }
+
+    QueryResponse::MutateHold {
+        agent_did: agent_did.to_string(),
+        payment_key: key.to_string(),
+        action: "released".to_string(),
     }
 }
 
@@ -677,6 +892,34 @@ async fn run_daemon() -> anyhow::Result<()> {
                                 &agent_did,
                                 &db,
                             ),
+                            "approve_hold" => {
+                                handle_approve_hold(
+                                    req.payment_key.as_deref(),
+                                    &agent_did,
+                                    &db,
+                                    &skills,
+                                    payment_vault.clone(),
+                                    x402_vault.clone(),
+                                    &runtime_cfg.injected_config,
+                                    api_key.clone(),
+                                    &vault,
+                                )
+                                .await
+                            }
+                            "release_hold" => {
+                                handle_release_hold(
+                                    req.payment_key.as_deref(),
+                                    &agent_did,
+                                    &db,
+                                    &skills,
+                                    payment_vault.clone(),
+                                    x402_vault.clone(),
+                                    &runtime_cfg.injected_config,
+                                    api_key.clone(),
+                                    &vault,
+                                )
+                                .await
+                            }
                             other => QueryResponse::QueryError {
                                 message: format!("unknown mutate type: {}", other),
                             },

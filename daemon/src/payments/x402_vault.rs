@@ -77,8 +77,10 @@ impl X402PaymentVault {
             requirements.extra = serde_json::Value::Object(obj);
         }
 
-        // 3. Build and partially sign the transaction
-        let transaction = crate::payments::x402_types::build_payment_transaction(
+        // 3. Build and partially sign the transaction. The Hedera TransactionId is
+        // generated client-side (payer@valid_start), so we know it before any
+        // network call — no need to wait for settlement to have something to log.
+        let (transaction, generated_tx_id) = crate::payments::x402_types::build_payment_transaction(
             &self.operator_id,
             &self.private_key,
             &requirements,
@@ -106,33 +108,29 @@ impl X402PaymentVault {
             payload: PaymentPayloadData { transaction },
         };
 
-        // 5. Call facilitator.verify() first
-        let payload_json = serde_json::to_string(&payload).unwrap_or_default();
-        let _payload_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            payload_json.as_bytes(),
-        );
+        // NOTE: Do NOT call facilitator.verify() here.
+        // The server-node calls /verify + /settle itself when it receives the
+        // PAYMENT-SIGNATURE header (standard x402 flow). Pre-verifying here
+        // consumes the transaction's verify slot and causes the server-node's
+        // own /verify call to fail as a replay — producing "HTTP 402 after
+        // payment" on the retry GET. The server-node is the authoritative
+        // verifier and settler.
 
-        let verify_res = facilitator.verify(&payload, &requirements).await?;
-        if !verify_res.is_valid {
-            let reason =
-                verify_res.invalid_reason.unwrap_or_else(|| "Verification failed".to_string());
-            return Err(PaymentError::VerificationFailed(reason));
-        }
-
-        // 6. Call facilitator.settle()
-        let settle_res = facilitator.settle(&payload, &requirements).await?;
-        if !settle_res.success {
-            let reason = settle_res.error_reason.unwrap_or_else(|| "Settle failed".to_string());
-            return Err(PaymentError::VerificationFailed(reason));
-        }
-
-        let transaction_id = settle_res.transaction_id.clone();
-        let payer = settle_res.payer.clone().unwrap_or_else(|| self.operator_id.to_string());
-        let network = settle_res.network.clone();
+        // NOTE: we deliberately do NOT call facilitator.settle() here. Settlement
+        // actually submits the transaction to Hedera and consumes it — it can only
+        // happen once. The resource server calls /verify + /settle itself when it
+        // receives this payload via the PAYMENT-SIGNATURE header (standard x402
+        // flow), so settling here first would mean the transaction is already
+        // consumed by the time the server tries to settle it, and that second
+        // settle attempt fails. The real settlement confirmation is read back from
+        // the PAYMENT-RESPONSE header on the resource server's success response.
+        let transaction_id = generated_tx_id;
+        let payer = self.operator_id.to_string();
+        let network = requirements.network.clone();
         let hashscan_url = format!("https://hashscan.io/testnet/transaction/{}", transaction_id);
 
-        // 7. Log the payment to the SQLite `payments` table
+        // 7. Log the payment as PENDING — it becomes SUCCESS once the resource
+        // server's PAYMENT-RESPONSE header confirms actual on-chain settlement.
         let agent_did = self
             .db
             .get_identity()
@@ -153,7 +151,7 @@ impl X402PaymentVault {
             memo.unwrap_or(""),
             &transaction_id,
             &hashscan_url,
-            if settle_res.success { "SUCCESS" } else { "FAILED" },
+            "PENDING",
         ) {
             warn!("Failed to log payment to db: {}", e);
         }

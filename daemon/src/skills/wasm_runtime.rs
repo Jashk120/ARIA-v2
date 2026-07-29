@@ -942,9 +942,9 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     );
                     crate::payments::audit::write_payment_decision(
                         audit_client.clone(), topic_id.clone(),
-                        crate::payments::audit::CurbRecord {
+                        crate::payments::audit::AriaRecord {
                             v: 1, agent: agent_did.clone(), ts: now_ms,
-                            policy: Some("curb.rate-limit".to_string()),
+                            policy: Some("aria.rate-limit".to_string()),
                             method: Some("x402.pay".to_string()),
                             amount: Some(0.0),
                             currency: Some("HBAR".to_string()),
@@ -966,9 +966,9 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 let is_allowed = db.is_url_allowlisted(&agent_did, &url).unwrap_or(false);
                 crate::payments::audit::write_payment_decision(
                     audit_client.clone(), topic_id.clone(),
-                    crate::payments::audit::CurbRecord {
+                    crate::payments::audit::AriaRecord {
                         v: 1, agent: agent_did.clone(), ts: now_ms,
-                        policy: Some("curb.allowlist".to_string()),
+                        policy: Some("aria.allowlist".to_string()),
                         method: Some("x402.pay".to_string()),
                         amount: Some(amount_hbar),
                         currency: Some("HBAR".to_string()),
@@ -984,13 +984,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 );
                 if !is_allowed {
                     eprintln!(
-                        "[host_x402_pay] blocked by policy (curb.allowlist): url '{}' is not on the allowlist (pay_to='{}', amount={} HBAR)",
+                        "[host_x402_pay] blocked by policy (aria.allowlist): url '{}' is not on the allowlist (pay_to='{}', amount={} HBAR)",
                         url, pay_to, amount_hbar
                     );
                     return write_wasm_error(
                         &mut caller,
                         &format!(
-                            "x402.pay blocked by policy (curb.url-allowlist): '{}' is not on the approved URL allowlist. \
+                            "x402.pay blocked by policy (aria.url-allowlist): '{}' is not on the approved URL allowlist. \
                              Add it in Settings → URL Allowlist before paying.",
                             url
                         )
@@ -1003,14 +1003,14 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 if let Some(per_task) = governance.per_task_cap {
                     if amount_hbar > per_task {
                         eprintln!(
-                            "[host_x402_pay] blocked by policy (curb.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR",
+                            "[host_x402_pay] blocked by policy (aria.spend-limit): amount {} HBAR exceeds per-task cap of {} HBAR",
                             amount_hbar, per_task
                         );
                         crate::payments::audit::write_payment_decision(
                             audit_client.clone(), topic_id.clone(),
-                            crate::payments::audit::CurbRecord {
+                            crate::payments::audit::AriaRecord {
                                 v: 1, agent: agent_did.clone(), ts: now_ms,
-                                policy: Some("curb.spend-limit".to_string()),
+                                policy: Some("aria.spend-limit".to_string()),
                                 method: Some("x402.pay".to_string()),
                                 amount: Some(amount_hbar),
                                 currency: Some("HBAR".to_string()),
@@ -1023,7 +1023,7 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         return write_wasm_error(
                             &mut caller,
                             &format!(
-                                "x402.pay blocked by policy (curb.spend-limit): {:.6} HBAR exceeds the per-task cap of {:.6} HBAR",
+                                "x402.pay blocked by policy (aria.spend-limit): {:.6} HBAR exceeds the per-task cap of {:.6} HBAR",
                                 amount_hbar, per_task
                             )
                         ).await;
@@ -1036,9 +1036,9 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     .unwrap_or(false);
                 crate::payments::audit::write_payment_decision(
                     audit_client.clone(), topic_id.clone(),
-                    crate::payments::audit::CurbRecord {
+                    crate::payments::audit::AriaRecord {
                         v: 1, agent: agent_did.clone(), ts: now_ms,
-                        policy: Some("curb.spend-limit".to_string()),
+                        policy: Some("aria.spend-limit".to_string()),
                         method: Some("x402.pay".to_string()),
                         amount: Some(amount_hbar),
                         currency: Some("HBAR".to_string()),
@@ -1054,13 +1054,13 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 );
                 if !reserved {
                     eprintln!(
-                        "[host_x402_pay] blocked by policy (curb.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap",
+                        "[host_x402_pay] blocked by policy (aria.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap",
                         amount_hbar
                     );
                     return write_wasm_error(
                         &mut caller,
                         &format!(
-                            "x402.pay blocked by policy (curb.spend-limit): {:.6} HBAR exceeds the rolling 24-hour daily budget cap",
+                            "x402.pay blocked by policy (aria.spend-limit): {:.6} HBAR exceeds the rolling 24-hour daily budget cap",
                             amount_hbar
                         )
                     ).await;
@@ -1069,9 +1069,9 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 // x402 is always auto-approved (no human confirmation step) — log it.
                 crate::payments::audit::write_payment_decision(
                     audit_client.clone(), topic_id.clone(),
-                    crate::payments::audit::CurbRecord {
+                    crate::payments::audit::AriaRecord {
                         v: 1, agent: agent_did.clone(), ts: now_ms,
-                        policy: Some("curb.approval-tier".to_string()),
+                        policy: Some("aria.approval-tier".to_string()),
                         method: Some("x402.pay".to_string()),
                         amount: Some(amount_hbar),
                         currency: Some("HBAR".to_string()),

@@ -828,7 +828,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     if runtime_cfg.governance.audit_topic_id.is_none() {
         if let Some(ref pv) = payment_vault {
             let client = pv.client();
-            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "aria-audit").await
             {
                 info!("Provisioned new HCS payment audit topic: {}", tid);
                 println!("HCS Payment Audit Topic ID: {}", tid);
@@ -836,7 +836,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
         } else if let Some(ref xv) = x402_vault {
             let client = xv.client();
-            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "curb-audit").await
+            if let Ok(tid) = crate::payments::audit::create_audit_topic(&client, "aria-audit").await
             {
                 info!("Provisioned new HCS payment audit topic: {}", tid);
                 println!("HCS Payment Audit Topic ID: {}", tid);

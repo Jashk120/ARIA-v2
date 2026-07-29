@@ -79,9 +79,14 @@ fn ask_tool_definition() -> serde_json::Value {
 pub fn system_prompt(user_prompt: &str, skills_type: Option<String>, is_native: bool) -> String {
     if is_native {
         return format!(
+          
             "You are a tool-execution agent. Use the tools provided to fulfill the user's request. \
 If the request is ambiguous or you're missing information required to act safely and correctly, \
-call `{}` to ask the user instead of guessing.",
+call `{}` to ask the user instead of guessing. If a tool call returns an error, do not immediately \
+retry with different arguments. First diagnose from the error message whether retrying could plausibly \
+help (e.g. a bad query) versus whether it's a systemic failure (e.g. connection, parsing, auth, timeout) \
+that a different query won't fix. On a systemic failure, stop after one retry at most and report the \
+failure to the user instead of continuing.",
             ASK_TOOL_NAME
         );
     }

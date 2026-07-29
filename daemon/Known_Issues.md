@@ -200,7 +200,7 @@ transient failure.
 
 This is asymmetric with the `hedera_pay` confirm/deny path: those same
 governance checks run earlier, in `src/agent/react_loop.rs`, and *do* emit a
-specific reason (e.g. `"Payment blocked by policy (curb.allowlist): ..."`) as
+specific reason (e.g. `"Payment blocked by policy (aria.allowlist): ..."`) as
 an `AgentEvent::Error`. Only the autonomous x402 path loses the reason.
 
 Found while building the Aria-GUI payment-confirmation UI (three-outcome

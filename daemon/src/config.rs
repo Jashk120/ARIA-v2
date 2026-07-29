@@ -113,13 +113,13 @@ impl RuntimeConfig {
 
         let governance = PaymentGovernanceConfig {
             per_task_cap: parse_opt_f64("PER_TASK_CAP", "per_task_cap")
-                .or_else(|| parse_opt_f64("CURB_PER_TASK_CAP", "curb_per_task_cap")),
+                .or_else(|| parse_opt_f64("ARIA_PER_TASK_CAP", "aria_per_task_cap")),
             per_day_cap: parse_opt_f64("PER_DAY_CAP", "per_day_cap")
-                .or_else(|| parse_opt_f64("CURB_PER_DAY_CAP", "curb_per_day_cap")),
+                .or_else(|| parse_opt_f64("ARIA_PER_DAY_CAP", "aria_per_day_cap")),
             auto_under: parse_opt_f64("AUTO_UNDER", "auto_under")
-                .or_else(|| parse_opt_f64("CURB_AUTO_UNDER", "curb_auto_under")),
+                .or_else(|| parse_opt_f64("ARIA_AUTO_UNDER", "aria_auto_under")),
             audit_topic_id: parse_opt_str(
-                &["HEDERA_PAYMENT_AUDIT_TOPIC", "HEDERA_AUDIT_TOPIC", "CURB_AUDIT_TOPIC"],
+                &["HEDERA_PAYMENT_AUDIT_TOPIC", "HEDERA_AUDIT_TOPIC", "ARIA_AUDIT_TOPIC"],
                 "hedera_payment_audit_topic",
             ),
         };

@@ -7,7 +7,7 @@ use hiero_sdk::{
 use tracing::error;
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct CurbRecord {
+pub struct AriaRecord {
     pub v: u32,
     pub agent: String,
     pub ts: u64,
@@ -41,12 +41,12 @@ pub async fn create_audit_topic(client: &Client, memo: &str) -> anyhow::Result<S
     Ok(topic_id.to_string())
 }
 
-/// Non-blocking fire-and-forget write of a CurbRecord to Hedera Consensus Service.
+/// Non-blocking fire-and-forget write of an AriaRecord to Hedera Consensus Service.
 /// An HCS failure or network error NEVER blocks, delays, or reverses the policy decision.
 pub fn write_payment_decision(
     client: Option<Client>,
     topic_id_str: Option<String>,
-    record: CurbRecord,
+    record: AriaRecord,
 ) {
     let (Some(client), Some(topic_id_str)) = (client, topic_id_str) else {
         return;
@@ -61,7 +61,7 @@ pub fn write_payment_decision(
         let topic_id = match TopicId::from_str(&topic_id_str) {
             Ok(tid) => tid,
             Err(e) => {
-                error!("[curb audit] Invalid HCS topic ID '{}': {}", topic_id_str, e);
+                error!("[aria audit] Invalid HCS topic ID '{}': {}", topic_id_str, e);
                 return;
             }
         };
@@ -69,7 +69,7 @@ pub fn write_payment_decision(
         let payload = match serde_json::to_string(&record) {
             Ok(json) => json,
             Err(e) => {
-                error!("[curb audit] Failed to serialize record: {}", e);
+                error!("[aria audit] Failed to serialize record: {}", e);
                 return;
             }
         };
@@ -79,7 +79,7 @@ pub fn write_payment_decision(
 
         if let Err(e) = tx.execute(&client).await {
             error!(
-                "[curb audit] HCS write failed ({}/{}): {}",
+                "[aria audit] HCS write failed ({}/{}): {}",
                 record.policy.as_deref().unwrap_or(""),
                 record.reason.as_deref().unwrap_or(""),
                 e

@@ -373,6 +373,76 @@ impl Db {
         Ok(())
     }
 
+    /// Scan all tasks in `awaiting_confirmation` status for `agent_did` and
+    /// return the `(task_id, pending_action_json, history_json)` of the first
+    /// one whose pending action's payment key matches `target_payment_key`.
+    /// Called by the dashboard `approve_hold` / `release_hold` TCP handlers so
+    /// they can resolve the owning task without the GUI needing to track it.
+    pub fn find_task_awaiting_by_payment_key(
+        &self,
+        agent_did: &str,
+        target_payment_key: &str,
+    ) -> anyhow::Result<Option<(String, String, Vec<serde_json::Value>)>> {
+        use crate::payments::governance::compute_payment_key;
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, pending_action_json, history_json \
+             FROM tasks \
+             WHERE agent_did = ? AND status = 'awaiting_confirmation' \
+               AND pending_action_json IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([agent_did])?;
+        while let Some(row) = rows.next()? {
+            let task_id: String = row.get(0)?;
+            let pending_json: String = row.get(1)?;
+            let history_json: Option<String> = row.get(2)?;
+
+            let Ok(pending) = serde_json::from_str::<serde_json::Value>(&pending_json) else {
+                continue;
+            };
+
+            let skill = pending.get("skill").and_then(|v| v.as_str()).unwrap_or_default();
+            let args = pending.get("args").cloned().unwrap_or(serde_json::Value::Null);
+
+            // Compute the payment key the same way governance.rs does, then compare.
+            let key_match = {
+                // hedera_pay path
+                let hbar_key = args
+                    .get("recipient")
+                    .and_then(|v| v.as_str())
+                    .and_then(|rec| {
+                        args.get("amount")
+                            .and_then(|a| a.as_f64())
+                            .map(|amt| compute_payment_key(agent_did, rec, amt))
+                    });
+                // x402 path (pay_to / recipient / payee / destination / paymentAddress)
+                let x402_key = ["pay_to", "recipient", "payee", "destination", "paymentAddress"]
+                    .iter()
+                    .find_map(|field| args.get(field).and_then(|v| v.as_str()))
+                    .and_then(|rec| {
+                        ["amount", "amount_hbar", "value"]
+                            .iter()
+                            .find_map(|f| args.get(f).and_then(|v| v.as_f64()))
+                            .map(|amt| compute_payment_key(agent_did, rec, amt))
+                    });
+
+                hbar_key.as_deref() == Some(target_payment_key)
+                    || x402_key.as_deref() == Some(target_payment_key)
+                    || skill == target_payment_key // fallback: direct key match
+            };
+
+            if key_match {
+                let history: Vec<serde_json::Value> = history_json
+                    .as_deref()
+                    .and_then(|h| serde_json::from_str(h).ok())
+                    .unwrap_or_default();
+                return Ok(Some((task_id, pending_json, history)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Load a task's session state so a new TCP connection can resume it by
     /// task_id, instead of starting fresh. Returns None if the task doesn't
     /// exist.

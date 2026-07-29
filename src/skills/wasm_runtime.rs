@@ -1145,7 +1145,20 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 if !retry_resp.status().is_success() {
-                    eprintln!("[host_x402_pay] retry returned non-200: {}", retry_resp.status());
+                    let retry_status = retry_resp.status();
+                    eprintln!("[host_x402_pay] retry returned non-200: {}", retry_status);
+                    // Read the body so we can surface the server's rejection reason to the user.
+                    let retry_body = retry_resp.text().await.unwrap_or_default();
+                    eprintln!("[host_x402_pay] retry non-200 body: {}", retry_body);
+                    let server_reason = serde_json::from_str::<serde_json::Value>(&retry_body)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("reason")
+                                .or_else(|| v.get("error"))
+                                .and_then(|r| r.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| retry_body.clone());
                     if let Some(db) = caller.data().db.clone()
                         && let Err(db_err) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
                             eprintln!("[host_x402_pay] failed to update payment status to delivery_failed: {}", db_err);
@@ -1153,13 +1166,17 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     return write_wasm_error(
                         &mut caller,
                         &format!(
-                            "x402.pay: payment sent (tx: {}) but server returned HTTP {} after payment — content not delivered",
-                            payment_result.transaction_id, retry_resp.status()
+                            "x402.pay: payment sent (tx: {}) but server returned HTTP {} after payment — {} — content not delivered",
+                            payment_result.transaction_id, retry_status, server_reason
                         )
                     ).await;
                 }
 
-                // READING THE SETTLEMENT CONFIRMATION — check for PAYMENT-RESPONSE header on successful response:
+                // READING THE SETTLEMENT CONFIRMATION — the resource server settles
+                // the payment (not us) and reports the result via PAYMENT-RESPONSE.
+                // This is what actually confirms the payment we logged as PENDING.
+                let mut confirmed_tx_id = payment_result.transaction_id.clone();
+                let mut confirmed_hashscan_url = payment_result.hashscan_url.clone();
                 if let Some(resp_hdr_val) = retry_resp
                     .headers()
                     .get("PAYMENT-RESPONSE")
@@ -1167,8 +1184,32 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 {
                     if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, resp_hdr_val) {
                         match serde_json::from_slice::<crate::payments::x402_types::SettleResponse>(&decoded) {
+                            Ok(settle_resp) if settle_resp.success => {
+                                eprintln!("[host_x402_pay] Confirmed settlement via PAYMENT-RESPONSE: {:?}", settle_resp);
+                                if let Some(db) = caller.data().db.clone() {
+                                    // The server-settled tx id is authoritative; if it differs
+                                    // from our locally-generated one, move the payment record
+                                    // over to it so status tracking stays keyed correctly.
+                                    if settle_resp.transaction_id != payment_result.transaction_id
+                                        && let Err(e) = db.update_payment_status(&payment_result.transaction_id, "delivery_failed") {
+                                            eprintln!("[host_x402_pay] failed to clear stale pending record: {}", e);
+                                    }
+                                    if let Err(e) = db.update_payment_status(&settle_resp.transaction_id, "SUCCESS") {
+                                        eprintln!("[host_x402_pay] failed to mark payment SUCCESS: {}", e);
+                                    }
+                                }
+                                confirmed_tx_id = settle_resp.transaction_id.clone();
+                                confirmed_hashscan_url = format!(
+                                    "https://hashscan.io/testnet/transaction/{}",
+                                    settle_resp.transaction_id
+                                );
+                            }
                             Ok(settle_resp) => {
-                                eprintln!("[host_x402_pay] Successfully parsed PAYMENT-RESPONSE header: {:?}", settle_resp);
+                                eprintln!("[host_x402_pay] Server reported settlement failure: {:?}", settle_resp);
+                                if let Some(db) = caller.data().db.clone()
+                                    && let Err(e) = db.update_payment_status(&payment_result.transaction_id, "FAILED") {
+                                        eprintln!("[host_x402_pay] failed to mark payment FAILED: {}", e);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("[host_x402_pay] failed to parse PAYMENT-RESPONSE header JSON: {}", e);
@@ -1177,6 +1218,11 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     } else {
                         eprintln!("[host_x402_pay] failed to base64-decode PAYMENT-RESPONSE header");
                     }
+                } else {
+                    // No PAYMENT-RESPONSE header at all — we can't confirm settlement
+                    // actually happened even though the server returned 200. Leave the
+                    // payment as PENDING rather than silently assuming success.
+                    eprintln!("[host_x402_pay] warning: 200 response had no PAYMENT-RESPONSE header — payment left PENDING");
                 }
 
                 // Step 6: Parse response body — JSON if content-type is JSON, else string
@@ -1217,8 +1263,8 @@ fn wire_x402_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 // Step 7: Return JSON matching pay.x402 output_schema
                 let result = serde_json::json!({
                     "data": data,
-                    "transaction_id": payment_result.transaction_id,
-                    "hashscan_url": payment_result.hashscan_url,
+                    "transaction_id": confirmed_tx_id,
+                    "hashscan_url": confirmed_hashscan_url,
                 });
 
                 let bytes = serde_json::to_vec(&result).unwrap_or_default();

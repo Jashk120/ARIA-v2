@@ -252,6 +252,7 @@ async fn handle_approve_hold(
     injected_config: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     api_key: String,
     vault: &std::sync::Arc<std::sync::Arc<dyn crate::identity::IdentityVault>>,
+    socket: &mut tokio::net::TcpStream,
 ) -> QueryResponse {
     let Some(key) = payment_key else {
         return QueryResponse::QueryError {
@@ -317,6 +318,12 @@ async fn handle_approve_hold(
             }
             _ => {}
         }
+
+        use tokio::io::AsyncWriteExt;
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+            break;
+        }
     }
 
     let status = match handle.await {
@@ -352,6 +359,7 @@ async fn handle_release_hold(
     injected_config: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     api_key: String,
     vault: &std::sync::Arc<std::sync::Arc<dyn crate::identity::IdentityVault>>,
+    socket: &mut tokio::net::TcpStream,
 ) -> QueryResponse {
     let Some(key) = payment_key else {
         return QueryResponse::QueryError {
@@ -421,6 +429,12 @@ async fn handle_release_hold(
                     }
             }
             _ => {}
+        }
+
+        use tokio::io::AsyncWriteExt;
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        if socket.write_all(format!("{}\n", json).as_bytes()).await.is_err() {
+            break;
         }
     }
 
@@ -903,6 +917,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                                     &runtime_cfg.injected_config,
                                     api_key.clone(),
                                     &vault,
+                                    &mut socket,
                                 )
                                 .await
                             }
@@ -917,6 +932,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                                     &runtime_cfg.injected_config,
                                     api_key.clone(),
                                     &vault,
+                                    &mut socket,
                                 )
                                 .await
                             }

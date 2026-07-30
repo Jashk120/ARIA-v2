@@ -1,6 +1,6 @@
 name        = "x402.pay"
 version     = "0.1.0"
-description = "Fetches a URL, paying automatically via Hedera x402 if the server returns HTTP 402 Payment Required. Use this to read, access, or retrieve paywalled content. If the URL is freely accessible, returns the content directly without payment. and alwas send the hashscan url to user "
+description = "Fetches and returns the unlocked content of a paywalled URL by paying automatically via Hedera x402. Use this ONLY as a fallback when a prior scrape.web attempt on the URL returned a payment_required error. Once this skill is called, it returns the page content in the 'data' field, so do not call scrape.web again.Also always send the transaction URL back to user"
 triggers = []
 
 [display]

@@ -87,13 +87,27 @@ impl PaymentVault {
             .transaction_memo(memo);
 
         let response = tx.execute(&self.client).await.context("submit transfer failed")?;
+        // get_receipt() validates status by default (validate_status: true) and
+        // returns Err for anything other than Status::Success — see
+        // transaction_receipt_query.rs in hiero-sdk. So reaching this line means
+        // the transfer is confirmed successful; we don't need (and shouldn't use)
+        // the SDK's own Debug formatting of the status enum here.
+        //
+        // hiero-sdk-proto generates Rust enum variants from the protobuf
+        // ResponseCodeEnum via prost-build's default PascalCase conversion, so
+        // `format!("{:?}", receipt.status)` for a success renders as "Success",
+        // not "SUCCESS". The `payments` table and every budget/cap SQL query in
+        // db.rs filter on the literal string 'SUCCESS' (case-sensitive), so that
+        // mismatch meant *every* direct HBAR payment was recorded under a status
+        // that never matched — direct transfers never counted toward
+        // committed_spend_24h or the per-day cap, no matter how many were made.
         let receipt = response.get_receipt(&self.client).await.context("get receipt failed")?;
         let tx_id = response.transaction_id.to_string();
 
         Ok(PaymentReceipt {
             hashscan_url: format!("https://hashscan.io/testnet/transaction/{}", tx_id),
             transaction_id: tx_id,
-            status: format!("{:?}", receipt.status),
+            status: "SUCCESS".to_string(),
         })
     }
 }

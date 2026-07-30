@@ -897,10 +897,26 @@ impl Db {
         Ok(res)
     }
 
+    /// Sums `payments` for the rolling 24h window with status `SUCCESS` *or*
+    /// `PENDING`. `PENDING` must count here: for x402 payments the spend
+    /// hold is released as soon as the transaction is signed (see
+    /// `host_x402_pay` in wasm_runtime.rs), well before the resource
+    /// server's PAYMENT-RESPONSE confirms settlement and flips the row to
+    /// `SUCCESS` — and that confirmation can be delayed indefinitely or
+    /// never arrive (missing/unparseable header), leaving the row stuck at
+    /// `PENDING`. Excluding `PENDING` here left a window (and, if
+    /// settlement confirmation never arrives, a permanent gap) where money
+    /// that already left the wallet showed up in neither `held_spend` nor
+    /// `committed_spend_24h` — the dashboard would report the pre-payment
+    /// cap/remaining amounts even though the payment had gone through.
+    /// `FAILED` and `delivery_failed` are deliberately excluded: those are
+    /// only ever set when the resource server rejected or never received
+    /// the settlement request, so the underlying Hedera transaction was
+    /// never submitted and no funds moved.
     pub fn get_daily_committed_spend(&self, agent_did: &str) -> anyhow::Result<f64> {
         let conn = self.conn.lock().unwrap();
         let sum: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status = 'SUCCESS' AND timestamp >= datetime('now', '-24 hours')",
+            "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status IN ('SUCCESS', 'PENDING') AND timestamp >= datetime('now', '-24 hours')",
             params![agent_did],
             |row| row.get(0),
         )?;
@@ -958,8 +974,12 @@ impl Db {
         }
 
         if let Some(cap) = per_day_cap {
+            // Keep in sync with get_daily_committed_spend's SUCCESS+PENDING
+            // rationale above — otherwise a signed-but-not-yet-settled x402
+            // payment (hold already released) is invisible here too, and a
+            // fast-firing agent could reserve past the real per-day cap.
             let committed: f64 = conn.query_row(
-                "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status = 'SUCCESS' AND timestamp >= datetime('now', '-24 hours')",
+                "SELECT COALESCE(SUM(amount_hbar), 0.0) FROM payments WHERE agent_did = ? AND status IN ('SUCCESS', 'PENDING') AND timestamp >= datetime('now', '-24 hours')",
                 params![agent_did],
                 |row| row.get(0),
             )?;
@@ -1182,6 +1202,62 @@ mod tests {
         Ok(())
     }
 
+    /// Pins the exact-case 'SUCCESS' contract that every payment-recording call site
+    /// must honor.
+    ///
+    /// This reproduces the direct hedera_pay bug: `payments/direct.rs` used to store
+    /// `format!("{:?}", receipt.status)`, and hiero-sdk's prost-generated `Status` enum
+    /// renders its success variant as `"Success"` (PascalCase, from the protobuf
+    /// `SUCCESS` value), not `"SUCCESS"`. Since `get_daily_committed_spend` and the
+    /// per-day cap check both do a case-sensitive `status = 'SUCCESS'` match, every
+    /// direct HBAR payment was recorded under a status string that never matched —
+    /// none of them ever counted against the daily cap, regardless of how many were
+    /// made. `direct.rs` now hardcodes the canonical `"SUCCESS"` string instead of
+    /// relying on the SDK's Debug formatting; this test guards the SQL side of that
+    /// contract so a similarly-cased status string can never silently vanish again.
+    #[test]
+    fn test_committed_spend_status_match_is_case_sensitive() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+
+        // A wrongly-cased status (what the old `format!("{:?}", receipt.status)` bug
+        // produced) must NOT be counted — this documents the current (case-sensitive)
+        // behavior of the SQL filter, which is why callers must always write the
+        // canonical "SUCCESS" string rather than derive it from an external enum's
+        // Debug output.
+        db.insert_payment(
+            None, agent, "hedera_pay", "0.0.2222", 3.0, "memo",
+            "0.0.1234@1.1", "https://hashscan.io/testnet/tx/wrong-case", "Success",
+        )?;
+        assert_eq!(
+            db.get_daily_committed_spend(agent)?,
+            0.0,
+            "a 'Success'-cased row must not be picked up by the 'SUCCESS' filter — \
+             this is exactly the bug that made direct hedera_pay invisible to the cap"
+        );
+
+        // The canonical, correctly-cased status is what direct.rs now writes, and it
+        // must count immediately.
+        db.insert_payment(
+            None, agent, "hedera_pay", "0.0.2222", 3.0, "memo",
+            "0.0.1234@1.2", "https://hashscan.io/testnet/tx/right-case", "SUCCESS",
+        )?;
+        assert_eq!(
+            db.get_daily_committed_spend(agent)?,
+            3.0,
+            "a canonically-cased 'SUCCESS' row must count toward committed spend"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
     /// Reproduces the original bug: a failed payment must release the hold, not leave it stuck.
     ///
     /// Old (buggy) behaviour: commit_spend_hold was called BEFORE run_skill_raw.
@@ -1225,6 +1301,85 @@ mod tests {
         // Step 4: the same payment can be retried — full cap is available again.
         let retried = db.try_reserve_spend(agent, "pay-key-retry-001", 7.0, Some(10.0))?;
         assert!(retried, "budget must be fully available again after failed payment releases hold");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    /// Reproduces the reported dashboard bug: after paying, the dashboard still showed
+    /// the full cap/remaining amount as if nothing had been spent.
+    ///
+    /// For x402 payments, `host_x402_pay` releases the spend hold as soon as the
+    /// transaction is *signed* (via commit_spend_hold), well before the resource
+    /// server's PAYMENT-RESPONSE confirms settlement and flips the payments row from
+    /// PENDING to SUCCESS — a confirmation that can be delayed or never arrive at all
+    /// (e.g. a missing/unparseable header leaves the row at PENDING forever). Since
+    /// get_daily_committed_spend used to only count `status = 'SUCCESS'`, a payment in
+    /// this state was counted in neither `held_spend` (hold already released) nor
+    /// `committed_spend_24h` (status still PENDING) — the dashboard reported the
+    /// pre-payment numbers even though the money had already left the wallet, and a
+    /// second payment could be reserved past the real per-day cap.
+    #[test]
+    fn test_pending_x402_payment_counts_as_committed_spend() -> anyhow::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("aria_db_test_{}", new_uuid()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let db_path = temp_dir.join("test.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(SCHEMA)?;
+        let db = Db { conn: std::sync::Mutex::new(conn) };
+
+        let agent = "did:aria:test";
+        let pkey = "x402-pay-key-001";
+
+        // Step 1: reserve a hold for 6.0 HBAR against an 10.0 cap, as host_x402_pay
+        // does before signing the transaction.
+        let reserved = db.try_reserve_spend(agent, pkey, 6.0, Some(10.0))?;
+        assert!(reserved, "hold reservation should succeed");
+        assert_eq!(db.get_daily_held_spend(agent)?, 6.0);
+
+        // Step 2: the transaction is signed and logged as PENDING (x402_vault::pay),
+        // then the hold is released immediately (host_x402_pay's commit_spend_hold) —
+        // *before* any settlement confirmation is received.
+        db.insert_payment(
+            None,
+            agent,
+            "x402.pay",
+            "0.0.4321",
+            6.0,
+            "memo",
+            "0.0.1111@1111111111.111111111",
+            "https://hashscan.io/testnet/tx/pending-test",
+            "PENDING",
+        )?;
+        db.commit_spend_hold(agent, pkey)?;
+
+        // Step 3: hold is gone, but the spend must still be visible — this is the
+        // core of the bug. Before the fix, both of these were 0.0.
+        assert_eq!(db.get_daily_held_spend(agent)?, 0.0, "hold released after signing");
+        assert_eq!(
+            db.get_daily_committed_spend(agent)?,
+            6.0,
+            "a signed-but-unsettled PENDING payment must still count as committed spend"
+        );
+
+        // Step 4: the per-day cap must also see it — trying to reserve another 5.0
+        // (6.0 already committed + 5.0 new > 10.0 cap) must be blocked.
+        let over_cap = db.try_reserve_spend(agent, "x402-pay-key-002", 5.0, Some(10.0))?;
+        assert!(!over_cap, "cap check must account for the still-PENDING payment");
+
+        // A payment that only takes the remaining 4.0 HBAR should still succeed.
+        let within_cap = db.try_reserve_spend(agent, "x402-pay-key-003", 4.0, Some(10.0))?;
+        assert!(within_cap, "remaining budget under the cap should still be reservable");
+
+        // Step 5: once settlement is confirmed and the row flips to SUCCESS, the
+        // 6.0 HBAR payment must remain counted at the same amount (no double
+        // counting between the PENDING and SUCCESS states).
+        db.update_payment_status("0.0.1111@1111111111.111111111", "SUCCESS")?;
+        assert_eq!(
+            db.get_daily_committed_spend(agent)?,
+            6.0,
+            "confirming settlement must not change the already-committed total"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         Ok(())

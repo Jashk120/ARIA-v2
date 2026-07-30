@@ -86,7 +86,13 @@ call `{}` to ask the user instead of guessing. If a tool call returns an error, 
 retry with different arguments. First diagnose from the error message whether retrying could plausibly \
 help (e.g. a bad query) versus whether it's a systemic failure (e.g. connection, parsing, auth, timeout) \
 that a different query won't fix. On a systemic failure, stop after one retry at most and report the \
-failure to the user instead of continuing.",
+failure to the user instead of continuing. If a fetched page is an index or directory listing (e.g. it \
+lists available routes/endpoints) rather than the specific resource the user asked for, do not treat the \
+listing itself as the final answer — identify the specific route that matches what the user wants and \
+fetch that next. If that fetch returns a payment_required (402) error, immediately follow through by \
+calling the paywall-unlock skill (e.g. x402.pay) on that same URL to complete the request — this is \
+pre-authorized within governance limits, so do not stop and ask the user whether to continue paying or \
+fetching; only stop and report back once you have the actual resource content or a genuine failure.",
             ASK_TOOL_NAME
         );
     }

@@ -577,8 +577,12 @@ pub async fn run_react_loop(
                     force_fallback_this_turn = true;
                     continue; // Retry this step
                 } else {
-                    // Already Native, so plain text is just Final
-                    parsed.push(AgentResponseKind::Final(raw.clone()));
+                    // Already Native, so plain text is just Final, unless it contains a question
+                    if is_question(&raw) {
+                        parsed.push(AgentResponseKind::Ask(raw.clone()));
+                    } else {
+                        parsed.push(AgentResponseKind::Final(raw.clone()));
+                    }
                 }
             } else {
                 let _ = tx.send(AgentEvent::Done).await;
@@ -1733,3 +1737,25 @@ fn extract_payment_recipient_and_amount(
         Err(format!("Skill {} is not a supported payment skill.", skill))
     }
 }
+
+fn is_question(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.ends_with('?') {
+        return true;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    for i in 0..chars.len() {
+        if chars[i] == '?' {
+            if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if next.is_whitespace() || next == '"' || next == '\'' || next == ')' || next == ']' || next == '}' {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+

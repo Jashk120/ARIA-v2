@@ -44,6 +44,52 @@ The daemon will subsequently stream back execution events (such as `Action`, `Ob
 - `src/identity/`: Hardware Abstraction Layer (HAL) for securely managing identity vaults and signing.
 - `src/skills/`: Managing WASM modules, loading skills from `skills/`, parsing `.toml` manifests, enforcing memory offsets, and executing sandbox instructions.
 
+## Payment Flows
+
+ARIA supports two payment paths: one fully autonomous, one that requires human approval.
+
+### x402 — autonomous payment
+
+The agent hits a paywalled resource and pays for it automatically, after checking it's allowed to.
+
+```mermaid
+sequenceDiagram
+    participant Skill as WASM Skill
+    participant Agent as ARIA Agent
+    participant Server as Resource Server
+    participant Hedera as Hedera Network
+
+    Skill->>Agent: Request paid resource
+    Agent->>Server: GET resource
+    Server-->>Agent: 402 Payment Required
+    Agent->>Agent: Check allowlist + spend limits
+    Agent->>Hedera: Pay automatically (no human)
+    Hedera-->>Agent: Payment confirmed
+    Agent->>Server: Retry with payment proof
+    Server-->>Skill: Resource delivered
+```
+
+### Direct transfer — human confirm/deny
+
+The agent proposes a payment and waits for the user to approve or reject it before sending anything.
+
+```mermaid
+sequenceDiagram
+    participant Agent as ARIA Agent
+    participant User as User
+    participant Hedera as Hedera Network
+
+    Agent->>User: Propose payment (to, amount)
+    User-->>Agent: Approve / Reject
+
+    alt Approved
+        Agent->>Hedera: Send transfer
+        Hedera-->>Agent: Confirmed
+        Agent-->>User: Payment complete
+    else Rejected
+        Agent-->>User: Cancelled, nothing sent
+    end
+```
 ## Development & Building
 
 The Daemon relies on its workspace configuration located at `../Cargo.toml`. To build:

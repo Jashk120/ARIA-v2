@@ -135,7 +135,9 @@ async fn approve_hold(
     let res = tokio::task::spawn_blocking(move || {
         daemon::approve_hold(&payment_key, |event| {
             let mut final_result = String::new();
-            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result);
+            let mut is_terminal_answer = false;
+            let mut is_awaiting_confirmation = false;
+            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
         })
     })
     .await
@@ -164,7 +166,9 @@ async fn release_hold(
     let res = tokio::task::spawn_blocking(move || {
         daemon::release_hold(&payment_key, |event| {
             let mut final_result = String::new();
-            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result);
+            let mut is_terminal_answer = false;
+            let mut is_awaiting_confirmation = false;
+            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
         })
     })
     .await

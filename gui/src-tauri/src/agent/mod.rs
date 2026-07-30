@@ -167,13 +167,34 @@ pub async fn run_turn(app: AppHandle, mut history: Vec<ChatMessage>) -> Result<(
 
                 // TcpStream is synchronous — run it in a blocking thread pool
                 let app_daemon = app.clone();
-                let (res, final_result) =
+                let (res, final_result, daemon_gave_final_answer, awaiting_confirmation) =
                     tokio::task::spawn_blocking(move || run_daemon_task(app_daemon, task, skill_type, None))
                         .await
                         .map_err(|e| format!("Block thread error: {e}"))?;
 
                 if let Err(e) = res {
                     FrontendEvent::Error { message: e }.emit(&app);
+                    break;
+                }
+
+                // The daemon paused this task on a human confirmation (e.g. a
+                // payment above the auto-approval threshold). AwaitingConfirmation
+                // was already emitted straight to the frontend, which renders the
+                // Yes/No card. Stop the turn here — do NOT push a tool result and
+                // loop back into the router LLM, or it has nothing real to go on
+                // and will hallucinate an outcome for a payment that hasn't
+                // happened yet. `resumeInlineAsk` on the frontend drives what
+                // happens next, via the separate `resume_daemon_task` command.
+                if awaiting_confirmation {
+                    break;
+                }
+
+                // If the daemon itself produced a terminal "final"/"chat" answer,
+                // that IS the user-facing response — don't loop back into the
+                // router LLM to have it generate a second, redundant answer that
+                // streams in after (and visually clobbers) the daemon's own reply.
+                if daemon_gave_final_answer {
+                    FrontendEvent::DaemonDone { result: final_result, turn_done: true }.emit(&app);
                     break;
                 }
 
@@ -221,7 +242,7 @@ pub async fn resume_daemon_task(
         .clear_pending_confirmation(&session_id)
         .map_err(|e| e.to_string())?;
 
-    let (res, final_result) = tokio::task::spawn_blocking({
+    let (res, final_result, _daemon_gave_final_answer, _awaiting_confirmation) = tokio::task::spawn_blocking({
         let app_daemon = app.clone();
         let task_id = task_id.clone();
         move || run_daemon_task(app_daemon, reply, skill_type, Some(task_id))
@@ -247,20 +268,38 @@ fn run_daemon_task(
     task: String,
     skill_type: String,
     task_id: Option<String>,
-) -> (Result<(), String>, String) {
+) -> (Result<(), String>, String, bool, bool) {
     let mut final_result = String::new();
+    let mut is_terminal_answer = false;
+    let mut is_awaiting_confirmation = false;
 
     let res = daemon::submit_task(&task, &skill_type, task_id, |event| {
-        forward_daemon_event(&app, event, &mut final_result);
+        forward_daemon_event(&app, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
     });
 
-    (res, final_result)
+    (res, final_result, is_terminal_answer, is_awaiting_confirmation)
 }
 
-pub fn forward_daemon_event(app: &AppHandle, event: daemon::DaemonEvent, final_result: &mut String) {
+/// Forwards one daemon event to the frontend. `final_result` accumulates the
+/// content of the last `final`/`chat` event so the caller can use it as the
+/// tool observation (or, in the resume-confirmation path, ignore it).
+/// `is_terminal_answer` is set to `true` whenever a `final`/`chat` event is
+/// seen — a signal to the caller that the daemon already produced a
+/// complete, user-facing answer, so no further LLM pass should re-answer
+/// (and visually overwrite) it. `is_awaiting_confirmation` is set to `true`
+/// when the daemon paused on an `ask` — a signal that this task has NOT
+/// finished and no further LLM pass should synthesize an outcome for it.
+pub fn forward_daemon_event(
+    app: &AppHandle,
+    event: daemon::DaemonEvent,
+    final_result: &mut String,
+    is_terminal_answer: &mut bool,
+    is_awaiting_confirmation: &mut bool,
+) {
     let ev_type = event.event_type.clone();
 
     if ev_type == "ask" {
+        *is_awaiting_confirmation = true;
         if let (Some(task_id), Some(content)) = (
             event.payload["task_id"].as_str(),
             event.payload["content"].as_str(),
@@ -275,16 +314,12 @@ pub fn forward_daemon_event(app: &AppHandle, event: daemon::DaemonEvent, final_r
         return;
     }
 
-    // Capture the final/chat content to return as the tool observation
     if ev_type == "final" || ev_type == "chat" {
         if let Some(content) = event.payload["content"].as_str() {
             *final_result = content.to_string();
+            *is_terminal_answer = true;
         }
     }
 
-    FrontendEvent::DaemonEvent {
-        event_type: ev_type,
-        payload: event.payload,
-    }
-    .emit(app);
+    FrontendEvent::DaemonEvent { event_type: ev_type, payload: event.payload }.emit(app);
 }

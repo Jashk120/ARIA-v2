@@ -48,7 +48,7 @@ class HistoryState {
       if (!topicId) throw new Error('Daemon did not return an audit_topic_id');
 
       const res = await fetch(
-        `https://testnet.mirrornode.hedera.com/api/v1/topics/${encodeURIComponent(topicId)}/messages?order=desc&limit=50`
+        `https://testnet.mirrornode.hedera.com/api/v1/topics/${encodeURIComponent(topicId)}/messages?order=desc&limit`
       );
       if (!res.ok) throw new Error(`Mirror Node returned ${res.status}`);
       const body = await res.json();

@@ -214,24 +214,80 @@ struct HoldMutateRequest<'a> {
     payment_key: &'a str,
 }
 
+fn send_hold_mutate_request<F>(
+    mutate_type: &str,
+    payment_key: &str,
+    mut on_event: F,
+) -> Result<Value, String>
+where
+    F: FnMut(DaemonEvent),
+{
+    let stream = connect_with_retries()?;
+    let mut write_stream = stream.try_clone().map_err(|e| e.to_string())?;
+
+    let request = HoldMutateRequest {
+        mutate: mutate_type,
+        payment_key,
+    };
+
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| format!("Serialization error: {e}"))?;
+
+    write_stream
+        .write_all(request_json.as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    write_stream
+        .write_all(b"\n")
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let reader = BufReader::new(stream);
+    let mut last_value = Value::Null;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Read error: {e}"))?;
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let event: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("Parse error on '{line}': {e}"))?;
+
+        if let Some(event_type) = event.get("type").and_then(|t| t.as_str()) {
+            if event_type == "mutate_hold" {
+                last_value = event;
+                break;
+            } else if event_type == "query_error" {
+                let message = event.get("message").and_then(|m| m.as_str()).unwrap_or("unknown daemon error");
+                return Err(message.to_string());
+            } else {
+                if let Ok(daemon_event) = serde_json::from_value::<DaemonEvent>(event) {
+                    on_event(daemon_event);
+                }
+            }
+        }
+    }
+
+    Ok(last_value)
+}
+
 /// Approves a pending hold, releasing it into a committed payment. Returns
 /// the daemon's response verbatim; the caller re-queries `query_holds` (and
 /// `query_payment_history`) afterward rather than trusting this response to
 /// update local state.
-pub fn approve_hold(payment_key: &str) -> Result<Value, String> {
-    send_request(&HoldMutateRequest {
-        mutate: "approve_hold",
-        payment_key,
-    })
+pub fn approve_hold<F>(payment_key: &str, on_event: F) -> Result<Value, String>
+where
+    F: FnMut(DaemonEvent),
+{
+    send_hold_mutate_request("approve_hold", payment_key, on_event)
 }
 
 /// Releases a pending hold without paying it — the funds return to
 /// available budget. Same re-query-after pattern as `approve_hold`.
-pub fn release_hold(payment_key: &str) -> Result<Value, String> {
-    send_request(&HoldMutateRequest {
-        mutate: "release_hold",
-        payment_key,
-    })
+pub fn release_hold<F>(payment_key: &str, on_event: F) -> Result<Value, String>
+where
+    F: FnMut(DaemonEvent),
+{
+    send_hold_mutate_request("release_hold", payment_key, on_event)
 }
 
 // ── Task Submission ───────────────────────────────────────────────────────────

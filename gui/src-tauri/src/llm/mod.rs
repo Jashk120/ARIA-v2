@@ -127,7 +127,8 @@ pub enum LlmStreamResult {
 // ── Streaming LLM Call ────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT: &str = "You are ARIA. For system tasks (files, web, OS commands, payments) \
-call delegate_to_daemon. If the request is ambiguous or you're missing information needed to \
+call delegate_to_daemon. For multi-step tasks, perform only one step at a time; you will see the outcome before starting the next step. \
+If the request is ambiguous or you're missing information needed to \
 answer or to fill in delegate_to_daemon's task/type correctly, call ask_user instead of guessing. \
 Otherwise just reply normally.";
 
@@ -197,14 +198,17 @@ where
             if let Some(tool_calls) = delta["tool_calls"].as_array() {
                 is_tool_call = true;
                 for tc in tool_calls {
-                    if let Some(id) = tc["id"].as_str() {
-                        if !id.is_empty() { tool_call_id = id.to_string(); }
-                    }
-                    if let Some(name) = tc["function"]["name"].as_str() {
-                        if !name.is_empty() { tool_call_name = name.to_string(); }
-                    }
-                    if let Some(args) = tc["function"]["arguments"].as_str() {
-                        tool_call_args.push_str(args);
+                    let idx = tc["index"].as_i64().unwrap_or(0);
+                    if idx == 0 {
+                        if let Some(id) = tc["id"].as_str() {
+                            if !id.is_empty() { tool_call_id = id.to_string(); }
+                        }
+                        if let Some(name) = tc["function"]["name"].as_str() {
+                            if !name.is_empty() { tool_call_name = name.to_string(); }
+                        }
+                        if let Some(args) = tc["function"]["arguments"].as_str() {
+                            tool_call_args.push_str(args);
+                        }
                     }
                 }
                 continue;

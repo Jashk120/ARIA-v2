@@ -74,6 +74,23 @@
   }
 
   /**
+   * @param {DaemonLogEvent | null} observation
+   * @returns {string | null}
+   */
+  function getTransactionId(observation) {
+    if (!observation || !observation.payload || !observation.payload.content) return null;
+    try {
+      const parsed = JSON.parse(observation.payload.content);
+      if (parsed && typeof parsed === 'object') {
+        return parsed.transaction_id || null;
+      }
+    } catch (e) {
+      // Not a JSON string
+    }
+    return null;
+  }
+
+  /**
    * @typedef {{ type: 'tool', key: number, ev: DaemonLogEvent|null, observation: DaemonLogEvent|null, isPaymentAuto: boolean, isPaymentFail: boolean }} ToolGroup
    * @typedef {{ type: 'ask',  key: number, ev: DaemonLogEvent }} AskGroup
    * @typedef {{ type: 'error',key: number, ev: DaemonLogEvent }} ErrorGroup
@@ -95,8 +112,12 @@
           observation = events[nextI]; nextI++;
         }
         const isPayment = isPaymentSkill(ev.payload?.skill);
-        const isPaymentAuto = isPayment && isAutoApprovedPaymentAction(events, i);
+        const hasTx = getTransactionId(observation) !== null;
         const isPaymentFail = observation !== null && isOpaqueSkillFailure(observation.payload?.content) && isPayment;
+        const isPaymentAuto = isPayment &&
+                              isAutoApprovedPaymentAction(events, i) &&
+                              !isPaymentFail &&
+                              (observation === null || hasTx);
         groups.push({ type: 'tool', key: i, ev, observation, isPaymentAuto, isPaymentFail });
         i = nextI; continue;
       }
@@ -113,8 +134,24 @@
 
   /** Pending ask groups that need user interaction — always visible, never hidden */
   const pendingAsks = $derived(
-    displayGroups.filter((g) => g.type === 'ask' && !g.ev.resolved)
+    /** @type {any} */ (displayGroups.filter((g) => g.type === 'ask' && g.ev !== null && !g.ev.resolved))
   );
+
+  /** Check if there is an assistant response following this daemon block in the current turn */
+  const hasSubsequentAssistantMessage = $derived.by(() => {
+    const idx = chatState.messages.findIndex((m) => m.id === msg.id);
+    if (idx === -1) return false;
+    for (let i = idx + 1; i < chatState.messages.length; i++) {
+      const nextMsg = chatState.messages[i];
+      if (nextMsg.role === 'user') {
+        return false;
+      }
+      if (nextMsg.role === 'assistant') {
+        return true;
+      }
+    }
+    return false;
+  });
 
   const finalAnswer = $derived.by(() => {
     const events = msg.daemonEvents ?? [];
@@ -291,7 +328,7 @@
     {/each}
 
     <!-- ── Final answer: rendered markdown, no box ── -->
-    {#if finalAnswer}
+    {#if finalAnswer && !hasSubsequentAssistantMessage}
       <div class="daemon-final-text md-body">
         {@html finalHtml}{#if finalAnswer.streaming}<span class="streaming-caret">█</span>{/if}
       </div>

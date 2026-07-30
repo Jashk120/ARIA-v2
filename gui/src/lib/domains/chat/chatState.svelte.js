@@ -293,7 +293,9 @@ class ChatState {
         }
         this.#currentGroupId = null;
         this.activeDaemonSkillType = null;
-        this.isThinking = false;
+        if (data.turn_done) {
+          this.isThinking = false;
+        }
         this.scrollBottom();
         break;
       }

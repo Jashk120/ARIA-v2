@@ -126,22 +126,58 @@ async fn mutate_allowlist(action: String, account: String) -> Result<Value, Stri
 /// verbatim — the caller re-queries `query_holds`/`query_payment_history`
 /// afterward rather than trusting this response to update local state.
 #[tauri::command]
-async fn approve_hold(state: State<'_, AppState>, payment_key: String) -> Result<Value, String> {
-    let res = tokio::task::spawn_blocking(move || daemon::approve_hold(&payment_key))
-        .await
-        .map_err(|e| format!("Block thread error: {e}"))??;
+async fn approve_hold(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payment_key: String,
+) -> Result<Value, String> {
+    let app_clone = app.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        daemon::approve_hold(&payment_key, |event| {
+            let mut final_result = String::new();
+            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result);
+        })
+    })
+    .await
+    .map_err(|e| format!("Block thread error: {e}"))??;
     let _ = state.db.clear_all_pending_confirmations();
+
+    let final_res_str = res.to_string();
+    crate::agent::FrontendEvent::DaemonDone {
+        result: final_res_str,
+        turn_done: true,
+    }
+    .emit(&app);
+
     Ok(res)
 }
 
 /// Release a pending hold via the daemon's `release_hold` TCP endpoint
 /// without paying it. Same re-query-after pattern as `approve_hold`.
 #[tauri::command]
-async fn release_hold(state: State<'_, AppState>, payment_key: String) -> Result<Value, String> {
-    let res = tokio::task::spawn_blocking(move || daemon::release_hold(&payment_key))
-        .await
-        .map_err(|e| format!("Block thread error: {e}"))??;
+async fn release_hold(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payment_key: String,
+) -> Result<Value, String> {
+    let app_clone = app.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        daemon::release_hold(&payment_key, |event| {
+            let mut final_result = String::new();
+            crate::agent::forward_daemon_event(&app_clone, event, &mut final_result);
+        })
+    })
+    .await
+    .map_err(|e| format!("Block thread error: {e}"))??;
     let _ = state.db.clear_all_pending_confirmations();
+
+    let final_res_str = res.to_string();
+    crate::agent::FrontendEvent::DaemonDone {
+        result: final_res_str,
+        turn_done: true,
+    }
+    .emit(&app);
+
     Ok(res)
 }
 

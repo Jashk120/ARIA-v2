@@ -273,14 +273,13 @@ impl Db {
 
     // ── Identity ──────────────────────────────────────────────────────────────
 
-    pub fn ensure_identity(&self, did: &str) -> anyhow::Result<()> {
+    pub fn ensure_identity_with(&self, identity: crypto::Identity) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT count(*) FROM identity", [], |row| row.get(0))?;
         if count > 0 {
             return Ok(());
         }
-        info!("No identity found in DB — generating fresh Ed25519 identity for {}", did);
-        let identity = crypto::generate_identity(did)?;
+        info!("No identity found in DB — inserting fresh identity {}", identity.did);
         conn.execute(
             "INSERT INTO identity (did, public_key, manifest_path) VALUES (?, ?, ?)",
             params![identity.did, identity.public_key_multibase, "~/.aria/manifest.toml"],

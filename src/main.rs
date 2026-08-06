@@ -28,6 +28,7 @@ mod agent;
 mod config;
 mod crypto;
 mod db;
+mod fee_payer;
 mod identity;
 mod payments;
 mod skills;
@@ -738,17 +739,17 @@ WantedBy=default.target
 }
 
 fn bootstrap_db() -> anyhow::Result<Db> {
-    let db = Db::new()?;
-    // Generate identity if missing
-    db.ensure_identity("did:aria:jayesh")?;
-    Ok(db)
+    Db::new()
 }
 
-/// Attempt to build an X402PaymentVault from environment; returns None on any failure.
-/// This lets the daemon start without Hedera credentials — x402 just won't work.
-fn build_x402_vault(
-    db: Arc<crate::db::Db>,
-) -> Option<Arc<crate::payments::x402_vault::X402PaymentVault>> {
+/// Build a `hiero_sdk::Client` operator tuple from an account ID + ECDSA key.
+/// Shared by the env path (`build_hedera_client`) and the interactive prompt.
+/// Returns `None` if the credentials don't parse.
+fn hedera_client_from(account_id_str: &str, private_key_str: &str) -> Option<(
+    hiero_sdk::Client,
+    hiero_sdk::AccountId,
+    hiero_sdk::PrivateKey,
+)> {
     use std::str::FromStr;
 
     use hiero_sdk::{
@@ -757,14 +758,11 @@ fn build_x402_vault(
         PrivateKey,
     };
 
-    let account_id_str = std::env::var("HEDERA_ACCOUNT_ID").ok()?;
-    let private_key_str = std::env::var("HEDERA_PRIVATE_KEY").ok()?;
     if private_key_str.trim().is_empty() {
         return None;
     }
-
-    let operator_id = AccountId::from_str(&account_id_str).ok()?;
-    let private_key = PrivateKey::from_str_ecdsa(&private_key_str).ok()?;
+    let operator_id = AccountId::from_str(account_id_str).ok()?;
+    let private_key = PrivateKey::from_str_ecdsa(private_key_str).ok()?;
 
     let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
     let client = match network.as_str() {
@@ -774,16 +772,94 @@ fn build_x402_vault(
     };
     client.set_operator(operator_id, private_key.clone());
 
+    Some((client, operator_id, private_key))
+}
+
+/// Build the Hedera client operator from `HEDERA_ACCOUNT_ID` /
+/// `HEDERA_PRIVATE_KEY` (ECDSA) and `HEDERA_NETWORK` (default: testnet).
+/// Returns `None` if the env vars are unset or invalid.
+///
+/// The client is built exactly once here and shared by every component that
+/// talks to Hedera (identity bootstrap, x402, direct transfers) — nothing
+/// else constructs its own.
+fn build_hedera_client() -> Option<(
+    hiero_sdk::Client,
+    hiero_sdk::AccountId,
+    hiero_sdk::PrivateKey,
+)> {
+    let account_id_str = std::env::var("HEDERA_ACCOUNT_ID").ok()?;
+    let private_key_str = std::env::var("HEDERA_PRIVATE_KEY").ok()?;
+    hedera_client_from(&account_id_str, &private_key_str)
+}
+
+/// Prompt the user for their ECDSA operator credentials on a terminal.
+/// Only runs when stdin is a TTY; returns `None` when it isn't (headless /
+/// systemd) or the user declines — the caller then fails with a clear,
+/// actionable message.
+fn prompt_hedera_credentials() -> Option<(
+    hiero_sdk::Client,
+    hiero_sdk::AccountId,
+    hiero_sdk::PrivateKey,
+)> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+
+    println!();
+    println!("No HEDERA_ACCOUNT_ID / HEDERA_PRIVATE_KEY found in the environment.");
+    println!(
+        "ARIA needs an ECDSA (secp256k1) Hedera operator account to pay gas fees \
+         (did:hedera creation + payments)."
+    );
+    println!("Create one at https://portal.hedera.com/ (testnet) and fund it with HBAR.");
+    println!();
+
+    print!("HEDERA_ACCOUNT_ID: ");
+    let _ = io::stdout().flush();
+    let mut account_id = String::new();
+    if io::stdin().read_line(&mut account_id).is_err() {
+        return None;
+    }
+    let account_id = account_id.trim().to_string();
+    if account_id.is_empty() {
+        return None;
+    }
+
+    print!("HEDERA_PRIVATE_KEY (ECDSA): ");
+    let _ = io::stdout().flush();
+    let mut private_key = String::new();
+    if io::stdin().read_line(&mut private_key).is_err() {
+        return None;
+    }
+    let private_key = private_key.trim().to_string();
+    if private_key.is_empty() {
+        return None;
+    }
+
+    hedera_client_from(&account_id, &private_key)
+}
+
+/// Build an X402PaymentVault from the shared operator client. The client is
+/// provided by the caller (built once in `main`) — this no longer reads
+/// `HEDERA_*` env vars or constructs its own.
+fn build_x402_vault(
+    client: &hiero_sdk::Client,
+    operator_id: hiero_sdk::AccountId,
+    private_key: hiero_sdk::PrivateKey,
+    db: Arc<crate::db::Db>,
+) -> Arc<crate::payments::x402_vault::X402PaymentVault> {
     let facilitator_url = std::env::var("X402_FACILITATOR_URL")
         .unwrap_or_else(|_| "https://x402.org/facilitator".to_string());
 
-    Some(Arc::new(crate::payments::x402_vault::X402PaymentVault::new(
-        client,
+    Arc::new(crate::payments::x402_vault::X402PaymentVault::new(
+        client.clone(),
         operator_id,
         private_key,
         db,
         facilitator_url,
-    )))
+    ))
 }
 
 fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
@@ -812,13 +888,47 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
 
 async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(bootstrap_db()?);
+
+    // One Hedera client, built once, shared by identity bootstrap, x402, and
+    // direct transfers. Read from env first; prompt on a terminal if unset.
+    let operator = build_hedera_client().or_else(prompt_hedera_credentials);
+
+    // First run: mint a real did:hedera identity before anything needs it.
+    // The DID's control key is the Ed25519 key ARIA generates (id.key); the
+    // operator account only pays the HCS topic-creation fee. No stub DIDs.
+    if db.get_identity()?.is_none() {
+        let (client, operator_id, private_key) = operator.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No ARIA identity found and no Hedera operator credentials available. \
+                 Set HEDERA_ACCOUNT_ID and HEDERA_PRIVATE_KEY (ECDSA) in the daemon \
+                 environment, or run `aria daemon` interactively so it can prompt you. \
+                 Create a funded testnet account at https://portal.hedera.com/ — it pays \
+                 the HCS fee that creates your did:hedera identity."
+            )
+        })?;
+        let fee_payer = crate::fee_payer::FeePayer::Local(
+            client.clone(),
+            *operator_id,
+            private_key.clone(),
+        );
+        let identity = crypto::create_real_identity(&fee_payer).await?;
+        db.ensure_identity_with(identity)?;
+    }
+
     let api_key = prompt_api_key(&db)?;
     let runtime_cfg = RuntimeConfig::load(&db);
     let payment_vault: Option<Arc<crate::payments::direct::PaymentVault>> =
-        crate::payments::direct::PaymentVault::try_from_env().map(Arc::new);
+        operator.as_ref().map(|(client, operator_id, _)| {
+            Arc::new(crate::payments::direct::PaymentVault::new(
+                client.clone(),
+                *operator_id,
+            ))
+        });
 
     let x402_vault: Option<Arc<crate::payments::x402_vault::X402PaymentVault>> =
-        build_x402_vault(db.clone());
+        operator.as_ref().map(|(client, operator_id, private_key)| {
+            build_x402_vault(client, *operator_id, private_key.clone(), db.clone())
+        });
 
     let skills = Arc::new(SkillManager::new()?);
 
@@ -1156,8 +1266,11 @@ async fn main() -> anyhow::Result<()> {
         "allowlist" => {
             let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("list");
             let db = bootstrap_db()?;
-            let (agent_did, _) =
-                db.get_identity()?.unwrap_or(("did:aria:jayesh".into(), String::new()));
+            let (agent_did, _) = db.get_identity()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No identity found — run `aria daemon` once to create the did:hedera identity first"
+                )
+            })?;
             match subcmd {
                 "add" => {
                     let account = args.get(3).ok_or_else(|| {
@@ -1200,8 +1313,11 @@ async fn main() -> anyhow::Result<()> {
         "url-allowlist" => {
             let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("list");
             let db = bootstrap_db()?;
-            let (agent_did, _) =
-                db.get_identity()?.unwrap_or(("did:aria:jayesh".into(), String::new()));
+            let (agent_did, _) = db.get_identity()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No identity found — run `aria daemon` once to create the did:hedera identity first"
+                )
+            })?;
             match subcmd {
                 "add" => {
                     let url = args.get(3).ok_or_else(|| {

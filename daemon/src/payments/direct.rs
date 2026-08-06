@@ -1,14 +1,10 @@
 use std::str::FromStr;
 
-use anyhow::{
-    Context,
-    anyhow,
-};
+use anyhow::Context;
 use hiero_sdk::{
     AccountId,
     Client,
     Hbar,
-    PrivateKey,
     TransferTransaction,
 };
 
@@ -33,44 +29,11 @@ impl PaymentVault {
         self.operator_id
     }
 
-    /// Non-fatal variant of `from_env`: returns `None` (with a log line) when
-    /// Hedera credentials aren't configured, instead of erroring out. Use this
-    /// at daemon startup so direct HBAR payments being unconfigured doesn't
-    /// prevent the daemon from running (mirrors `build_x402_vault`).
-    pub fn try_from_env() -> Option<Self> {
-        match Self::from_env() {
-            Ok(vault) => Some(vault),
-            Err(e) => {
-                tracing::warn!("Direct HBAR payment vault not configured, skipping: {}", e);
-                None
-            }
-        }
-    }
-    pub fn from_env() -> anyhow::Result<Self> {
-        let network = std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-        let account_id_str =
-            std::env::var("HEDERA_ACCOUNT_ID").context("HEDERA_ACCOUNT_ID not set in env")?;
-        let private_key_str =
-            std::env::var("HEDERA_PRIVATE_KEY").context("HEDERA_PRIVATE_KEY not set in env")?;
-
-        if private_key_str.trim().is_empty() {
-            return Err(anyhow!(
-                "HEDERA_PRIVATE_KEY is empty — generate a testnet account at portal.hedera.com first"
-            ));
-        }
-
-        let operator_id =
-            AccountId::from_str(&account_id_str).context("Invalid HEDERA_ACCOUNT_ID")?;
-        let private_key =
-            PrivateKey::from_str_ecdsa(&private_key_str).context("Invalid HEDERA_PRIVATE_KEY")?;
-
-        let client = match network.as_str() {
-            "mainnet" => Client::for_mainnet(),
-            "previewnet" => Client::for_previewnet(),
-            _ => Client::for_testnet(),
-        };
-        client.set_operator(operator_id, private_key);
-        Ok(Self { client, operator_id })
+    /// Construct from the shared operator client, built once by the ARIA host.
+    /// The host owns the Hedera client; this vault just holds a cheap
+    /// `Arc<ClientInner>` clone plus the operator account it pays from.
+    pub fn new(client: Client, operator_id: AccountId) -> Self {
+        Self { client, operator_id }
     }
     pub async fn pay(
         &self,

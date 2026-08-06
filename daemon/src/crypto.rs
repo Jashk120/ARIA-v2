@@ -211,6 +211,71 @@ pub fn generate_identity(did: &str) -> anyhow::Result<Identity> {
     Ok(Identity { did: did.to_string(), public_key_multibase: pub_multibase })
 }
 
+/// Create a real did:hedera DID on Testnet via the hiero DID registrar, then
+/// persist the private key with the same at-rest encryption as
+/// `generate_identity` (`~/.aria/id.key`, AES-256-GCM keyed on the DID string,
+/// 0600 permissions).
+///
+/// The Ed25519 keypair is generated here, by ARIA — it becomes `id.key` and
+/// the DID's root/verification key. `fee_payer` (the user's ECDSA operator
+/// account) only funds the HCS topic-creation fee; it never controls the DID.
+pub async fn create_real_identity(
+    fee_payer: &crate::fee_payer::FeePayer,
+) -> anyhow::Result<Identity> {
+    let path = identity_key_path()?;
+    if path.exists() {
+        anyhow::bail!("Identity key file already exists at {:?}", path);
+    }
+
+    // ARIA owns the DID's control key: a fresh Ed25519 keypair that becomes id.key.
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let signer = AriaSigner(signing_key.clone());
+
+    let created = hiero_did_registrar::create::create_did_with_signer(
+        fee_payer.client(),
+        hiero_did_core::did::Network::Testnet,
+        None,
+        &signer,
+    )
+    .await
+    .map_err(|e| anyhow!("create_did failed: {}", e))?;
+
+    let did = created.did.to_string();
+
+    let device_secret = load_or_create_device_secret()?;
+    let aes_key = derive_aes_key(&device_secret, did.as_bytes())?;
+    let priv_hex = encrypt_key_bytes(signing_key.as_bytes(), &aes_key)?;
+
+    // Persist private key to separate file with 0600 permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&path, &priv_hex)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    fs::write(&path, &priv_hex)?;
+
+    Ok(Identity { did, public_key_multibase: multibase_encode(&created.public_key_bytes) })
+}
+
+/// Adapter exposing ARIA's `id.key` Ed25519 key as a `hiero_did_core::Signer`
+/// so the DID document's root key is the key ARIA generates and controls.
+///
+/// Implemented with a fully-qualified trait path to avoid any collision with
+/// `ed25519_dalek::Signer`, which is imported at the top of this module.
+struct AriaSigner(SigningKey);
+
+impl hiero_did_core::Signer for AriaSigner {
+    fn public_key_bytes(&self) -> Vec<u8> {
+        self.0.verifying_key().as_bytes().to_vec()
+    }
+
+    fn sign_bytes(&self, message: &[u8]) -> Result<Vec<u8>, hiero_did_core::DIDError> {
+        Ok(self.0.sign(message).to_bytes().to_vec())
+    }
+}
+
 /// Load the signing key from the `~/.aria/id.key` file.
 pub fn load_signing_key(did: &str) -> anyhow::Result<SigningKey> {
     let path = identity_key_path()?;
@@ -232,7 +297,7 @@ pub fn load_signing_key(did: &str) -> anyhow::Result<SigningKey> {
 // ── Multibase (base58btc) ─────────────────────────────────────────────────────
 
 /// Encode bytes as multibase base58btc (prefix 'z').
-/// Used in DID documents: `did:aria:jayesh#key-0` → `"z<base58(pubkey)>"`
+/// Used in DID documents: `<did>#did-root-key` → `"z<base58(pubkey)>"`
 pub fn multibase_encode(bytes: &[u8]) -> String {
     format!("z{}", bs58::encode(bytes).into_string())
 }

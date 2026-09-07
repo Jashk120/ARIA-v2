@@ -10,6 +10,8 @@ members = [
     "skills/pay/x402.pay",
     "skills/pay/query.pay",
     "skills/pay/transfer.pay",
+    "skills/doc/write.pdf",
+    "skills/doc/write.xlsx",
 
 ]
 

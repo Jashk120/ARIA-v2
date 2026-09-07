@@ -2,6 +2,10 @@
 //! agent responses (thought/action/ask/final/chat), dispatches skills via
 //! SkillManager, and enforces per-skill max_steps / terminal behavior from
 //! each skill's manifest.
+//!
+//! One turn may dispatch up to MAX_PARALLEL_ACTIONS independent actions
+//! concurrently (see `plan_action_batch` / `execute_parallel_batch`); the
+//! MAX_REACT_STEPS budget counts turns, not individual tool calls.
 
 use std::collections::HashMap;
 
@@ -9,7 +13,10 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::prompt::system_prompt;
+use super::prompt::{
+    build_native_tools_with_dlt,
+    system_prompt_with_dlt,
+};
 use crate::config::CONFIG;
 use crate::payments::governance::compute_payment_key;
 use crate::skills::manifest::{
@@ -22,7 +29,17 @@ use crate::skills::paths::{
     wasm_path,
 };
 
+// MAX_REACT_STEPS counts turns, not tool calls: one turn may now contain up
+// to MAX_PARALLEL_ACTIONS concurrent calls (tier 1 of the hierarchy plan —
+// parallel tools, zero extra LLM calls).
 pub const MAX_REACT_STEPS: usize = 8;
+
+/// Max independent actions executed concurrently in one turn. The model may
+/// emit up to this many `Action{skill,args}` per assistant message (native
+/// tool calls) or as consecutive `{"type":"action",...}` lines
+/// (prompt-fallback). Extras are deferred with a note observation, never
+/// dropped silently and never run.
+pub const MAX_PARALLEL_ACTIONS: usize = 5;
 
 /// How long the background settlement watcher (see `spawn_payment_settlement_watch`)
 /// keeps polling the mirror node before giving up on a transaction.
@@ -76,18 +93,48 @@ pub enum AskKind {
     // without asking the LLM.
 }
 
+/// Span hierarchy contract (single-brain direction: daemon owns reasoning,
+/// GUI is a thin renderer):
+/// - `span_id` / `parent_span_id` / `depth` are ALWAYS optional and
+///   `skip_serializing_if None`, so existing GUI parsing keeps working.
+/// - Top-level turn events carry `depth: Some(0)` (or `None`, treated as 0)
+///   with no parent. Nested execution detail (e.g. an Observation produced by
+///   an Action) carries `depth > 0` with `parent_span_id` pointing at the
+///   parent's `span_id`.
+/// - The GUI renders `depth > 0` events collapsible under their parent span.
+/// - NOTE: the serde `tag = "type", rename_all = "lowercase"` is unchanged;
+///   `PaymentSettled` serializes as `"paymentsettled"` — a separate fix owns
+///   that rename, do NOT touch it here.
 #[derive(serde::Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AgentEvent {
     Thought {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u8>,
     },
     Action {
         skill: String,
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u8>,
     },
     Observation {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u8>,
     },
     Ask {
         content: String,
@@ -102,6 +149,12 @@ pub enum AgentEvent {
     /// Full assembled text after streaming completes (Chat or Final)
     Final {
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u8>,
     },
     Chat {
         content: String,
@@ -118,6 +171,17 @@ pub enum AgentEvent {
         status: String,
     },
     Done,
+}
+
+/// Short random hex span id for the event-stream span hierarchy (see the
+/// contract comment on `AgentEvent`). Uses the existing `rand` dep — no new
+/// dependencies. 4 bytes → 8 hex chars is enough to correlate a turn's
+/// action/observation pair in the GUI.
+fn new_span_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    hex::encode(b)
 }
 
 enum AgentResponseKind {
@@ -212,6 +276,17 @@ pub async fn approve_hold(
         return ApproveHoldOutcome::Invalid { message: error };
     }
 
+    // Air-gap: a hold approved after the flag was flipped off must still
+    // fail closed — same release + clear shape as the invalid-proposal path.
+    if let Some(message) = dlt_blocked_error(db, skill) {
+        if let Ok((rec, amt)) = extract_payment_recipient_and_amount(skill, args) {
+            let pkey = compute_payment_key(agent_did, &rec, amt);
+            let _ = db.release_spend_hold(agent_did, &pkey);
+        }
+        let _ = db.clear_pending_action(task_id);
+        return ApproveHoldOutcome::Invalid { message };
+    }
+
     let current_fingerprint = payment_fingerprint(skill, args, injected_config);
     if stored_fingerprint != current_fingerprint {
         if let Ok((rec, amt)) = extract_payment_recipient_and_amount(skill, args) {
@@ -231,9 +306,22 @@ pub async fn approve_hold(
     let _ = db.clear_pending_action(task_id);
 
     if let Some(tx) = tx {
-        let _ = tx.send(AgentEvent::Action { skill: skill.to_string(), args: args.clone() }).await;
+        let _ = tx
+            .send(AgentEvent::Action {
+                skill: skill.to_string(),
+                args: args.clone(),
+                span_id: Some(new_span_id()),
+                parent_span_id: None,
+                depth: Some(0),
+            })
+            .await;
     }
 
+    // ── deterministic: no model calls past this point ──
+    // The executor below (`run_skill_raw` + hold commit/release) is pure
+    // deterministic dispatch: WASM execution, DB writes, and structured
+    // error observations. Any LLM fallback/retry belongs in the ReAct loop
+    // above, never here — on failure return the error as an observation.
     let mut enriched = args.clone();
     if let Some(obj) = enriched.as_object_mut()
         && let Some(skill_config) = injected_config.get(skill)
@@ -413,8 +501,14 @@ pub async fn run_react_loop(
                         return Ok(());
                     }
                     ApproveHoldOutcome::Executed { success, observation, .. } => {
-                        let _ =
-                            tx.send(AgentEvent::Observation { content: observation.clone() }).await;
+                        let _ = tx
+                            .send(AgentEvent::Observation {
+                                content: observation.clone(),
+                                span_id: Some(new_span_id()),
+                                parent_span_id: None,
+                                depth: Some(0),
+                            })
+                            .await;
 
                         if !success {
                             let _ = tx.send(AgentEvent::Error { content: observation }).await;
@@ -433,7 +527,14 @@ pub async fn run_react_loop(
             }
             ConfirmationDecision::Denied => {
                 let message = release_hold(&db, &agent_did, &task_id, &skill, &args);
-                let _ = tx.send(AgentEvent::Final { content: message }).await;
+                let _ = tx
+                    .send(AgentEvent::Final {
+                        content: message,
+                        span_id: Some(new_span_id()),
+                        parent_span_id: None,
+                        depth: Some(0),
+                    })
+                    .await;
                 let _ = tx.send(AgentEvent::Done).await;
                 return Ok(());
             }
@@ -451,6 +552,8 @@ pub async fn run_react_loop(
         }
     }
 
+    // `step` counts turns, not tool calls: one turn may dispatch up to
+    // MAX_PARALLEL_ACTIONS concurrent actions (see plan_action_batch).
     while step < MAX_REACT_STEPS {
         let (url, model, provider_name) = match CONFIG.use_provider {
             crate::config::Provider::OpenRouter => {
@@ -482,9 +585,19 @@ pub async fn run_react_loop(
 
         let is_native = capability == crate::db::ToolCapability::Native
             || capability == crate::db::ToolCapability::Unverified;
-        let sys_prompt = system_prompt(&user_prompt, skills_type.clone(), is_native);
+        let user_profile = db.get_user_profile(&agent_did).ok().flatten();
+        // Live read per step (not the startup-cached RuntimeConfig clone):
+        // flipping the flag mid-task hides DLT skills from the next prompt.
+        let dlt_enabled = crate::config::dlt_enabled_live(&db);
+        let sys_prompt = system_prompt_with_dlt(
+            &user_prompt,
+            skills_type.clone(),
+            is_native,
+            user_profile.as_ref(),
+            dlt_enabled,
+        );
         let tools = if is_native {
-            Some(crate::agent::prompt::build_native_tools(&user_prompt, &skills_type))
+            Some(build_native_tools_with_dlt(&user_prompt, &skills_type, dlt_enabled))
         } else {
             None
         };
@@ -593,17 +706,112 @@ pub async fn run_react_loop(
         let mut should_continue = true;
         let mut executed_tools = false;
 
-        for kind in parsed {
+        // ── Parallel multi-action planning (deterministic, no model calls) ──
+        // The first run of consecutive Actions in this turn is planned here:
+        // pure non-payment runs go to `execute_parallel_batch`, runs with a
+        // payment action execute only the first payment action sequentially
+        // (rest deferred). See `plan_action_batch`.
+        let batch_plan = plan_action_batch(&parsed, &db, &tool_calls);
+        let mut parallel_at: Option<(usize, usize, Vec<BatchItem>, Vec<String>)> = None;
+        let mut payment_skip: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut payment_at: Option<usize> = None;
+        let mut payment_note: Option<String> = None;
+        match batch_plan {
+            Some(BatchPlan::Parallel { start, run_end, items, extra_desc }) => {
+                parallel_at = Some((start, run_end, items, extra_desc));
+            }
+            Some(BatchPlan::PaymentFirst { payment_pos, skip, note }) => {
+                payment_at = Some(payment_pos);
+                payment_skip = skip.into_iter().collect();
+                payment_note = Some(note);
+            }
+            None => {}
+        }
+
+        for (pos, kind) in parsed.into_iter().enumerate() {
+            if payment_skip.contains(&pos) {
+                continue;
+            }
+            if let Some((start, run_end, _, _)) = parallel_at.as_ref()
+                && pos > *start
+                && pos < *run_end
+            {
+                // Handled by the batch executor (executed) or covered by the
+                // deferral note (extras over the cap): skip silently.
+                continue;
+            }
             match kind {
                 AgentResponseKind::Chat(content) => {
                     let _ = tx.send(AgentEvent::Chat { content }).await;
                     should_continue = false;
                 }
                 AgentResponseKind::Thought(thought) => {
-                    let _ = tx.send(AgentEvent::Thought { content: thought }).await;
+                    let _ = tx
+                        .send(AgentEvent::Thought {
+                            content: thought,
+                            span_id: Some(new_span_id()),
+                            parent_span_id: None,
+                            depth: Some(0),
+                        })
+                        .await;
                 }
                 AgentResponseKind::Action { skill, args } => {
+                    if let Some((start, _, _, _)) = parallel_at.as_ref()
+                        && pos == *start
+                    {
+                        let (_, _, items, extra_desc) =
+                            parallel_at.take().expect("parallel batch planned");
+                        let _ = (skill, args);
+                        executed_tools = true;
+                        should_continue = execute_parallel_batch(
+                            items,
+                            extra_desc,
+                            &db,
+                            &skills,
+                            &payment_vault,
+                            &x402_vault,
+                            &injected_config,
+                            &agent_did,
+                            &task_id,
+                            &tx,
+                            &mut history,
+                            &mut skill_fire_counts,
+                            &raw,
+                            is_native,
+                        )
+                        .await;
+                        if !should_continue {
+                            break;
+                        }
+                        continue;
+                    }
+                    if Some(pos) == payment_at
+                        && let Some(note) = payment_note.take()
+                    {
+                        let _ = tx
+                            .send(AgentEvent::Observation {
+                                content: note.clone(),
+                                span_id: Some(new_span_id()),
+                                parent_span_id: None,
+                                depth: Some(0),
+                            })
+                            .await;
+                        history.push(json!({ "role": "user", "content": note }));
+                    }
                     executed_tools = true;
+                    // Air-gap proposal guard: DLT skills fail closed BEFORE
+                    // any proposal validation, hold reservation, or HCS audit
+                    // write below — all of those are unreachable once this
+                    // returns an error, which is also what keeps HCS egress
+                    // silent in air-gap mode (no audit.rs change needed).
+                    // Covers x402_pay too, which never enters the
+                    // skill_requires_confirmation path.
+                    if let Some(message) = dlt_blocked_error(&db, &skill) {
+                        let _ = tx.send(AgentEvent::Error { content: message }).await;
+                        should_continue = false;
+                        break;
+                    }
                     let react_meta = load_react_meta(&skill);
                     if let Some(max) = react_meta.max_steps {
                         let count = skill_fire_counts.entry(skill.clone()).or_insert(0);
@@ -837,8 +1045,15 @@ pub async fn run_react_loop(
                             break;
                         }
                     }
+                    let action_span_id = new_span_id();
                     let _ = tx
-                        .send(AgentEvent::Action { skill: skill.clone(), args: args.clone() })
+                        .send(AgentEvent::Action {
+                            skill: skill.clone(),
+                            args: args.clone(),
+                            span_id: Some(action_span_id.clone()),
+                            parent_span_id: None,
+                            depth: Some(0),
+                        })
                         .await;
 
                     let mut enriched = args.clone();
@@ -850,6 +1065,11 @@ pub async fn run_react_loop(
                         }
                     }
 
+                    // ── deterministic: no model calls past this point ──
+                    // Same executor boundary as in `approve_hold`: `run_skill_raw`
+                    // + hold commit/release below are deterministic dispatch only.
+                    // Failures return as structured error observations for the
+                    // loop to reason about — never an LLM retry from in here.
                     let (observation, tx_id, is_error): (String, Option<String>, bool) =
                         match skills
                             .run_skill_raw(
@@ -872,7 +1092,14 @@ pub async fn run_react_loop(
                             }
                             Err(e) => (e.to_string(), None, true),
                         };
-                    let _ = tx.send(AgentEvent::Observation { content: observation.clone() }).await;
+                    let _ = tx
+                        .send(AgentEvent::Observation {
+                            content: observation.clone(),
+                            span_id: Some(new_span_id()),
+                            parent_span_id: Some(action_span_id),
+                            depth: Some(1),
+                        })
+                        .await;
 
                     // For payment skills (both auto-approved and confirmed-after-policy),
                     // commit the hold on success or release it on failure.
@@ -897,7 +1124,14 @@ pub async fn run_react_loop(
                     }
 
                     if react_meta.terminal && !is_error {
-                        let _ = tx.send(AgentEvent::Final { content: observation }).await;
+                        let _ = tx
+                            .send(AgentEvent::Final {
+                                content: observation,
+                                span_id: Some(new_span_id()),
+                                parent_span_id: Some(action_span_id.clone()),
+                                depth: Some(1),
+                            })
+                            .await;
                         should_continue = false;
                         break;
                     }
@@ -960,7 +1194,14 @@ pub async fn run_react_loop(
                     should_continue = false;
                 }
                 AgentResponseKind::Final(answer) => {
-                    let _ = tx.send(AgentEvent::Final { content: answer }).await;
+                    let _ = tx
+                        .send(AgentEvent::Final {
+                            content: answer,
+                            span_id: Some(new_span_id()),
+                            parent_span_id: None,
+                            depth: Some(0),
+                        })
+                        .await;
                     should_continue = false;
                 }
             }
@@ -979,6 +1220,405 @@ pub async fn run_react_loop(
         .await;
     let _ = tx.send(AgentEvent::Done).await;
     Ok(())
+}
+
+// ── Parallel multi-action dispatch ────────────────────────────────────────────
+// Tier 1 of the hierarchy plan: the model may emit up to MAX_PARALLEL_ACTIONS
+// independent `Action{skill,args}` in a single turn ("read 5 docs" costs one
+// turn, not five). MAX_REACT_STEPS still counts turns, not calls.
+//
+// Safety rules (all decided deterministically here — no model calls):
+// - A batch is the first maximal run of *consecutive* Actions in the turn;
+//   anything else (Thought, Ask, Final, Chat) breaks the run and flows
+//   through the sequential loop. Later runs stay sequential.
+// - DLT-blocked or payment-confirmation actions never run concurrently: a
+//   run containing a DLT-blocked action stays fully sequential (today's path
+//   fails closed per action); a run containing a payment action executes only
+//   the first payment action via today's sequential path while the rest are
+//   deferred, never executed.
+// - Holds are never reserved concurrently: the concurrent path only ever
+//   contains non-payment skills, which reserve no holds.
+
+/// One action inside a planned parallel batch, with its native tool call
+/// (if any) pre-matched so duplicate skill names still pair with distinct
+/// call ids in history.
+struct BatchItem {
+    skill: String,
+    args: serde_json::Value,
+    tool_call: Option<serde_json::Value>,
+    tool_call_id: String,
+}
+
+enum BatchPlan {
+    Parallel {
+        start: usize,
+        run_end: usize,
+        items: Vec<BatchItem>,
+        extra_desc: Vec<String>,
+    },
+    PaymentFirst {
+        payment_pos: usize,
+        skip: Vec<usize>,
+        note: String,
+    },
+}
+
+fn action_summary(skill: &str, args: &serde_json::Value) -> String {
+    format!("{} {}", skill, args)
+}
+
+fn plan_action_batch(
+    parsed: &[AgentResponseKind],
+    db: &crate::db::Db,
+    tool_calls: &[serde_json::Value],
+) -> Option<BatchPlan> {
+    // Locate the first maximal run of consecutive Actions.
+    let mut run_start: Option<usize> = None;
+    let mut run_end = 0usize;
+    for (i, kind) in parsed.iter().enumerate() {
+        if matches!(kind, AgentResponseKind::Action { .. }) {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            run_end = i + 1;
+        } else if run_start.is_some() {
+            break;
+        }
+    }
+    let start = run_start?;
+    if run_end - start < 2 {
+        return None;
+    }
+
+    let mut run: Vec<(String, serde_json::Value)> = Vec::new();
+    for kind in &parsed[start..run_end] {
+        if let AgentResponseKind::Action { skill, args } = kind {
+            run.push((skill.clone(), args.clone()));
+        }
+    }
+
+    // Air-gap fail-closed: any DLT-blocked action keeps the whole turn on
+    // today's sequential path, which surfaces the block per action.
+    if run.iter().any(|(skill, _)| dlt_blocked_error(db, skill).is_some()) {
+        return None;
+    }
+
+    // Payment governance: never concurrent. Only the first payment action
+    // runs (via today's proposal/Ask/park path); the rest are deferred.
+    if let Some(rel) = run.iter().position(|(skill, _)| skill_requires_confirmation(skill)) {
+        let payment_pos = start + rel;
+        let mut skip = Vec::new();
+        let mut deferred = Vec::new();
+        for (k, (skill, args)) in run.iter().enumerate() {
+            if k != rel {
+                skip.push(start + k);
+                deferred.push(action_summary(skill, args));
+            }
+        }
+        let note = format!(
+            "Deferred {} parallel action(s) this turn: {}. The payment action '{}' requires sequential confirmation, so the rest did not run — re-emit any still-needed actions after it resolves.",
+            deferred.len(),
+            deferred.join("; "),
+            run[rel].0,
+        );
+        return Some(BatchPlan::PaymentFirst { payment_pos, skip, note });
+    }
+
+    // Pure non-payment run → concurrent batch, capped at MAX_PARALLEL_ACTIONS.
+    let take = run.len().min(MAX_PARALLEL_ACTIONS);
+    // Match native tool calls to items in order (first-unused same-name win).
+    let mut used = vec![false; tool_calls.len()];
+    let mut items = Vec::with_capacity(take);
+    for (skill, args) in run.iter().take(take) {
+        let mut tool_call = None;
+        let mut tool_call_id = String::new();
+        for (j, call) in tool_calls.iter().enumerate() {
+            if used[j] {
+                continue;
+            }
+            let name =
+                call.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or_default();
+            if name == skill {
+                used[j] = true;
+                tool_call_id =
+                    call.get("id").and_then(|id| id.as_str()).unwrap_or_default().to_string();
+                tool_call = Some(call.clone());
+                break;
+            }
+        }
+        items.push(BatchItem {
+            skill: skill.clone(),
+            args: args.clone(),
+            tool_call,
+            tool_call_id,
+        });
+    }
+    let extra_desc =
+        run.iter().skip(take).map(|(skill, args)| action_summary(skill, args)).collect();
+    Some(BatchPlan::Parallel { start, run_end, items, extra_desc })
+}
+
+/// Executes a planned parallel batch of non-payment actions concurrently and
+/// appends one labeled Observation per action — in action order (deterministic
+/// history), never completion order. Returns `should_continue` for the turn
+/// loop. At most one terminal skill fires per batch: the first successful
+/// terminal result (in action order) becomes Final and ends the turn.
+///
+/// Concurrency safety: `SkillManager::run_skill_raw` only borrows `&self`
+/// (module cache behind `RwLock`; `wasmtime::Engine` is `Send + Sync`) and
+/// every invocation builds a fresh WASM `Store` (see `wasm_runtime.rs`), so
+/// sharing one `&SkillManager` across `join_all` futures is sound — no mutex
+/// needed. Each future owns its enriched args plus cloned vault/db handles.
+/// Payment skills can never reach here (the planner routes them to the
+/// sequential path), so no spend holds are reserved or committed concurrently
+/// and no hold commit/release logic is duplicated here.
+///
+/// ── deterministic: no model calls past this point ── (same executor
+/// boundary as the sequential path and `approve_hold`).
+#[allow(clippy::too_many_arguments)]
+async fn execute_parallel_batch(
+    items: Vec<BatchItem>,
+    extra_desc: Vec<String>,
+    db: &std::sync::Arc<crate::db::Db>,
+    skills: &std::sync::Arc<crate::skills::SkillManager>,
+    payment_vault: &Option<std::sync::Arc<crate::payments::direct::PaymentVault>>,
+    x402_vault: &Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    injected_config: &HashMap<String, HashMap<String, String>>,
+    agent_did: &str,
+    task_id: &str,
+    tx: &mpsc::Sender<AgentEvent>,
+    history: &mut Vec<serde_json::Value>,
+    skill_fire_counts: &mut std::collections::HashMap<String, usize>,
+    raw: &str,
+    is_native: bool,
+) -> bool {
+    let n = items.len();
+    // Siblings share one parent span id so the GUI renders them as one
+    // expandable group: turn-span (implicit) → Action depth 1 →
+    // Observation/Final depth 2.
+    let turn_span = new_span_id();
+
+    enum Slot {
+        Skipped { skill: String, max: usize },
+        Ready {
+            skill: String,
+            args: serde_json::Value,
+            enriched: serde_json::Value,
+            terminal: bool,
+            tool_call: Option<serde_json::Value>,
+            tool_call_id: String,
+            action_span: String,
+        },
+    }
+
+    // Deterministic pre-pass: per-skill max_steps caps apply per action — a
+    // skill at its cap is skipped with an error observation, others proceed.
+    let mut slots: Vec<Slot> = Vec::with_capacity(n);
+    for item in items {
+        let react_meta = load_react_meta(&item.skill);
+        if let Some(max) = react_meta.max_steps {
+            let count = skill_fire_counts.entry(item.skill.clone()).or_insert(0);
+            if *count >= max {
+                slots.push(Slot::Skipped { skill: item.skill, max });
+                continue;
+            }
+            *count += 1;
+        }
+        let mut enriched = item.args.clone();
+        if let Some(obj) = enriched.as_object_mut()
+            && let Some(skill_config) = injected_config.get(&item.skill)
+        {
+            for (k, v) in skill_config {
+                obj.insert(k.clone(), json!(v));
+            }
+        }
+        slots.push(Slot::Ready {
+            skill: item.skill,
+            args: item.args,
+            enriched,
+            terminal: react_meta.terminal,
+            tool_call: item.tool_call,
+            tool_call_id: item.tool_call_id,
+            action_span: new_span_id(),
+        });
+    }
+
+    // Emit Action events first, in action order.
+    for slot in &slots {
+        if let Slot::Ready { skill, args, action_span, .. } = slot {
+            let _ = tx
+                .send(AgentEvent::Action {
+                    skill: skill.clone(),
+                    args: args.clone(),
+                    span_id: Some(action_span.clone()),
+                    parent_span_id: Some(turn_span.clone()),
+                    depth: Some(1),
+                })
+                .await;
+        }
+    }
+
+    // Run the ready actions concurrently. `join_all` polls inline (no
+    // `Send`/`'static` requirement) and returns results in action order.
+    let futs: Vec<_> = slots
+        .iter()
+        .map(|slot| async move {
+            match slot {
+                Slot::Ready { skill, enriched, .. } => Some(
+                    skills
+                        .run_skill_raw(
+                            skill,
+                            enriched,
+                            Some(db.clone()),
+                            payment_vault.clone(),
+                            x402_vault.clone(),
+                            agent_did.to_string(),
+                            Some(task_id.to_string()),
+                        )
+                        .await,
+                ),
+                Slot::Skipped { .. } => None,
+            }
+        })
+        .collect();
+    let results = futures_util::future::join_all(futs).await;
+
+    if !is_native {
+        history.push(json!({ "role": "assistant", "content": raw }));
+    }
+    let mut terminal_hit: Option<(String, String)> = None;
+    for (i, (slot, res)) in slots.iter().zip(results).enumerate() {
+        let (skill, action_span, body, is_error, tx_id, tool_call, tool_call_id, terminal) =
+            match (slot, res) {
+                (Slot::Skipped { skill, max }, _) => (
+                    skill.clone(),
+                    turn_span.clone(),
+                    format!("Skill '{}' exceeded its max_steps limit of {}", skill, max),
+                    true,
+                    None,
+                    None,
+                    String::new(),
+                    false,
+                ),
+                (
+                    Slot::Ready {
+                        skill,
+                        action_span,
+                        terminal,
+                        tool_call,
+                        tool_call_id,
+                        ..
+                    },
+                    Some(Ok(val)),
+                    ) => {
+                    let tx_id = val
+                        .get("transaction_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (
+                        skill.clone(),
+                        action_span.clone(),
+                        val.to_string(),
+                        false,
+                        tx_id,
+                        tool_call.clone(),
+                        tool_call_id.clone(),
+                        *terminal,
+                    )
+                }
+                (
+                    Slot::Ready { skill, action_span, tool_call, tool_call_id, .. },
+                    Some(Err(e)),
+                ) => (
+                    skill.clone(),
+                    action_span.clone(),
+                    e.to_string(),
+                    true,
+                    None,
+                    tool_call.clone(),
+                    tool_call_id.clone(),
+                    false,
+                ),
+                (Slot::Ready { .. }, None) => {
+                    unreachable!("ready slots always produce a result")
+                }
+            };
+        // Labeled observation so the model can attribute results to calls.
+        let labeled = format!("[{}/{} from {}]: {}", i + 1, n, skill, body);
+        let (parent_span_id, depth) = match slot {
+            Slot::Ready { .. } => (Some(action_span.clone()), Some(2)),
+            Slot::Skipped { .. } => (Some(turn_span.clone()), Some(1)),
+        };
+        let _ = tx
+            .send(AgentEvent::Observation {
+                content: labeled.clone(),
+                span_id: Some(new_span_id()),
+                parent_span_id,
+                depth,
+            })
+            .await;
+
+        // Applies to any payment skill that just submitted — a no-op for
+        // non-payment skills, since tx_id is only Some when the result had a
+        // "transaction_id" field. (No hold commit/release here: confirmation
+        // skills never enter the concurrent path.)
+        if !is_error {
+            spawn_payment_settlement_watch(db.clone(), Some(tx.clone()), tx_id);
+        }
+
+        if terminal && !is_error && terminal_hit.is_none() {
+            terminal_hit = Some((body, action_span));
+        }
+
+        if is_native {
+            if !is_error && tool_call.is_some() {
+                let tc = tool_call.unwrap_or_else(|| json!({}));
+                history.push(json!({ "role": "assistant", "tool_calls": [tc] }));
+                history.push(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": labeled }));
+            } else {
+                history.push(json!({
+                    "role": "user",
+                    "content": format!("{}. If this is an error, consider retrying with corrected args, trying a different skill, or telling the user it failed.", labeled)
+                }));
+            }
+        } else {
+            history.push(json!({
+                "role": "user",
+                "content": format!("{}. If this is an error, consider retrying with corrected args, trying a different skill, or telling the user it failed.", labeled)
+            }));
+        }
+    }
+
+    if !extra_desc.is_empty() {
+        let note = format!(
+            "Deferred {} parallel action(s) this turn (max {} per turn): {}. Re-emit any still-needed actions next turn.",
+            extra_desc.len(),
+            MAX_PARALLEL_ACTIONS,
+            extra_desc.join("; "),
+        );
+        let _ = tx
+            .send(AgentEvent::Observation {
+                content: note.clone(),
+                span_id: Some(new_span_id()),
+                parent_span_id: None,
+                depth: Some(0),
+            })
+            .await;
+        history.push(json!({ "role": "user", "content": note }));
+    }
+
+    if let Some((final_body, final_parent)) = terminal_hit {
+        let _ = tx
+            .send(AgentEvent::Final {
+                content: final_body,
+                span_id: Some(new_span_id()),
+                parent_span_id: Some(final_parent),
+                depth: Some(2),
+            })
+            .await;
+        return false;
+    }
+    true
 }
 
 fn load_react_meta(skill: &str) -> ReactConfig {
@@ -1042,6 +1682,26 @@ fn skill_requires_confirmation(skill: &str) -> bool {
     skill_capabilities(skill)
         .map(|capabilities| capabilities.hedera_pay)
         .unwrap_or(false)
+}
+
+/// Air-gap proposal guard. Returns `Some(error)` when `skill` needs a DLT
+/// capability and `dlt_enabled` is off — the caller surfaces it as a
+/// proposal error so no spend hold is ever reserved and no HCS audit write
+/// fires. Returns `None` for non-DLT skills and whenever the flag is on
+/// (default), leaving all current behavior untouched. Reads the flag live
+/// from env/db on every call so the toggle applies without a restart.
+fn dlt_blocked_error(db: &crate::db::Db, skill: &str) -> Option<String> {
+    let capabilities = skill_capabilities(skill).unwrap_or_default();
+    if !(capabilities.hedera_pay || capabilities.x402_pay) {
+        return None;
+    }
+    if crate::config::dlt_enabled_live(db) {
+        return None;
+    }
+    Some(format!(
+        "Skill '{}' blocked: DLT disabled (air-gap mode) — re-enable with `aria dlt on`",
+        skill
+    ))
 }
 
 fn pending_payment_action(

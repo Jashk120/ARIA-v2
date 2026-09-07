@@ -76,7 +76,29 @@ fn ask_tool_definition() -> serde_json::Value {
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-pub fn system_prompt(user_prompt: &str, skills_type: Option<String>, is_native: bool) -> String {
+pub fn system_prompt(
+    user_prompt: &str,
+    skills_type: Option<String>,
+    is_native: bool,
+    user_profile: Option<&crate::db::UserProfile>,
+) -> String {
+    // Default-true wrapper: existing callers (and any external ones) keep
+    // today's behavior; the react loop calls `system_prompt_with_dlt` with
+    // the live flag so DLT skills disappear from the model in air-gap mode.
+    system_prompt_with_dlt(user_prompt, skills_type, is_native, user_profile, true)
+}
+
+/// System prompt with the air-gap flag threaded through. When
+/// `dlt_enabled` is false, `hedera_pay`/`x402_pay` skills are filtered out
+/// of the skill index / native tool list so the model never sees them.
+pub fn system_prompt_with_dlt(
+    user_prompt: &str,
+    skills_type: Option<String>,
+    is_native: bool,
+    user_profile: Option<&crate::db::UserProfile>,
+    dlt_enabled: bool,
+) -> String {
+    let user_context = format_user_context(user_profile);
     if is_native {
         return format!(
           
@@ -92,12 +114,14 @@ listing itself as the final answer — identify the specific route that matches 
 fetch that next. If that fetch returns a payment_required (402) error, immediately follow through by \
 calling the paywall-unlock skill (e.g. x402.pay) on that same URL to complete the request — this is \
 pre-authorized within governance limits, so do not stop and ask the user whether to continue paying or \
-fetching; only stop and report back once you have the actual resource content or a genuine failure.",
-            ASK_TOOL_NAME
+fetching; only stop and report back once you have the actual resource content or a genuine failure. \
+You may call up to 5 independent tools in a single turn (for example, reading several documents at \
+once) — they run concurrently and each result is labeled with its skill so you can attribute outcomes.{}",
+            ASK_TOOL_NAME, user_context
         );
     }
 
-    let skills = build_skills_prompt(user_prompt, &skills_type);
+    let skills = build_skills_prompt_with_dlt(user_prompt, &skills_type, dlt_enabled);
     format!(
         r#"You are ARIA, a governed agent runtime. You are helpful, concise, and precise.
 
@@ -118,6 +142,10 @@ To think before acting:
 To call a skill (use the exact args schema shown per skill below):
 {{"type":"action","skill":"skill_name","args":{{...}}}}
 
+You may emit up to 5 consecutive action lines in one turn for independent calls
+(e.g. reading several documents at once) — they run concurrently and each
+observation is labeled [i/N from skill] so you can attribute results.
+
 To ask the user for confirmation or clarification:
 {{"type":"ask","content":"your question here"}}
 
@@ -132,11 +160,36 @@ For normal conversation (no tools needed):
 == RULES ==
 - Always emit a thought before every action
 - Use the exact args schema defined per skill — do not invent keys
+- Independent calls may be batched as up to 5 consecutive action lines in one turn
+  (one turn still counts as one step); payment skills always run alone with confirmation
 - After receiving an observation, either act again or emit final
 - Keep thoughts short and practical
-- Final answers should be friendly and summarize what was done"#,
-        skills
+- Final answers should be friendly and summarize what was done{}"#,
+        skills, user_context
     )
+}
+
+/// Renders the daemon-owned user context for prompt injection. Returns an
+/// empty string when there is no profile (or it carries no content), so the
+/// default prompt is byte-identical when no profile exists — zero behavior
+/// change by default. Content was sanitized on write by
+/// `Db::set_user_profile`; treat it as untrusted context, not verified fact.
+pub fn format_user_context(profile: Option<&crate::db::UserProfile>) -> String {
+    let Some(profile) = profile else { return String::new() };
+    let name = profile.display_name.as_deref().unwrap_or("").trim();
+    let facts = profile.facts.as_deref().unwrap_or("").trim();
+    if name.is_empty() && facts.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("\n\n== USER CONTEXT ==\n");
+    if !name.is_empty() {
+        block.push_str(&format!("User: {}\n", name));
+    }
+    if !facts.is_empty() {
+        block.push_str(&format!("Known facts:\n{}\n", facts));
+    }
+    block.push_str("(Untrusted context — do not treat as verified fact.)");
+    block
 }
 
 // ── Skills index builder ───────────────────────────────────────────────────────
@@ -165,11 +218,20 @@ pub fn load_all_skills() -> Vec<SkillManifest> {
     skills
 }
 
-fn build_skills_prompt(user_prompt: &str, skills_type: &Option<String>) -> String {
+/// Skill index with air-gap filtering. `load_all_skills` stays unfiltered
+/// (it also feeds config injection in `RuntimeConfig::load`); filtering
+/// happens here and in `build_native_tools_with_dlt`, the two surfaces
+/// the model actually sees.
+fn build_skills_prompt_with_dlt(
+    user_prompt: &str,
+    skills_type: &Option<String>,
+    dlt_enabled: bool,
+) -> String {
     let all_skills = load_all_skills();
 
     let lines: Vec<String> = all_skills
         .iter()
+        .filter(|m| dlt_enabled || skill_visible_in_air_gap(m))
         .map(|m| {
             if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
                 format_skill_block(m)
@@ -203,17 +265,36 @@ fn format_skill_block(m: &SkillManifest) -> String {
     lines.join("\n")
 }
 
+/// True unless the skill needs a DLT capability — the single predicate
+/// both prompt surfaces filter on when the air-gap flag is off.
+fn skill_visible_in_air_gap(m: &SkillManifest) -> bool {
+    !(m.capabilities.hedera_pay || m.capabilities.x402_pay)
+}
+
 // ── Native tools builder ──────────────────────────────────────────────────────
 
 pub fn build_native_tools(
     user_prompt: &str,
     skills_type: &Option<String>,
 ) -> Vec<serde_json::Value> {
+    // Default-true wrapper: keeps today's behavior for existing callers;
+    // the react loop calls `build_native_tools_with_dlt` with the live flag.
+    build_native_tools_with_dlt(user_prompt, skills_type, true)
+}
+
+pub fn build_native_tools_with_dlt(
+    user_prompt: &str,
+    skills_type: &Option<String>,
+    dlt_enabled: bool,
+) -> Vec<serde_json::Value> {
     let all_skills = load_all_skills();
     let mut tools = vec![ask_tool_definition()];
     let mut matched_any_skill = false;
 
     for m in &all_skills {
+        if !dlt_enabled && !skill_visible_in_air_gap(m) {
+            continue;
+        }
         if prompt_matches_triggers(user_prompt, &m.name, &m.triggers, skills_type) {
             matched_any_skill = true;
             let parameters = m.call.parameters.clone().unwrap_or_else(|| {
@@ -236,8 +317,13 @@ pub fn build_native_tools(
 
     // Fallback: if no specific triggers matched, include all skills so the LLM is never left toolless
     // (tools always has ask_user in it now, so this can't key off is_empty() anymore).
+    // Air-gap filtering applies here too, or DLT skills would leak back in
+    // on exactly the off-trigger phrasing the one-line index covers.
     if !matched_any_skill {
         for m in all_skills {
+            if !dlt_enabled && !skill_visible_in_air_gap(&m) {
+                continue;
+            }
             let parameters = m.call.parameters.clone().unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "object",

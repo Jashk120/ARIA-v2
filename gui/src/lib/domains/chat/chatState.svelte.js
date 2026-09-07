@@ -62,12 +62,12 @@ class ChatState {
   persistEvent(role, content, eventType, payload = null, groupId = null) {
     if (!this.currentSession) return;
     tauriInvoke('save_event', {
-      sessionId: this.currentSession,
+      session_id: this.currentSession,
       role,
       content,
-      eventType,
-      payloadJson: payload ? JSON.stringify(payload) : null,
-      groupId
+      event_type: eventType,
+      payload_json: payload ? JSON.stringify(payload) : null,
+      group_id: groupId
     }).catch(() => {});
   }
 
@@ -92,7 +92,7 @@ class ChatState {
 
   async newSession() {
     const id = `sess_${Date.now()}`;
-    await tauriInvoke('create_session', { sessionId: id, title: 'New Chat' });
+    await tauriInvoke('create_session', { session_id: id, title: 'New Chat' });
     await this.refreshSessions();
     await this.openSession(id);
   }
@@ -104,7 +104,7 @@ class ChatState {
     this.messages = [];
     this.activeDaemonSkillType = null;
 
-    const stored = /** @type {any[]} */ (await tauriInvoke('load_messages', { sessionId: id }).catch(() => []));
+    const stored = /** @type {any[]} */ (await tauriInvoke('load_messages', { session_id: id }).catch(() => []));
     /** @type {Map<string, UiMessage>} */
     const groupBlocks = new Map();
 
@@ -165,7 +165,7 @@ class ChatState {
     }
 
     const pending = /** @type {{ task_id: string, content: string, kind?: string, skill_type: string } | null} */ (
-      await tauriInvoke('load_pending_confirmation', { sessionId: id }).catch(() => null)
+      await tauriInvoke('load_pending_confirmation', { session_id: id }).catch(() => null)
     );
     if (pending) {
       this.activeDaemonSkillType = pending.skill_type;
@@ -198,7 +198,7 @@ class ChatState {
 
   /** @param {string} id */
   async deleteSession(id) {
-    await tauriInvoke('delete_session', { sessionId: id });
+    await tauriInvoke('delete_session', { session_id: id });
     await this.refreshSessions();
     if (id === this.currentSession) {
       if (this.sessions.length > 0) {
@@ -274,7 +274,7 @@ class ChatState {
           this.messages = this.messages;
           this.persistEvent('daemon', data.payload?.content ?? '', data.event_type, data.payload, last.groupId ?? this.#currentGroupId);
         }
-        if (data.event_type === 'payment_settled') {
+        if (data.event_type === 'paymentsettled' || data.event_type === 'payment_settled') {
           historyState.applyPaymentSettled(data.payload ?? {});
         }
         this.scrollBottom();
@@ -284,6 +284,19 @@ class ChatState {
       case 'daemon_done': {
         const last = this.lastDaemonBlock();
         if (last) {
+          // The terminal answer arrives exactly once via DaemonDone (the
+          // backend no longer forwards final/chat as daemon_event).
+          // Append it once so the block renders the answer and the
+          // summary/persist paths below see it. The hasFinal guard keeps
+          // this idempotent — a duplicate DaemonDone never double-appends.
+          const hasFinal = (last.daemonEvents ?? []).some(
+            (ev) => ev.event_type === 'final' || ev.event_type === 'chat'
+          );
+          if (data.result && !hasFinal) {
+            const payload = { content: data.result };
+            last.daemonEvents = [...(last.daemonEvents ?? []), { event_type: 'final', payload }];
+            this.persistEvent('daemon', data.result, 'final', payload, last.groupId ?? this.#currentGroupId);
+          }
           last.streaming = false;
           this.messages = this.messages;
           this.history = [
@@ -332,11 +345,11 @@ class ChatState {
         this.persistEvent('daemon', data.content, 'ask', { content: data.content, kind: data.payload?.kind, task_id: data.task_id }, groupId);
         if (this.currentSession) {
           tauriInvoke('save_pending_confirmation', {
-            sessionId: this.currentSession,
-            taskId: data.task_id,
+            session_id: this.currentSession,
+            task_id: data.task_id,
             content: data.content,
             kind: data.payload?.kind,
-            skillType
+            skill_type: skillType
           }).catch(() => {});
         }
         this.isThinking = false;
@@ -399,10 +412,10 @@ class ChatState {
 
     try {
       await tauriInvoke('resume_daemon_task', {
-        sessionId: this.currentSession,
-        taskId: target.taskId,
+        session_id: this.currentSession,
+        task_id: target.taskId,
         reply: text,
-        skillType: target.skillType
+        skill_type: target.skillType
       });
     } catch (err) {
       this.messages = [...this.messages, { id: ++msgId, role: 'error', content: `Failed to resume task: ${err}` }];
@@ -457,7 +470,7 @@ class ChatState {
     this.messages = this.messages;
 
     if (this.currentSession) {
-      tauriInvoke('clear_pending_confirmation', { sessionId: this.currentSession }).catch(() => {});
+      tauriInvoke('clear_pending_confirmation', { session_id: this.currentSession }).catch(() => {});
     }
 
     const note = action === 'approve'

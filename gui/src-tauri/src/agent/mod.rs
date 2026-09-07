@@ -1,4 +1,3 @@
-use reqwest::Client;
 use serde::ser::{SerializeMap, Serializer};
 use serde::Serialize;
 use serde_json::Value;
@@ -6,7 +5,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::daemon;
 use crate::AppState;
-use crate::llm::{self, ChatMessage, LlmStreamResult};
+// NOTE: the GUI owns no router LLM. `ChatMessage` is kept only so the
+// `send_message` command signature (history: Vec<ChatMessage>) stays stable
+// for the frontend; nothing in the chat path calls `llm::stream_chat`.
+use crate::llm::ChatMessage;
 
 // ── Tauri Event Payloads ──────────────────────────────────────────────────────
 
@@ -113,118 +115,64 @@ impl FrontendEvent {
 
 // ── Agent: Single Turn ────────────────────────────────────────────────────────
 
-/// Process one user turn through the agent loop.
-/// Streams tokens/events to the frontend via Tauri events.
-pub async fn run_turn(app: AppHandle, mut history: Vec<ChatMessage>) -> Result<(), String> {
-    let client = Client::new();
+/// Process one user turn as a pure pass-through to the daemon.
+///
+/// The GUI owns NO router LLM: the last user message from `history` goes
+/// straight to `run_daemon_task` (daemon `submit_task` over TCP) on a
+/// blocking thread, daemon events stream to the frontend via
+/// `forward_daemon_event`, and the daemon's terminal answer is delivered
+/// exactly once via `DaemonDone`. Exactly one writer closes the turn:
+/// `Error` on transport failure, otherwise a single `DaemonDone`.
+/// An `awaiting_confirmation` turn emits no `DaemonDone` — the confirmation
+/// card was already emitted and `resume_daemon_task` drives what happens next.
+pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), String> {
+    let task = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
-    loop {
-        // Clone app handle for the token streaming closure
-        let app_token = app.clone();
-        let result = llm::stream_chat(&client, &history, move |token| {
-            FrontendEvent::Token { content: token }.emit(&app_token);
-        })
-        .await;
-
-        match result {
-            // ── Normal text response — nothing else to do ─────────────────────
-            Ok(LlmStreamResult::TextDone { full_text }) => {
-                FrontendEvent::Done { full_text }.emit(&app);
-                break;
-            }
-
-            // ── Router is asking a clarifying question instead of guessing ────
-            Ok(LlmStreamResult::Ask { question }) => {
-                FrontendEvent::Ask { content: question }.emit(&app);
-                break;
-            }
-
-            // ── Tool call — delegate to the daemon ────────────────────────────
-            Ok(LlmStreamResult::ToolCall { id, name, arguments }) => {
-                if name != "delegate_to_daemon" {
-                    FrontendEvent::Error {
-                        message: format!("Unsupported tool: {name}"),
-                    }
-                    .emit(&app);
-                    break;
-                }
-
-                // Parse the tool arguments JSON
-                let args: Value = serde_json::from_str(&arguments)
-                    .map_err(|e| format!("Bad tool args JSON: {e}"))?;
-
-                let task = args["task"]
-                    .as_str()
-                    .unwrap_or("unknown task")
-                    .to_string();
-                let skill_type = args["type"].as_str().unwrap_or("fs").to_string();
-
-                FrontendEvent::DaemonStarted {
-                    task: task.clone(),
-                    skill_type: skill_type.clone(),
-                }
-                .emit(&app);
-
-                // TcpStream is synchronous — run it in a blocking thread pool
-                let app_daemon = app.clone();
-                let (res, final_result, daemon_gave_final_answer, awaiting_confirmation) =
-                    tokio::task::spawn_blocking(move || run_daemon_task(app_daemon, task, skill_type, None))
-                        .await
-                        .map_err(|e| format!("Block thread error: {e}"))?;
-
-                if let Err(e) = res {
-                    FrontendEvent::Error { message: e }.emit(&app);
-                    break;
-                }
-
-                // The daemon paused this task on a human confirmation (e.g. a
-                // payment above the auto-approval threshold). AwaitingConfirmation
-                // was already emitted straight to the frontend, which renders the
-                // Yes/No card. Stop the turn here — do NOT push a tool result and
-                // loop back into the router LLM, or it has nothing real to go on
-                // and will hallucinate an outcome for a payment that hasn't
-                // happened yet. `resumeInlineAsk` on the frontend drives what
-                // happens next, via the separate `resume_daemon_task` command.
-                if awaiting_confirmation {
-                    break;
-                }
-
-                // If the daemon itself produced a terminal "final"/"chat" answer,
-                // that IS the user-facing response — don't loop back into the
-                // router LLM to have it generate a second, redundant answer that
-                // streams in after (and visually clobbers) the daemon's own reply.
-                if daemon_gave_final_answer {
-                    FrontendEvent::DaemonDone { result: final_result, turn_done: true }.emit(&app);
-                    break;
-                }
-
-                FrontendEvent::DaemonDone { result: final_result.clone(), turn_done: false }.emit(&app);
-
-                // Append the tool call and tool result to history
-                let tool_call = llm::ToolCall {
-                    id: id.clone(),
-                    call_type: "function".to_string(),
-                    function: llm::ToolCallFunction {
-                        name: "delegate_to_daemon".to_string(),
-                        arguments: arguments.clone(),
-                    },
-                };
-                history.push(llm::ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: Some(vec![tool_call]),
-                    tool_call_id: None,
-                });
-                history.push(llm::ChatMessage::tool_result(id, final_result));
-            }
-
-            Err(e) => {
-                FrontendEvent::Error { message: e }.emit(&app);
-                break;
-            }
+    if task.is_empty() {
+        FrontendEvent::Error {
+            message: "Empty message".to_string(),
         }
+        .emit(&app);
+        return Ok(());
     }
 
+    let skill_type = "fs".to_string();
+
+    FrontendEvent::DaemonStarted {
+        task: task.clone(),
+        skill_type: skill_type.clone(),
+    }
+    .emit(&app);
+
+    // TcpStream is synchronous — run it in a blocking thread pool
+    let app_daemon = app.clone();
+    let (res, final_result, _daemon_gave_final_answer, awaiting_confirmation) =
+        tokio::task::spawn_blocking(move || run_daemon_task(app_daemon, task, skill_type, None))
+            .await
+            .map_err(|e| format!("Block thread error: {e}"))?;
+
+    if let Err(e) = res {
+        FrontendEvent::Error { message: e }.emit(&app);
+        return Ok(());
+    }
+
+    // The daemon paused this task on a human confirmation (e.g. a
+    // payment above the auto-approval threshold). AwaitingConfirmation
+    // was already emitted straight to the frontend, which renders the
+    // Yes/No card. Stop the turn here. `resumeInlineAsk` on the frontend
+    // drives what happens next, via `resume_daemon_task`.
+    if awaiting_confirmation {
+        return Ok(());
+    }
+
+    FrontendEvent::DaemonDone { result: final_result, turn_done: true }.emit(&app);
     Ok(())
 }
 
@@ -281,14 +229,15 @@ fn run_daemon_task(
 }
 
 /// Forwards one daemon event to the frontend. `final_result` accumulates the
-/// content of the last `final`/`chat` event so the caller can use it as the
-/// tool observation (or, in the resume-confirmation path, ignore it).
-/// `is_terminal_answer` is set to `true` whenever a `final`/`chat` event is
-/// seen — a signal to the caller that the daemon already produced a
-/// complete, user-facing answer, so no further LLM pass should re-answer
-/// (and visually overwrite) it. `is_awaiting_confirmation` is set to `true`
+/// content of the last `final`/`chat` event so the caller can deliver it
+/// exactly once via `DaemonDone` (the frontend appends it to the daemon
+/// block there). `is_terminal_answer` is set to `true` whenever a
+/// `final`/`chat` event is seen. `is_awaiting_confirmation` is set to `true`
 /// when the daemon paused on an `ask` — a signal that this task has NOT
-/// finished and no further LLM pass should synthesize an outcome for it.
+/// finished.
+/// Terminal `final`/`chat` events are NOT forwarded as `DaemonEvent`: they
+/// are already delivered via `DaemonDone`, and forwarding both would render
+/// the daemon's answer twice.
 pub fn forward_daemon_event(
     app: &AppHandle,
     event: daemon::DaemonEvent,
@@ -319,6 +268,8 @@ pub fn forward_daemon_event(
             *final_result = content.to_string();
             *is_terminal_answer = true;
         }
+        // Delivered exactly once via DaemonDone — do NOT also emit DaemonEvent.
+        return;
     }
 
     FrontendEvent::DaemonEvent { event_type: ev_type, payload: event.payload }.emit(app);

@@ -37,6 +37,59 @@ class SettingsState {
   /** @type {UrlRateStatusMap} */
   settingsUrlRateStatus = $state({});
 
+  // ── DLT Air-Gap Switch ──
+  /** @type {boolean | null} null = not yet loaded from the daemon */
+  dltEnabled = $state(null);
+  dltLoading = $state(false);
+  dltLoadedOnce = $state(false);
+  /** @type {string | null} */
+  dltLoadError = $state(null);
+  dltMutating = $state(false);
+  /** @type {string | null} */
+  dltMutateError = $state(null);
+  /** @type {string | null} */
+  dltNotice = $state(null);
+
+  async loadDltStatus() {
+    if (this.dltLoading) return;
+    this.dltLoading = true;
+    this.dltLoadedOnce = true;
+    this.dltLoadError = null;
+
+    try {
+      const result = /** @type {any} */ (await tauriInvoke('query_dlt_status'));
+      this.dltEnabled = result?.enabled ?? true;
+    } catch (e) {
+      this.dltLoadError = String(e);
+    } finally {
+      this.dltLoading = false;
+    }
+  }
+
+  /** @param {boolean} enabled */
+  async setDltEnabled(enabled) {
+    if (this.dltMutating || !daemonState.online) return;
+
+    this.dltMutating = true;
+    this.dltMutateError = null;
+    this.dltNotice = null;
+
+    try {
+      const result = /** @type {any} */ (
+        await tauriInvoke('mutate_dlt', { action: enabled ? 'on' : 'off' })
+      );
+      const next = result?.enabled ?? enabled;
+      this.dltEnabled = next;
+      this.dltNotice = next
+        ? 'DLT skills enabled.'
+        : 'DLT skills disabled (air-gap mode).';
+    } catch (e) {
+      this.dltMutateError = String(e);
+    } finally {
+      this.dltMutating = false;
+    }
+  }
+
   async loadSettingsAllowlist() {
     if (this.settingsLoading) return;
     this.settingsLoading = true;

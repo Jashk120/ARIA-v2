@@ -2,6 +2,7 @@
   import TopBar from '$lib/domains/shell/TopBar.svelte';
   import AccountAllowlist from './components/AccountAllowlist.svelte';
   import UrlAllowlist from './components/UrlAllowlist.svelte';
+  import DltToggle from './components/DltToggle.svelte';
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { settingsState } from './settingsState.svelte.js';
   import { onMount } from 'svelte';
@@ -13,15 +14,19 @@
     if (!settingsState.settingsUrlLoadedOnce) {
       settingsState.loadSettingsUrlAllowlist();
     }
+    if (!settingsState.dltLoadedOnce) {
+      settingsState.loadDltStatus();
+    }
   });
 
   function refreshAll() {
     settingsState.loadSettingsAllowlist();
     settingsState.loadSettingsUrlAllowlist();
+    settingsState.loadDltStatus();
   }
 
-  const isRefreshing = $derived(settingsState.settingsLoading || settingsState.settingsUrlLoading);
-  const isBusy = $derived(isRefreshing || settingsState.settingsMutating || settingsState.settingsUrlMutating);
+  const isRefreshing = $derived(settingsState.settingsLoading || settingsState.settingsUrlLoading || settingsState.dltLoading);
+  const isBusy = $derived(isRefreshing || settingsState.settingsMutating || settingsState.settingsUrlMutating || settingsState.dltMutating);
 </script>
 
 <section class="chat-panel">
@@ -41,6 +46,7 @@
       </p>
       <AccountAllowlist />
       <UrlAllowlist />
+      <DltToggle />
     {/if}
   </div>
 </section>

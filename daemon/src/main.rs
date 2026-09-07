@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::io::{
-    AsyncReadExt,
+    AsyncBufReadExt,
     AsyncWriteExt,
 };
 use tracing::{
@@ -49,21 +49,26 @@ struct DaemonRequest {
     task_id: Option<String>,
     /// Read-only daemon query, short-circuited before any task/ReAct-loop
     /// dispatch: "query_budget", "query_holds", "query_allowlist",
-    /// "query_url_allowlist", "query_payment_history", or
-    /// "query_wallet_balance". When set, `task` is ignored.
+    /// "query_url_allowlist", "query_payment_history",
+    /// "query_wallet_balance", or "query_dlt_status". When set, `task` is
+    /// ignored.
     #[serde(default)]
     query: Option<String>,
     /// Mutating daemon endpoint, short-circuited the same way `query` is:
-    /// "mutate_allowlist", "mutate_url_allowlist", "approve_hold", or
-    /// "release_hold". When set, `task` and `query` are ignored.
+    /// "mutate_allowlist", "mutate_url_allowlist", "mutate_dlt",
+    /// "approve_hold", or "release_hold". When set, `task` and `query` are
+    /// ignored.
     #[serde(default)]
     mutate: Option<String>,
     /// For `mutate: "mutate_allowlist"` / `"mutate_url_allowlist"`: "add" or
-    /// "remove".
+    /// "remove". For `mutate: "mutate_dlt"`: "on" or "off".
     action: Option<String>,
     /// For `mutate: "mutate_allowlist"`: the account to add/remove.
     account: Option<String>,
     /// For `mutate: "mutate_url_allowlist"`: the url to add/remove.
+    /// For `query: "query_url_rate_status"`: the url to report the
+    /// rolling 1-hour attempt count for.
+    #[serde(default)]
     url: Option<String>,
     /// For `mutate: "approve_hold"` / `"release_hold"`: the payment key
     /// identifying the hold to act on.
@@ -135,6 +140,16 @@ enum QueryResponse {
         agent_did: String,
         audit_topic_id: Option<String>,
     },
+    /// Returned for `query: "query_url_rate_status"`. `recent_attempts`
+    /// is the rolling 1-hour attempt count from `db.rs`
+    /// `count_recent_url_attempts`; `max_per_hour` mirrors the x402
+    /// enforcement ceiling in `skills/wasm_runtime.rs`.
+    QueryUrlRateStatus {
+        agent_did: String,
+        url: String,
+        recent_attempts: i64,
+        max_per_hour: i64,
+    },
     MutateAllowlist {
         agent_did: String,
         action: String,
@@ -156,6 +171,20 @@ enum QueryResponse {
         payment_key: String,
         /// "approved" or "released" — mirrors the action requested.
         action: String,
+    },
+    /// Returned for `query: "query_dlt_status"`. `enabled` is the live
+    /// air-gap flag (env `ARIA_DLT_ENABLED` wins, then db `dlt_enabled`,
+    /// default true) — read straight from the store on every call, never
+    /// from the startup-cached `RuntimeConfig`, so the toggle is live.
+    QueryDltStatus {
+        agent_did: String,
+        enabled: bool,
+    },
+    /// Returned for `mutate: "mutate_dlt"`. `enabled` is the flag value
+    /// after the mutation.
+    MutateDlt {
+        agent_did: String,
+        enabled: bool,
     },
     QueryError {
         message: String,
@@ -237,6 +266,27 @@ fn mutate_url_allowlist_entry(
     }
 }
 
+/// Fire-and-forget per-task HCS audit anchor after a successful seal.
+/// No-op when air-gap mode is on or no HCS topic/vault is configured.
+/// An HCS failure NEVER fails the seal — see `payments::task_anchor`.
+fn anchor_task_seal(
+    db: &std::sync::Arc<crate::db::Db>,
+    payment_vault: &Option<std::sync::Arc<crate::payments::direct::PaymentVault>>,
+    x402_vault: &Option<std::sync::Arc<crate::payments::x402_vault::X402PaymentVault>>,
+    agent_did: &str,
+    task_id: &str,
+    status: &str,
+) {
+    if !crate::config::dlt_enabled_live(db) {
+        return;
+    }
+    let client = payment_vault.as_ref().map(|v| v.client()).or_else(|| {
+        x402_vault.as_ref().map(|v| v.client())
+    });
+    let topic = db.get_config("hedera_payment_audit_topic").ok().flatten();
+    crate::payments::task_anchor::publish_task_anchor(db, client, topic, agent_did, task_id, status);
+}
+
 /// Handles the TCP `approve_hold` endpoint from the dashboard.
 /// Looks up the `awaiting_confirmation` task that owns this payment_key,
 /// then runs the ReAct loop with "yes" so the agent executes the payment,
@@ -298,10 +348,10 @@ async fn handle_approve_hold(
 
     while let Some(event) = rx.recv().await {
         match &event {
-            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+            crate::agent::react_loop::AgentEvent::Action { skill, args, .. } => {
                 last_action = Some((skill.clone(), args.clone()));
             }
-            crate::agent::react_loop::AgentEvent::Observation { content } |
+            crate::agent::react_loop::AgentEvent::Observation { content, .. } |
             crate::agent::react_loop::AgentEvent::Error { content } => {
                 let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
                 if let Some((skill, args)) = last_action.take()
@@ -334,7 +384,13 @@ async fn handle_approve_hold(
 
     if let Ok(Some(session)) = db.get_task_session(&task_id) {
         if session.status != "awaiting_confirmation" {
-            let _ = db.seal_task(&task_id, status);
+            let status_str = match status {
+                crate::db::TaskStatus::Done => "done",
+                _ => "failed",
+            };
+            if db.seal_task(&task_id, status).is_ok() {
+                anchor_task_seal(db, &payment_vault, &x402_vault, agent_did, &task_id, status_str);
+            }
         }
     }
 
@@ -410,10 +466,10 @@ async fn handle_release_hold(
 
     while let Some(event) = rx.recv().await {
         match &event {
-            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+            crate::agent::react_loop::AgentEvent::Action { skill, args, .. } => {
                 last_action = Some((skill.clone(), args.clone()));
             }
-            crate::agent::react_loop::AgentEvent::Observation { content } |
+            crate::agent::react_loop::AgentEvent::Observation { content, .. } |
             crate::agent::react_loop::AgentEvent::Error { content } => {
                 let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
                 if let Some((skill, args)) = last_action.take()
@@ -446,7 +502,13 @@ async fn handle_release_hold(
 
     if let Ok(Some(session)) = db.get_task_session(&task_id) {
         if session.status != "awaiting_confirmation" {
-            let _ = db.seal_task(&task_id, status);
+            let status_str = match status {
+                crate::db::TaskStatus::Done => "done",
+                _ => "failed",
+            };
+            if db.seal_task(&task_id, status).is_ok() {
+                anchor_task_seal(db, &payment_vault, &x402_vault, agent_did, &task_id, status_str);
+            }
         }
     }
 
@@ -541,10 +603,44 @@ fn handle_mutate_url_allowlist(
     }
 }
 
+/// Handles the TCP `mutate_dlt` endpoint: validates the action ("on" or
+/// "off"), then calls `set_dlt_enabled` — the same function the
+/// `aria dlt on|off` CLI commands use — rather than writing the db key
+/// here. Takes effect immediately: every enforcement point re-reads the
+/// flag live, so no daemon restart is needed.
+fn handle_mutate_dlt(action: Option<&str>, agent_did: &str, db: &Db) -> QueryResponse {
+    let Some(action) = action else {
+        return QueryResponse::QueryError {
+            message: "missing \"action\" (expected \"on\" or \"off\")".to_string(),
+        };
+    };
+    let enabled = match action {
+        "on" => true,
+        "off" => false,
+        _ => {
+            return QueryResponse::QueryError {
+                message: format!(
+                    "unknown dlt action: {} (expected \"on\" or \"off\")",
+                    action
+                ),
+            };
+        }
+    };
+
+    match crate::config::set_dlt_enabled(db, enabled) {
+        Ok(()) => QueryResponse::MutateDlt {
+            agent_did: agent_did.to_string(),
+            enabled,
+        },
+        Err(e) => QueryResponse::QueryError { message: format!("dlt mutation failed: {}", e) },
+    }
+}
+
 /// Handles the read-only TCP query endpoints. Never touches
 /// `react_loop.rs` and never creates a task — answers straight from existing
 /// state (db + governance config), or, for the wallet balance, a live
 /// Hedera network read.
+#[allow(clippy::too_many_arguments)]
 async fn handle_query(
     query: &str,
     agent_did: &str,
@@ -553,6 +649,7 @@ async fn handle_query(
     payment_vault: Option<&crate::payments::direct::PaymentVault>,
     x402_vault: Option<&crate::payments::x402_vault::X402PaymentVault>,
     limit: Option<i64>,
+    url: Option<&str>,
 ) -> QueryResponse {
     match query {
         "query_budget" => {
@@ -635,6 +732,28 @@ async fn handle_query(
             agent_did: agent_did.to_string(),
             audit_topic_id: runtime_cfg.governance.audit_topic_id.clone(),
         },
+        // Live read (env then db), NOT the startup-cached runtime_cfg —
+        // the flag must reflect a toggle that happened after boot.
+        "query_dlt_status" => QueryResponse::QueryDltStatus {
+            agent_did: agent_did.to_string(),
+            enabled: crate::config::dlt_enabled_live(db),
+        },
+        "query_url_rate_status" => match url {
+            Some(u) if !u.is_empty() => match db.count_recent_url_attempts(agent_did, u) {
+                Ok(recent_attempts) => QueryResponse::QueryUrlRateStatus {
+                    agent_did: agent_did.to_string(),
+                    url: u.to_string(),
+                    recent_attempts,
+                    max_per_hour: 10,
+                },
+                Err(e) => QueryResponse::QueryError {
+                    message: format!("failed to load url rate status: {}", e),
+                },
+            },
+            _ => QueryResponse::QueryError {
+                message: "query_url_rate_status requires a non-empty url".to_string(),
+            },
+        },
         "query_wallet_balance" => {
             use hiero_sdk::AccountBalanceQuery;
 
@@ -680,6 +799,7 @@ fn print_help() {
     println!("  url-allowlist add <url>  Add a url to the x402 url allowlist");
     println!("  url-allowlist remove <url> Remove a url from the x402 url allowlist");
     println!("  url-allowlist list       List allowlisted x402 urls");
+    println!("  dlt on|off|status       Enable/disable DLT skills (air-gap mode) or show status");
     println!("  install                  Install systemd user service for auto-start");
     println!("  help                     Show this help");
     println!();
@@ -987,13 +1107,47 @@ async fn run_daemon() -> anyhow::Result<()> {
                 let x402_vault = x402_vault.clone();
 
                 tokio::spawn(async move {
-                    let mut buffer = vec![0u8; 16384]; // Increased buffer capacity
-                    let n = match socket.read(&mut buffer).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
-                    };
+                    // One newline-terminated JSON request per connection.
+                    // read_until buffers until the '\n' the GUI always
+                    // appends, so fragmented TCP segments and requests
+                    // larger than any fixed read buffer arrive whole.
+                    const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+                    let mut buf: Vec<u8> = Vec::new();
+                    {
+                        let mut reader = tokio::io::BufReader::new(&mut socket);
+                        match reader.read_until(b'\n', &mut buf).await {
+                            Ok(0) => return,
+                            Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if buf.is_empty() {
+                            return;
+                        }
+                        if buf.len() > MAX_REQUEST_SIZE {
+                            let _ = reader
+                                .get_mut()
+                                .write_all(
+                                    format!(
+                                        "Invalid JSON: request exceeds {} bytes\n",
+                                        MAX_REQUEST_SIZE
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                    if buf.ends_with(b"\n") {
+                        buf.pop();
+                        if buf.ends_with(b"\r") {
+                            buf.pop();
+                        }
+                    }
+                    if buf.is_empty() {
+                        return;
+                    }
 
-                    let req: DaemonRequest = match serde_json::from_slice(&buffer[..n]) {
+                    let req: DaemonRequest = match serde_json::from_slice(&buf) {
                         Ok(r) => r,
                         Err(e) => {
                             let _ = socket.write_all(format!("Invalid JSON: {}\n", e).as_bytes()).await;
@@ -1013,6 +1167,11 @@ async fn run_daemon() -> anyhow::Result<()> {
                             "mutate_url_allowlist" => handle_mutate_url_allowlist(
                                 req.action.as_deref(),
                                 req.url.as_deref(),
+                                &agent_did,
+                                &db,
+                            ),
+                            "mutate_dlt" => handle_mutate_dlt(
+                                req.action.as_deref(),
                                 &agent_did,
                                 &db,
                             ),
@@ -1065,6 +1224,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                             payment_vault.as_deref(),
                             x402_vault.as_deref(),
                             req.limit,
+                            req.url.as_deref(),
                         )
                         .await;
                         let json = serde_json::to_string(&response).unwrap_or_default();
@@ -1144,6 +1304,10 @@ async fn run_daemon() -> anyhow::Result<()> {
                     let db_for_loop = db.clone();
                     let did_for_loop = vault.did();
                     let task_id_for_loop = task_id.clone();
+                    // Cloned before the loop spawn moves the originals — used by
+                    // the post-seal HCS anchor below.
+                    let payment_vault_for_anchor = payment_vault.clone();
+                    let x402_vault_for_anchor = x402_vault.clone();
 
                     let handle = tokio::spawn(async move {
                         crate::agent::react_loop::run_react_loop(
@@ -1156,10 +1320,10 @@ async fn run_daemon() -> anyhow::Result<()> {
 
                     while let Some(event) = rx.recv().await {
                         match &event {
-                            crate::agent::react_loop::AgentEvent::Action { skill, args } => {
+                            crate::agent::react_loop::AgentEvent::Action { skill, args, .. } => {
                                 last_action = Some((skill.clone(), args.clone()));
                             }
-                            crate::agent::react_loop::AgentEvent::Observation { content } |
+                            crate::agent::react_loop::AgentEvent::Observation { content, .. } |
                             crate::agent::react_loop::AgentEvent::Error { content } => {
                                 let success = matches!(event, crate::agent::react_loop::AgentEvent::Observation { .. });
                                 if let Some((skill, args)) = last_action.take()
@@ -1211,8 +1375,21 @@ async fn run_daemon() -> anyhow::Result<()> {
                             );
                         }
                         Ok(_) => {
+                            let status_str = match status {
+                                TaskStatus::Done => "done",
+                                _ => "failed",
+                            };
                             if let Err(e) = db.seal_task(&task_id, status) {
                                 warn!("Failed to seal task {}: {}", task_id, e);
+                            } else {
+                                anchor_task_seal(
+                                    &db,
+                                    &payment_vault_for_anchor,
+                                    &x402_vault_for_anchor,
+                                    &vault.did(),
+                                    &task_id,
+                                    status_str,
+                                );
                             }
                         }
                         Err(e) => {
@@ -1220,8 +1397,21 @@ async fn run_daemon() -> anyhow::Result<()> {
                                 "Failed to inspect task {} before sealing: {}",
                                 task_id, e
                             );
+                            let status_str = match status {
+                                TaskStatus::Done => "done",
+                                _ => "failed",
+                            };
                             if let Err(e) = db.seal_task(&task_id, status) {
                                 warn!("Failed to seal task {}: {}", task_id, e);
+                            } else {
+                                anchor_task_seal(
+                                    &db,
+                                    &payment_vault_for_anchor,
+                                    &x402_vault_for_anchor,
+                                    &vault.did(),
+                                    &task_id,
+                                    status_str,
+                                );
                             }
                         }
                     }
@@ -1350,6 +1540,37 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ => {
                     println!("Usage: aria url-allowlist <add|remove|list> [url]");
+                }
+            }
+            Ok(())
+        }
+        // Air-gap master switch for all DLT skills (hedera_pay / x402_pay)
+        // plus HCS audit egress. Writes go through `set_dlt_enabled` — the
+        // same function the TCP `mutate_dlt` endpoint uses — and take
+        // effect immediately (every enforcement point re-reads the flag
+        // live). Default is ON; `status` reports the effective value,
+        // including an `ARIA_DLT_ENABLED` env override when one is set.
+        "dlt" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+            let db = bootstrap_db()?;
+            match subcmd {
+                "on" => {
+                    crate::config::set_dlt_enabled(&db, true)?;
+                    println!("✓ DLT skills enabled.");
+                }
+                "off" => {
+                    crate::config::set_dlt_enabled(&db, false)?;
+                    println!("✓ DLT skills disabled (air-gap mode).");
+                }
+                "status" => {
+                    if crate::config::dlt_enabled_live(&db) {
+                        println!("DLT skills: enabled");
+                    } else {
+                        println!("DLT skills: disabled (air-gap mode)");
+                    }
+                }
+                _ => {
+                    println!("Usage: aria dlt <on|off|status>");
                 }
             }
             Ok(())

@@ -50,11 +50,43 @@ pub fn split_skill_name(name: &str) -> anyhow::Result<(&str, &str)> {
 }
 
 /// Directory containing a skill's manifest.toml (and source crate).
+/// Core `skills/<category>/<name>/` first; falls back to scanning
+/// `Extra/<plugin>/skills/<category>/<name>/` so optional plugins (e.g.
+/// `Extra/dlt`) resolve at runtime without core ever importing them.
+/// Unknown skills still return the core path (old behavior) so callers get
+/// a stable, debuggable "not found" location.
 pub fn skill_dir(name: &str) -> anyhow::Result<PathBuf> {
     let (action, category) = split_skill_name(name)?;
     let root = get_daemon_root()?;
 
-    Ok(root.join("skills").join(category).join(format!("{}.{}", action, category)))
+    let core = root.join("skills").join(category).join(format!("{}.{}", action, category));
+    if core.join("manifest.toml").exists() {
+        return Ok(core);
+    }
+    for plugin_dir in extra_skill_roots(&root) {
+        let candidate = plugin_dir.join(category).join(format!("{}.{}", action, category));
+        if candidate.join("manifest.toml").exists() {
+            return Ok(candidate);
+        }
+    }
+    Ok(core)
+}
+
+/// Every `Extra/<plugin>/skills/` directory, sorted by plugin name for a
+/// stable scan order. Missing `Extra/` (or unreadable entries) yields an
+/// empty list — the air-gapped core works with plugins absent.
+pub(crate) fn extra_skill_roots(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(plugins) = std::fs::read_dir(root.join("Extra")) {
+        for plugin in plugins.flatten() {
+            let dir = plugin.path().join("skills");
+            if dir.is_dir() {
+                roots.push(dir);
+            }
+        }
+    }
+    roots.sort();
+    roots
 }
 
 /// Path to the compiled wasm binary for a skill.

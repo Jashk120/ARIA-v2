@@ -9,7 +9,10 @@ use crate::skills::manifest::{
     SkillManifest,
     load_manifest,
 };
-use crate::skills::paths::get_daemon_root;
+use crate::skills::paths::{
+    extra_skill_roots,
+    get_daemon_root,
+};
 
 // ── Trigger matching ──────────────────────────────────────────────────────────
 
@@ -196,20 +199,28 @@ pub fn format_user_context(profile: Option<&crate::db::UserProfile>) -> String {
 
 pub fn load_all_skills() -> Vec<SkillManifest> {
     let mut skills = Vec::new();
-    let skills_dir = match get_daemon_root() {
-        Ok(root) => root.join("skills"),
+    let root = match get_daemon_root() {
+        Ok(root) => root,
         Err(_) => return skills,
     };
 
-    if let Ok(categories) = std::fs::read_dir(&skills_dir) {
-        for cat in categories.flatten() {
-            if !cat.path().is_dir() {
-                continue;
-            }
-            if let Ok(entries) = std::fs::read_dir(cat.path()) {
-                for entry in entries.flatten() {
-                    if let Ok(m) = load_manifest(&entry.path()) {
-                        skills.push(m);
+    // Core skills plus every optional plugin's skills
+    // (`Extra/<plugin>/skills/`), so relocated skills (e.g. the pay
+    // skills under `Extra/dlt`) are discovered at runtime.
+    let mut skill_roots = vec![root.join("skills")];
+    skill_roots.extend(extra_skill_roots(&root));
+
+    for skills_dir in skill_roots {
+        if let Ok(categories) = std::fs::read_dir(&skills_dir) {
+            for cat in categories.flatten() {
+                if !cat.path().is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(cat.path()) {
+                    for entry in entries.flatten() {
+                        if let Ok(m) = load_manifest(&entry.path()) {
+                            skills.push(m);
+                        }
                     }
                 }
             }

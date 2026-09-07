@@ -30,6 +30,7 @@ mod crypto;
 mod db;
 mod fee_payer;
 mod identity;
+#[path = "../Extra/dlt/host/mod.rs"]
 mod payments;
 mod skills;
 

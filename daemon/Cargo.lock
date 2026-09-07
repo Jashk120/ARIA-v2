@@ -3890,6 +3890,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "run_exec"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6230,6 +6238,15 @@ dependencies = [
  "ff 0.14.0",
  "group 0.14.0",
  "hybrid-array",
+]
+
+[[package]]
+name = "write_docx"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zip",
 ]
 
 [[package]]

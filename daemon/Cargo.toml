@@ -7,12 +7,13 @@ members = [
     "skills/fs/list.fs",
     "skills/fs/read.fs",
     "skills/fs/write.fs",
-    "skills/pay/x402.pay",
-    "skills/pay/query.pay",
-    "skills/pay/transfer.pay",
+    "Extra/dlt/skills/pay/x402.pay",
+    "Extra/dlt/skills/pay/query.pay",
+    "Extra/dlt/skills/pay/transfer.pay",
     "skills/doc/write.pdf",
     "skills/doc/write.xlsx",
-
+    "skills/doc/write.docx",
+    "skills/exec/run.exec",
 ]
 
 [package]

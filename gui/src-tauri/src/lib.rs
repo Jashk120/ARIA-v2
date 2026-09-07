@@ -101,8 +101,8 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
 /// own TCP round trip — there is no background polling; panels call this
 /// once on mount and again whenever the user hits refresh.
 #[tauri::command]
-async fn dashboard_query(query: String) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || daemon::send_query(&query))
+async fn dashboard_query(query: String, limit: Option<i64>) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::send_query(&query, limit))
         .await
         .map_err(|e| format!("Block thread error: {e}"))?
 }
@@ -132,21 +132,26 @@ async fn approve_hold(
     payment_key: String,
 ) -> Result<Value, String> {
     let app_clone = app.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        daemon::approve_hold(&payment_key, |event| {
-            let mut final_result = String::new();
-            let mut is_terminal_answer = false;
-            let mut is_awaiting_confirmation = false;
+    // Accumulators live outside the per-event closure so a terminal
+    // final/chat streamed mid-flow is captured and delivered exactly once
+    // via DaemonDone (forward_daemon_event no longer forwards final/chat
+    // as DaemonEvent).
+    let (daemon_res, final_result) = tokio::task::spawn_blocking(move || {
+        let mut final_result = String::new();
+        let mut is_terminal_answer = false;
+        let mut is_awaiting_confirmation = false;
+        let res = daemon::approve_hold(&payment_key, |event| {
             crate::agent::forward_daemon_event(&app_clone, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
-        })
+        });
+        (res, final_result)
     })
     .await
-    .map_err(|e| format!("Block thread error: {e}"))??;
+    .map_err(|e| format!("Block thread error: {e}"))?;
+    let res = daemon_res?;
     let _ = state.db.clear_all_pending_confirmations();
 
-    let final_res_str = res.to_string();
     crate::agent::FrontendEvent::DaemonDone {
-        result: final_res_str,
+        result: final_result,
         turn_done: true,
     }
     .emit(&app);
@@ -163,21 +168,24 @@ async fn release_hold(
     payment_key: String,
 ) -> Result<Value, String> {
     let app_clone = app.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        daemon::release_hold(&payment_key, |event| {
-            let mut final_result = String::new();
-            let mut is_terminal_answer = false;
-            let mut is_awaiting_confirmation = false;
+    // Same accumulator hoisting as approve_hold: terminal final/chat is
+    // captured and delivered exactly once via DaemonDone.
+    let (daemon_res, final_result) = tokio::task::spawn_blocking(move || {
+        let mut final_result = String::new();
+        let mut is_terminal_answer = false;
+        let mut is_awaiting_confirmation = false;
+        let res = daemon::release_hold(&payment_key, |event| {
             crate::agent::forward_daemon_event(&app_clone, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
-        })
+        });
+        (res, final_result)
     })
     .await
-    .map_err(|e| format!("Block thread error: {e}"))??;
+    .map_err(|e| format!("Block thread error: {e}"))?;
+    let res = daemon_res?;
     let _ = state.db.clear_all_pending_confirmations();
 
-    let final_res_str = res.to_string();
     crate::agent::FrontendEvent::DaemonDone {
-        result: final_res_str,
+        result: final_result,
         turn_done: true,
     }
     .emit(&app);
@@ -206,6 +214,30 @@ async fn mutate_url_allowlist(action: String, url: String) -> Result<Value, Stri
 #[tauri::command]
 async fn query_url_rate_status(url: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::query_url_rate_status(&url))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Read the DLT air-gap flag via the daemon's `query_dlt_status` TCP
+/// endpoint. Returns the daemon's response verbatim
+/// (`{ agent_did, enabled }`). Own command (not folded into
+/// `dashboard_query`) so the Settings toggle has a typed round trip for
+/// exactly this flag.
+#[tauri::command]
+async fn query_dlt_status() -> Result<Value, String> {
+    tokio::task::spawn_blocking(daemon::query_dlt_status)
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+/// Flip the DLT air-gap flag via the daemon's `mutate_dlt` TCP endpoint.
+/// `action` is `"on"` or `"off"` (snake_case, matching the daemon wire
+/// shape). Returns the daemon's response verbatim (`{ agent_did, enabled }`)
+/// — the caller re-queries `query_dlt_status` afterward rather than
+/// trusting this response to update local state.
+#[tauri::command]
+async fn mutate_dlt(action: String) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::mutate_dlt(&action))
         .await
         .map_err(|e| format!("Block thread error: {e}"))?
 }
@@ -367,6 +399,8 @@ pub fn run() {
             release_hold,
             mutate_url_allowlist,
             query_url_rate_status,
+            query_dlt_status,
+            mutate_dlt,
             agent::resume_daemon_task,
             create_session,
             save_message,

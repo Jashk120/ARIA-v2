@@ -75,7 +75,7 @@ class DashboardState {
     this.holdActionError = null;
 
     try {
-      await tauriInvoke(action === 'approve' ? 'approve_hold' : 'release_hold', { paymentKey: payment_key });
+      await tauriInvoke(action === 'approve' ? 'approve_hold' : 'release_hold', { payment_key });
       chatState.handleDashboardHoldAction(action);
       this.holdPendingAction = null;
       await this.loadDashboard();

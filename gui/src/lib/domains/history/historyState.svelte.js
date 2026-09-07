@@ -27,7 +27,7 @@ class HistoryState {
     this.historyPaymentsError = null;
 
     try {
-      const result = /** @type {any} */ (await tauriInvoke('dashboard_query', { query: 'query_payment_history' }));
+      const result = /** @type {any} */ (await tauriInvoke('dashboard_query', { query: 'query_payment_history', limit: 50 }));
       this.historyPayments = result?.payments ?? [];
     } catch (e) {
       this.historyPaymentsError = String(e);

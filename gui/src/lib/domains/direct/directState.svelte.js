@@ -45,7 +45,7 @@ class DirectState {
           event_type: data.event_type,
           payload: data.payload
         }];
-        if (data.event_type === 'payment_settled') {
+        if (data.event_type === 'paymentsettled' || data.event_type === 'payment_settled') {
           historyState.applyPaymentSettled(data.payload ?? {});
         }
         break;
@@ -77,7 +77,7 @@ class DirectState {
     this.directEvents = [];
 
     try {
-      await tauriInvoke('send_direct_task', { task, skillType: skill_type });
+      await tauriInvoke('send_direct_task', { task, skill_type });
     } catch (err) {
       this.directEvents = [...this.directEvents, {
         event_type: 'error',

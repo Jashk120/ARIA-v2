@@ -73,6 +73,8 @@ fn connect_with_retries() -> Result<TcpStream, String> {
 #[derive(Debug, Serialize)]
 struct DaemonQueryRequest<'a> {
     query: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<i64>,
 }
 
 /// Serializes `payload`, sends it as a single line over a fresh TCP
@@ -122,8 +124,8 @@ fn send_request<T: Serialize>(payload: &T) -> Result<Value, String> {
 /// "query_url_allowlist" | "query_error", ...}`). Unlike `submit_task`, this
 /// is a single request/response round trip, not an event stream — the
 /// daemon closes the socket after the one line.
-pub fn send_query(query: &str) -> Result<Value, String> {
-    send_request(&DaemonQueryRequest { query })
+pub fn send_query(query: &str, limit: Option<i64>) -> Result<Value, String> {
+    send_request(&DaemonQueryRequest { query, limit })
 }
 
 // ── Allowlist Mutation ────────────────────────────────────────────────────────
@@ -200,6 +202,44 @@ pub fn query_url_rate_status(url: &str) -> Result<Value, String> {
     send_request(&UrlRateStatusRequest {
         query: "query_url_rate_status",
         url,
+    })
+}
+
+// ── DLT Air-Gap Switch ──────────────────────────────────────────────────────
+//
+// Master switch for all DLT skills (hedera_pay / x402_pay) plus HCS audit
+// egress. Same single-shot query/mutation round-trip shape as the allowlist
+// endpoints above: `mutate_dlt` flips the flag live (no daemon restart),
+// `query_dlt_status` reads the effective value back.
+
+// The JSON request for the `mutate_dlt` daemon endpoint. Carries
+// `mutate`/`action` ("on" or "off") — the daemon short-circuits on the
+// presence of `mutate` the same way it does for the allowlist endpoints.
+#[derive(Debug, Serialize)]
+struct DltMutateRequest<'a> {
+    mutate: &'a str,
+    action: &'a str,
+}
+
+// Sends a single `mutate_dlt` request ("on" or "off") and returns the
+// one-line JSON response the daemon writes back (tagged
+// `{"type": "mutate_dlt", "enabled"}` on success, or
+// `{"type": "query_error", "message"}` on failure).
+pub fn mutate_dlt(action: &str) -> Result<Value, String> {
+    send_request(&DltMutateRequest {
+        mutate: "mutate_dlt",
+        action,
+    })
+}
+
+// Sends a `query_dlt_status` request and returns the one-line JSON response
+// (tagged `{"type": "query_dlt_status", "enabled"}`). Single field beyond
+// the query name, so — like the other whole-state queries — it reuses the
+// shared `DaemonQueryRequest` shape rather than growing its own.
+pub fn query_dlt_status() -> Result<Value, String> {
+    send_request(&DaemonQueryRequest {
+        query: "query_dlt_status",
+        limit: None,
     })
 }
 

@@ -482,6 +482,51 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         },
     )?;
 
+    // host_fs_write_bytes(path_ptr, path_len, data_ptr, data_len) -> 1 ok / 0 err
+    // Binary-safe variant of host_fs_write: reads raw bytes (no UTF-8
+    // validation) so guests can persist PDF/XLSX payloads. Gated on the same
+    // `capabilities.fs` flag via wire_fs; all paths go through
+    // FsSandbox::resolve(..., false).
+    linker.func_wrap_async(
+        "aria",
+        "host_fs_write_bytes",
+        |mut caller: Caller<'_, HostState>,
+         (path_ptr, path_len, data_ptr, data_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                let path = match read_wasm_str(&mut caller, path_ptr, path_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_fs_write_bytes] failed to read path arg: {}", e);
+                        return 0;
+                    }
+                };
+                let data = match read_wasm_bytes(&mut caller, data_ptr, data_len) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[host_fs_write_bytes] failed to read data arg: {}", e);
+                        return 0;
+                    }
+                };
+
+                let resolved = match resolve_sandboxed(&caller, &path, false) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[host_fs_write_bytes] {}", e);
+                        return 0;
+                    }
+                };
+
+                match std::fs::write(&resolved, &data) {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        eprintln!("[host_fs_write_bytes] write failed: {}", e);
+                        0
+                    }
+                }
+            })
+        },
+    )?;
+
     // host_fs_list(path_ptr, path_len) -> packed(ptr,len) of JSON array bytes, or 0 on error
     // Each entry: {"name":"...","is_dir":bool,"size":number}
     linker.func_wrap_async(
@@ -695,6 +740,29 @@ fn find_matches(
 }
 
 // ── Memory helpers ────────────────────────────────────────────────────────────
+
+fn read_wasm_bytes(
+    caller: &mut Caller<'_, HostState>,
+    ptr: i32,
+    len: i32,
+) -> anyhow::Result<Vec<u8>> {
+    if ptr < 0 || len < 0 {
+        bail!("Memory read out of bounds (ptr: {}, len: {})", ptr, len);
+    }
+    let start = ptr as usize;
+    let end = start.checked_add(len as usize).ok_or_else(|| {
+        anyhow!("Memory read out of bounds (ptr: {}, len: {})", ptr, len)
+    })?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow!("No memory export"))?;
+    let data = memory.data(caller);
+    let slice = data
+        .get(start..end)
+        .ok_or_else(|| anyhow!("Memory read out of bounds (ptr: {}, len: {})", ptr, len))?;
+    Ok(slice.to_vec())
+}
 
 fn read_wasm_str(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> anyhow::Result<String> {
     let memory = caller

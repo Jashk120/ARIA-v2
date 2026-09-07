@@ -1,0 +1,53 @@
+name        = "write.xlsx"
+version     = "0.1.0"
+description = "Generate an XLSX spreadsheet from sheet names with row data or flat headers plus rows"
+
+triggers = []
+
+[display]
+action = "Writing spreadsheet {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","sheets":[{"name":"string","rows":[["string"]]}],"headers":["string"],"rows":[["string"]]}'
+output_schema = '{"path":"string","bytes_written":"number","sheets":"number","rows":"number","truncated":"bool"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path of the XLSX file to create on the local filesystem (relative to fs_root or absolute)"
+
+[call.parameters.properties.sheets]
+type = "array"
+description = "Worksheets to create; each has a 'name' and 'rows' (array of row arrays). Overrides headers/rows when non-empty (default: empty)"
+
+[call.parameters.properties.headers]
+type = "array"
+description = "Header row for single-sheet mode; used as the first row when 'sheets' is empty (default: empty)"
+
+[call.parameters.properties.rows]
+type = "array"
+description = "Data rows for single-sheet mode; each row is an array of cell values (default: empty)"
+
+[react]
+max_steps = 1
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

@@ -1,0 +1,53 @@
+name        = "write.pdf"
+version     = "0.1.0"
+description = "Generate a PDF document from a title and text lines or table rows"
+
+triggers = []
+
+[display]
+action = "Writing PDF {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","title":"string","lines":["string"],"table":[["string"]]}'
+output_schema = '{"path":"string","bytes_written":"number","pages":"number"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path of the PDF file to create on the local filesystem (relative to fs_root or absolute)"
+
+[call.parameters.properties.title]
+type = "string"
+description = "Document title rendered large at the top of the first page (default: empty)"
+
+[call.parameters.properties.lines]
+type = "array"
+description = "Body text lines rendered as wrapped paragraphs (default: empty)"
+
+[call.parameters.properties.table]
+type = "array"
+description = "Table rows rendered as 'cell | cell' lines; each row is an array of cell values (default: empty)"
+
+[react]
+max_steps = 1
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

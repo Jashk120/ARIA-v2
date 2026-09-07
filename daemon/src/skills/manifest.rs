@@ -48,6 +48,8 @@ pub struct Capabilities {
     pub db_query: bool,
     #[serde(default)]
     pub x402_pay: bool,
+    #[serde(default)]
+    pub exec: bool,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]

@@ -35,6 +35,7 @@ const INPUT_BUFFER_OFFSET: usize = 0;
 const MAX_INPUT_SIZE: usize = 128 * 1024; // 128KB limit for args
 const MAX_HTTP_RESPONSE_SIZE: usize = 5 * 1024 * 1024; // 5MB limit
 const MAX_FS_READ_SIZE: usize = 5 * 1024 * 1024; // 5MB limit per file read
+const MAX_EXEC_OUTPUT_SIZE: usize = 256 * 1024; // 256KB combined stdout+stderr cap
 
 // ── Host state ────────────────────────────────────────────────────────────────
 
@@ -87,8 +88,11 @@ pub async fn run_wasm_instance_async(
 
     let wasi = WasiCtxBuilder::new().build_p1();
 
-    let fs_sandbox =
-        if manifest.capabilities.fs { Some(FsSandbox::from_args(args)?) } else { None };
+    let fs_sandbox = if manifest.capabilities.fs || manifest.capabilities.exec {
+        Some(FsSandbox::from_args(args)?)
+    } else {
+        None
+    };
 
     let state = HostState {
         http_client: reqwest::Client::builder()
@@ -114,6 +118,9 @@ pub async fn run_wasm_instance_async(
     }
     if manifest.capabilities.fs {
         wire_fs(&mut linker)?;
+    }
+    if manifest.capabilities.exec {
+        wire_exec(&mut linker)?;
     }
     if manifest.capabilities.db_query {
         wire_db_query(&mut linker)?;
@@ -640,6 +647,242 @@ fn wire_fs(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         },
     )?;
 
+    Ok(())
+}
+
+// ── Sandboxed code-execution capability ───────────────────────────────────────
+//
+// host_exec_run(lang_ptr, lang_len, code_ptr, code_len, timeout_ms)
+//   -> packed(ptr,len) of JSON bytes {stdout,stderr,exit_code,timed_out}
+//      or {"error": ...}. Returns 0 only on transport failure (unreadable
+//      args or unwritable result); language/policy errors are returned as
+//      JSON so the guest can surface them to the LLM.
+//
+// Trust boundary: FsSandbox. The snippet is written to a temp file under the
+// sandboxed working dir (resolve(".", must_exist=true)) and executed with
+// cwd set to that dir. Language dispatch is an explicit allowlist:
+//   "python" -> `python3 <file>`
+//   "sh"     -> `sh <file>`
+// Anything else is rejected — no arbitrary binaries, ever. argv only; the
+// code is never interpolated into a shell string.
+//
+// Air-gap: no socket wiring is exposed to the child. The child environment is
+// scrubbed and rebuilt minimal (PATH=/usr/bin:/bin only; proxy vars, HOME,
+// and secret-bearing vars are dropped) — documented here because env scrub
+// lists are easy to regress silently.
+// Timeout: tokio::process::Command + tokio::time::timeout; on expiry the
+// child is killed and {"timed_out": true} is returned.
+fn wire_exec(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "aria",
+        "host_exec_run",
+        |mut caller: Caller<'_, HostState>,
+         (lang_ptr, lang_len, code_ptr, code_len, timeout_ms): (i32, i32, i32, i32, i32)| {
+            Box::new(async move {
+                let lang = match read_wasm_str(&mut caller, lang_ptr, lang_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_exec_run] failed to read language arg: {}", e);
+                        return 0;
+                    }
+                };
+                let code = match read_wasm_str(&mut caller, code_ptr, code_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_exec_run] failed to read code arg: {}", e);
+                        return 0;
+                    }
+                };
+                // Clamp timeout to 100ms..60s; garbage/negative input fails closed
+                // to the 10s default.
+                let timeout_ms = if (100..=60000).contains(&timeout_ms) {
+                    timeout_ms as u64
+                } else {
+                    10000
+                };
+
+                let (argv0, suffix) = match lang.trim().to_lowercase().as_str() {
+                    "python" | "python3" | "py" => ("python3", "py"),
+                    "sh" | "shell" => ("sh", "sh"),
+                    other => {
+                        let msg = format!(
+                            "unsupported language '{}' — allowed: python, sh",
+                            other
+                        );
+                        eprintln!("[host_exec_run] {}", msg);
+                        return write_wasm_error(
+                            &mut caller,
+                            &msg,
+                        )
+                        .await;
+                    }
+                };
+
+                // Sandboxed working dir: resolve "." (must exist — FsSandbox
+                // creates fs_root on construction).
+                let workdir = match resolve_sandboxed(&caller, ".", true) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[host_exec_run] {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("exec denied: {}", e),
+                        )
+                        .await;
+                    }
+                };
+
+                // Write the snippet to a temp file inside the sandbox so the
+                // child never receives code via a shell string.
+                let file_name = format!(
+                    "exec-{}-{}.{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                    suffix
+                );
+                let script_path = match resolve_sandboxed(
+                    &caller,
+                    &format!(".tmp-exec/{}", file_name),
+                    false,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[host_exec_run] {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("exec denied: {}", e),
+                        )
+                        .await;
+                    }
+                };
+                if let Some(parent) = script_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        eprintln!("[host_exec_run] cannot create tmp dir: {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("exec failed: cannot create tmp dir: {}", e),
+                        )
+                        .await;
+                    }
+                }
+                if let Err(e) = std::fs::write(&script_path, code.as_bytes()) {
+                    eprintln!("[host_exec_run] cannot write snippet: {}", e);
+                    return write_wasm_error(
+                        &mut caller,
+                        &format!("exec failed: cannot write snippet: {}", e),
+                    )
+                    .await;
+                }
+
+                // argv only — never shell string interpolation.
+                let mut cmd = tokio::process::Command::new(argv0);
+                cmd.arg(&script_path);
+                cmd.current_dir(&workdir);
+                // Scrubbed minimal env: PATH only. No proxy vars, no HOME,
+                // no secret-bearing vars — air-gap compatible.
+                cmd.env_clear();
+                cmd.env("PATH", "/usr/bin:/bin");
+                cmd.env("LANG", "C.UTF-8");
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                // Defensive: block any network the child might attempt via
+                // proxy auto-config leaking in through other channels.
+                cmd.env("http_proxy", "");
+                cmd.env("https_proxy", "");
+                cmd.env("all_proxy", "");
+                cmd.env("HTTP_PROXY", "");
+                cmd.env("HTTPS_PROXY", "");
+                cmd.env("ALL_PROXY", "");
+                cmd.env("no_proxy", "*");
+
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&script_path);
+                        eprintln!("[host_exec_run] spawn failed: {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("exec failed: cannot spawn '{}': {}", argv0, e),
+                        )
+                        .await;
+                    }
+                };
+
+                let timeout = std::time::Duration::from_millis(timeout_ms);
+                let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                    Ok(Ok(out)) => {
+                        let _ = std::fs::remove_file(&script_path);
+                        (out, false)
+                    }
+                    Ok(Err(e)) => {
+                        let _ = std::fs::remove_file(&script_path);
+                        eprintln!("[host_exec_run] wait failed: {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("exec failed: {}", e),
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        // Timeout: kill and reap, report timed_out:true.
+                        let _ = child.kill().await;
+                        match child.wait_with_output().await {
+                            Ok(out) => {
+                                let _ = std::fs::remove_file(&script_path);
+                                (out, true)
+                            }
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&script_path);
+                                eprintln!("[host_exec_run] reap after kill failed: {}", e);
+                                return write_wasm_error(
+                                    &mut caller,
+                                    &format!("exec timed out and reap failed: {}", e),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
+                let (output, timed_out) = output;
+
+                let exit_code = output.status.code().unwrap_or(-1);
+                let (mut stdout, mut stderr) = (
+                    String::from_utf8_lossy(&output.stdout).to_string(),
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                );
+                // Cap combined output at 256KB: trim stderr first, then stdout.
+                let total = stdout.len() + stderr.len();
+                if total > MAX_EXEC_OUTPUT_SIZE {
+                    let mut over = total - MAX_EXEC_OUTPUT_SIZE;
+                    if stderr.len() >= over {
+                        stderr.truncate(stderr.len() - over);
+                    } else {
+                        over -= stderr.len();
+                        stderr.clear();
+                        if stdout.len() > over {
+                            stdout.truncate(stdout.len() - over);
+                        } else {
+                            stdout.clear();
+                        }
+                    }
+                    stderr.push_str("\n[truncated: output exceeded 256KB]");
+                }
+
+                let bytes = serde_json::to_vec(&json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                }))
+                .unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
     Ok(())
 }
 

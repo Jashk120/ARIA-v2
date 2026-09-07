@@ -1,0 +1,49 @@
+name        = "run.exec"
+version     = "0.1.0"
+description = "Execute a Python or shell snippet in a sandboxed local process with timeout; returns captured stdout/stderr and exit status"
+
+triggers = []
+
+[display]
+action = "Running {language} snippet"
+
+[capabilities]
+exec = true
+
+[call]
+args_schema   = '{"language":"python|sh","code":"string","timeout_ms":10000}'
+output_schema = '{"stdout":"string","stderr":"string","exit_code":"number","timed_out":"bool"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.language]
+type = "string"
+description = "Language to execute: 'python' runs with python3, 'sh' runs with sh"
+
+[call.parameters.properties.code]
+type = "string"
+description = "Source code to execute in the sandbox working directory"
+
+[call.parameters.properties.timeout_ms]
+type = "integer"
+description = "Max wall-clock time in milliseconds before the process is killed (default: 10000, clamped 100..60000)"
+
+[react]
+max_steps = 3
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

@@ -143,6 +143,17 @@ CREATE TABLE IF NOT EXISTS payment_url_allowlist (
     agent_did       TEXT NOT NULL,
     url             TEXT NOT NULL,
     PRIMARY KEY(agent_did, url)
+);
+
+-- User context owned by the daemon (single-brain direction: replaces
+-- GUI-held user info). Untrusted input: sanitized on write by
+-- set_user_profile, never audit-signed as verified fact. No TCP endpoints
+-- manage it in this task (GUI wiring is separate).
+CREATE TABLE IF NOT EXISTS user_profile (
+    agent_did       TEXT PRIMARY KEY,
+    display_name    TEXT,
+    facts           TEXT,
+    updated_at      INTEGER NOT NULL DEFAULT 0
 )";
 
 pub struct Db {
@@ -213,6 +224,16 @@ pub struct PaymentHoldRecord {
     pub payment_key: String,
     pub amount_hbar: f64,
     pub timestamp: String,
+}
+
+/// Daemon-owned user context (single-brain direction: replaces GUI-held user
+/// info). Untrusted input — sanitized on write by `set_user_profile`, never
+/// audit-signed as verified fact.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserProfile {
+    pub display_name: Option<String>,
+    pub facts: Option<String>,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -708,6 +729,34 @@ impl Db {
         Ok(String::new())
     }
 
+    /// Number of sealed audit steps for `task_id` (rows in `audit_log`).
+    /// Public accessor for the per-task HCS anchor (`payments::task_anchor`);
+    /// mirrors `seal_task`'s inline `step_count` subquery as a reusable read.
+    pub fn count_task_steps(&self, task_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 =
+            conn.query_row("SELECT count(*) FROM audit_log WHERE task_id = ?", [task_id], |row| {
+                row.get(0)
+            })?;
+        Ok(n as usize)
+    }
+
+    /// Chain hash of the last audit step for `task_id` ("" when no steps exist).
+    /// Public accessor for the per-task HCS anchor (`payments::task_anchor`);
+    /// same query as the private `get_last_step_hash`, exposed without
+    /// touching existing fns.
+    pub fn get_task_chain_hash(&self, task_id: &str) -> anyhow::Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_hash FROM audit_log WHERE task_id = ? ORDER BY step DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([task_id], |row| row.get(0))?;
+        if let Some(res) = rows.next() {
+            return Ok(res?);
+        }
+        Ok(String::new())
+    }
+
     //--------------Payment ------------------------------
     pub fn insert_payment(
         &self,
@@ -894,6 +943,50 @@ impl Db {
             res.push(r?);
         }
         Ok(res)
+    }
+
+    // ── User profile (daemon-owned user context) ──────────────────────────────
+
+    pub fn get_user_profile(&self, agent_did: &str) -> anyhow::Result<Option<UserProfile>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT display_name, facts, updated_at FROM user_profile WHERE agent_did = ?",
+        )?;
+        let mut rows = stmt.query_map([agent_did], |row| {
+            Ok(UserProfile { display_name: row.get(0)?, facts: row.get(1)?, updated_at: row.get(2)? })
+        })?;
+        if let Some(res) = rows.next() {
+            return Ok(Some(res?));
+        }
+        Ok(None)
+    }
+
+    /// Insert or replace the user profile for `agent_did`.
+    ///
+    /// Sanitization (untrusted input — never audit-signed as verified fact):
+    /// lines starting with `==` are stripped (they could otherwise forge
+    /// `== SECTION ==` prompt blocks when injected into the system prompt),
+    /// and `facts` is truncated to 2000 chars.
+    pub fn set_user_profile(
+        &self,
+        agent_did: &str,
+        display_name: Option<&str>,
+        facts: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let display_name = display_name.map(sanitize_user_field);
+        let facts = facts.map(sanitize_user_field).map(|f| {
+            if f.len() > 2000 { f[..2000].to_string() } else { f }
+        });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO user_profile (agent_did, display_name, facts, updated_at) VALUES (?, ?, ?, ?)",
+            params![agent_did, display_name, facts, now],
+        )?;
+        Ok(())
     }
 
     /// Sums `payments` for the rolling 24h window with status `SUCCESS` *or*
@@ -1084,6 +1177,10 @@ impl Db {
 
         Ok(removed)
     }
+}
+
+fn sanitize_user_field(raw: &str) -> String {
+    raw.lines().filter(|line| !line.trim_start().starts_with("==")).collect::<Vec<_>>().join("\n")
 }
 
 fn now_iso8601() -> String {

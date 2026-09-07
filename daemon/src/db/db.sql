@@ -100,3 +100,13 @@ CREATE TABLE payment_holds (
     amount_hbar     REAL NOT NULL,
     timestamp       TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Daemon-owned user context (single-brain direction: replaces GUI-held user
+-- info). Untrusted input: sanitized on write (strip "=="-leading lines, cap
+-- facts at 2000 chars), never audit-signed as verified fact.
+CREATE TABLE user_profile (
+    agent_did       TEXT PRIMARY KEY,
+    display_name    TEXT,
+    facts           TEXT,
+    updated_at      INTEGER NOT NULL DEFAULT 0
+);

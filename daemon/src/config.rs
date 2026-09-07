@@ -40,12 +40,82 @@ pub struct RuntimeConfig {
     pub governance: PaymentGovernanceConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PaymentGovernanceConfig {
     pub per_task_cap: Option<f64>,
     pub per_day_cap: Option<f64>,
     pub auto_under: Option<f64>,
     pub audit_topic_id: Option<String>,
+    /// Air-gap master switch for all DLT skills (`hedera_pay` / `x402_pay`)
+    /// plus HCS audit egress. Default ON (true) — absent/empty config means
+    /// enabled, so fresh installs behave exactly as before this flag existed.
+    pub dlt_enabled: bool,
+}
+
+impl Default for PaymentGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            per_task_cap: None,
+            per_day_cap: None,
+            auto_under: None,
+            audit_topic_id: None,
+            // Default-true preserves current behavior for any constructor
+            // that doesn't set this field explicitly (same family as the
+            // per_task_cap/per_day_cap governance knobs).
+            dlt_enabled: true,
+        }
+    }
+}
+
+/// Parse a user-supplied boolean for the `dlt_enabled` flag.
+///
+/// Returns `None` for absent/empty/unrecognized input (caller falls through
+/// to the next source, ultimately defaulting to enabled). Only explicit
+/// `0`/`false`/`off`/`no` disables; explicit `1`/`true`/`on`/`yes` enables.
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_lowercase().as_str() {
+        "" => None,
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Effective `dlt_enabled` value from an env override + a db value.
+/// Env (`ARIA_DLT_ENABLED`) wins when it parses; otherwise the db key
+/// (`dlt_enabled`) wins when it parses; otherwise enabled (default ON).
+pub fn dlt_enabled_from_sources(env_val: Option<&str>, db_val: Option<&str>) -> bool {
+    if let Some(raw) = env_val
+        && let Some(parsed) = parse_bool(raw) {
+            return parsed;
+        }
+    if let Some(raw) = db_val
+        && let Some(parsed) = parse_bool(raw) {
+            return parsed;
+        }
+    true
+}
+
+/// Live read of the air-gap flag: env `ARIA_DLT_ENABLED` first, then the
+/// db `dlt_enabled` key, defaulting to enabled. Enforcement points
+/// (wasm host gating, react-loop proposal guard, `query_dlt_status`) call
+/// this on every use instead of trusting the startup-cached
+/// `RuntimeConfig` clone — that clone is built once in `run_daemon` and
+/// never refreshed, so reading through it would NOT be live. This single
+/// key read is what makes the CLI/GUI toggle take effect without a
+/// daemon restart; no watcher is needed.
+pub fn dlt_enabled_live(db: &crate::db::Db) -> bool {
+    let env_val = std::env::var("ARIA_DLT_ENABLED").ok();
+    let db_val = db.get_config("dlt_enabled").ok().flatten();
+    dlt_enabled_from_sources(env_val.as_deref(), db_val.as_deref())
+}
+
+/// Single code path for flipping the air-gap flag, shared by the
+/// `aria dlt on|off` CLI commands and the TCP `mutate_dlt` endpoint so the
+/// two can never diverge. Stored as `"1"`/`"0"`; an unset key reads back
+/// as enabled via `dlt_enabled_live`.
+pub fn set_dlt_enabled(db: &crate::db::Db, enabled: bool) -> anyhow::Result<()> {
+    db.set_config("dlt_enabled", if enabled { "1" } else { "0" })
 }
 
 impl RuntimeConfig {
@@ -121,6 +191,12 @@ impl RuntimeConfig {
             audit_topic_id: parse_opt_str(
                 &["HEDERA_PAYMENT_AUDIT_TOPIC", "HEDERA_AUDIT_TOPIC", "ARIA_AUDIT_TOPIC"],
                 "hedera_payment_audit_topic",
+            ),
+            // Air-gap flag: env ARIA_DLT_ENABLED wins, then db "dlt_enabled",
+            // default ON. Same env-override-then-db pattern as the caps above.
+            dlt_enabled: dlt_enabled_from_sources(
+                std::env::var("ARIA_DLT_ENABLED").ok().as_deref(),
+                db.get_config("dlt_enabled").ok().flatten().as_deref(),
             ),
         };
 

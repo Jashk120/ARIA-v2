@@ -64,6 +64,27 @@ pub async fn run_wasm_instance_async(
     skill_name: String,
     task_id: Option<String>,
 ) -> anyhow::Result<Value> {
+    // Air-gap enforcement (fail closed): DLT-capable skills refuse to run
+    // when `dlt_enabled` is off. Checked BEFORE instantiating so no guest
+    // code executes at all. The flag is read live (env then db) on every
+    // call, so the CLI/GUI toggle applies without a daemon restart.
+    // `db: None` (unit-test/embedded use with no config store to consult)
+    // treats the flag as enabled — fail-open ONLY for lack of a store, to
+    // preserve current behavior on those paths; every real daemon path
+    // always passes a db, so enforcement applies there.
+    if manifest.capabilities.hedera_pay || manifest.capabilities.x402_pay {
+        let enabled = match db.as_deref() {
+            Some(db) => crate::config::dlt_enabled_live(db),
+            None => true,
+        };
+        if !enabled {
+            bail!(
+                "Skill '{}' blocked: DLT disabled (air-gap mode) — re-enable with `aria dlt on`",
+                skill_name
+            );
+        }
+    }
+
     let wasi = WasiCtxBuilder::new().build_p1();
 
     let fs_sandbox =

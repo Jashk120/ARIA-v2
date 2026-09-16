@@ -1037,6 +1037,29 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     let api_key = prompt_api_key(&db)?;
+    let llm_url = crate::config::llm_url();
+    let llm_model = crate::config::llm_model();
+    info!("LLM endpoint: {} model: {}", llm_url, llm_model);
+    let probe_base = llm_url
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/')
+        .to_string();
+    match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+        .get(probe_base.as_str())
+        .send()
+        .await
+    {
+        Ok(_) => info!("LLM probe ok: {}", probe_base),
+        Err(e) => warn!(
+            "LLM probe {} unreachable: {} (daemon continues; tasks will try {} fallbacks)",
+            probe_base,
+            e,
+            crate::config::llm_candidates(&llm_url).len()
+        ),
+    }
     let runtime_cfg = RuntimeConfig::load(&db);
     let payment_vault: Option<Arc<crate::payments::direct::PaymentVault>> =
         operator.as_ref().map(|(client, operator_id, _)| {
@@ -1310,11 +1333,32 @@ async fn run_daemon() -> anyhow::Result<()> {
                     let payment_vault_for_anchor = payment_vault.clone();
                     let x402_vault_for_anchor = x402_vault.clone();
 
+                    // Tier-2 entry: forge-triggering fresh tasks spawn the
+                    // skill-forge child loop (staging + grant flow) instead of
+                    // the standard ReAct loop. Resumes (pending_action set)
+                    // always take the standard loop — grant resolution lives
+                    // in its resume path.
+                    let forge_request = pending_action
+                        .is_none()
+                        .then(|| crate::agent::forge::forge_triggered_by(&req.task))
+                        .flatten();
                     let handle = tokio::spawn(async move {
-                        crate::agent::react_loop::run_react_loop(
-                            api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
-                            db_for_loop, payment_vault, x402_vault, did_for_loop, task_id_for_loop, pending_action
-                        ).await
+                        if let Some(forge_req) = forge_request {
+                            crate::agent::forge::forge_request_flow(
+                                db_for_loop,
+                                skills,
+                                tx,
+                                task_id_for_loop,
+                                history,
+                                forge_req,
+                            )
+                            .await
+                        } else {
+                            crate::agent::react_loop::run_react_loop(
+                                api_key, history, runtime_cfg.injected_config, skills, tx, req.task, req.skills_type,
+                                db_for_loop, payment_vault, x402_vault, did_for_loop, task_id_for_loop, pending_action
+                            ).await
+                        }
                     });
 
                     let mut last_action: Option<(String, serde_json::Value)> = None;

@@ -83,6 +83,7 @@ fn spawn_payment_settlement_watch(
 #[serde(rename_all = "snake_case")]
 pub enum AskKind {
     Payment,
+    SkillGrant,
     // Future: Clarification is intentionally NOT added as a variant.
     // Absence of `kind` already means "plain question" — don't encode
     // that case explicitly, or every clarification call site has to
@@ -177,14 +178,14 @@ pub enum AgentEvent {
 /// contract comment on `AgentEvent`). Uses the existing `rand` dep — no new
 /// dependencies. 4 bytes → 8 hex chars is enough to correlate a turn's
 /// action/observation pair in the GUI.
-fn new_span_id() -> String {
+pub(crate) fn new_span_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 4];
     rand::rngs::OsRng.fill_bytes(&mut b);
     hex::encode(b)
 }
 
-enum AgentResponseKind {
+pub(crate) enum AgentResponseKind {
     Chat(String),
     Thought(String),
     Action { skill: String, args: serde_json::Value },
@@ -422,7 +423,7 @@ pub async fn run_react_loop(
     // No fingerprinting/holds involved — this isn't a decision-grade
     // confirmation, just "the user answered a clarifying question." Falls
     // through into the normal loop below instead of returning early.
-    let pending_action = match pending_action {
+    let mut pending_action = match pending_action {
         Some(ref pending) if pending.get("kind").and_then(|v| v.as_str()) == Some("ask") => {
             let _ = db.clear_pending_action(&task_id);
             history.push(json!({ "role": "user", "content": user_prompt.clone() }));
@@ -430,6 +431,101 @@ pub async fn run_react_loop(
         }
         other => other,
     };
+
+    // ── Resume: a pending skill-grant decision (forge install) ───────────────
+    // Same park/resume shape as payment holds: the grant Ask parked history +
+    // pending JSON via `save_awaiting_confirmation`; this reply resolves it
+    // deterministically (never re-asked to the model).
+    if let Some(ref pending) = pending_action
+        && crate::agent::forge::is_skill_grant_pending(pending)
+    {
+        let grant_skill =
+            pending.get("skill").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        match confirmation_decision(&user_prompt) {
+            ConfirmationDecision::Confirmed => {
+                match crate::agent::forge::approve_skill_grant(&db, &skills, &task_id, pending)
+                    .await
+                {
+                    crate::agent::forge::GrantOutcome::Installed { observation } => {
+                        let _ = tx
+                            .send(AgentEvent::Observation {
+                                content: observation.clone(),
+                                span_id: Some(new_span_id()),
+                                parent_span_id: None,
+                                depth: Some(0),
+                            })
+                            .await;
+                        history.push(json!({
+                            "role": "user",
+                            "content": format!("User granted the install. Result: {}", observation)
+                        }));
+                        pending_action = None;
+                    }
+                    crate::agent::forge::GrantOutcome::FingerprintChanged {
+                        question,
+                        refreshed_pending,
+                    } => {
+                        let _ = tx
+                            .send(AgentEvent::Ask {
+                                content: question.clone(),
+                                task_id: task_id.clone(),
+                                kind: Some(AskKind::SkillGrant),
+                            })
+                            .await;
+                        history.push(json!({
+                            "role": "assistant",
+                            "content": format!(
+                                "Skill grant refreshed because staging changed since the grant was issued: {}",
+                                grant_skill
+                            )
+                        }));
+                        let history_json = serde_json::to_string(&history).unwrap_or_default();
+                        let pending_json =
+                            serde_json::to_string(&refreshed_pending).unwrap_or_default();
+                        let _ =
+                            db.save_awaiting_confirmation(&task_id, &history_json, &pending_json);
+                        let _ = tx.send(AgentEvent::Done).await;
+                        return Ok(());
+                    }
+                    crate::agent::forge::GrantOutcome::Refused { message } => {
+                        // Air-gap fail-closed: the grant stays parked so the
+                        // user can enable DLT and approve again.
+                        let _ = tx.send(AgentEvent::Error { content: message }).await;
+                        let _ = tx.send(AgentEvent::Done).await;
+                        return Ok(());
+                    }
+                    crate::agent::forge::GrantOutcome::Failed { message } => {
+                        let _ = tx.send(AgentEvent::Error { content: message }).await;
+                        let _ = tx.send(AgentEvent::Done).await;
+                        return Ok(());
+                    }
+                }
+            }
+            ConfirmationDecision::Denied => {
+                let message = crate::agent::forge::discard_staged_skill(&grant_skill);
+                let _ = db.clear_pending_action(&task_id);
+                let _ = tx
+                    .send(AgentEvent::Final {
+                        content: message,
+                        span_id: Some(new_span_id()),
+                        parent_span_id: None,
+                        depth: Some(0),
+                    })
+                    .await;
+                let _ = tx.send(AgentEvent::Done).await;
+                return Ok(());
+            }
+            ConfirmationDecision::ContinueConversation => {
+                history.push(json!({
+                    "role": "user",
+                    "content": crate::agent::forge::skill_grant_resume_context(pending, &user_prompt)
+                }));
+                // Skip the payment block below; the DB pending stays parked so
+                // a later yes/no still resolves the same grant.
+                pending_action = None;
+            }
+        }
+    }
 
     // ── Resume: a pending payment confirmation takes priority over the LLM ─────
     // Interpreted deterministically (not re-asked to the model) so a
@@ -555,11 +651,15 @@ pub async fn run_react_loop(
     // `step` counts turns, not tool calls: one turn may dispatch up to
     // MAX_PARALLEL_ACTIONS concurrent actions (see plan_action_batch).
     while step < MAX_REACT_STEPS {
+        let resolved_url = crate::config::llm_url();
+        let resolved_model = crate::config::llm_model();
         let (url, model, provider_name) = match CONFIG.use_provider {
             crate::config::Provider::OpenRouter => {
-                (CONFIG.openrouter_url, CONFIG.openrouter_model, "OpenRouter")
+                (resolved_url.as_str(), resolved_model.as_str(), "OpenRouter")
             }
-            crate::config::Provider::Ollama => (CONFIG.ollama_url, CONFIG.ollama_model, "Ollama"),
+            crate::config::Provider::Ollama => {
+                (resolved_url.as_str(), resolved_model.as_str(), "Ollama")
+            }
         };
 
         // Fetch capability every step in case it was updated
@@ -1096,7 +1196,7 @@ pub async fn run_react_loop(
                         .send(AgentEvent::Observation {
                             content: observation.clone(),
                             span_id: Some(new_span_id()),
-                            parent_span_id: Some(action_span_id),
+                            parent_span_id: Some(action_span_id.clone()),
                             depth: Some(1),
                         })
                         .await;
@@ -1690,7 +1790,7 @@ fn skill_requires_confirmation(skill: &str) -> bool {
 /// fires. Returns `None` for non-DLT skills and whenever the flag is on
 /// (default), leaving all current behavior untouched. Reads the flag live
 /// from env/db on every call so the toggle applies without a restart.
-fn dlt_blocked_error(db: &crate::db::Db, skill: &str) -> Option<String> {
+pub(crate) fn dlt_blocked_error(db: &crate::db::Db, skill: &str) -> Option<String> {
     let capabilities = skill_capabilities(skill).unwrap_or_default();
     if !(capabilities.hedera_pay || capabilities.x402_pay) {
         return None;
@@ -1974,6 +2074,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn greeting_offer_of_help_is_not_a_question() {
+        assert!(!is_question("Hello! How can I help you today?"));
+        assert!(!is_question("Hi there — what can I do for you?"));
+        assert!(is_question("What file should I search?"));
+        assert!(is_question("Which account should I pay?"));
+    }
+
+    #[test]
     fn confirmation_decision_treats_modification_as_conversation() {
         assert_eq!(
             confirmation_decision("Can you make it 0.5 HBAR instead?"),
@@ -2143,7 +2251,7 @@ fn parse_single(line: &str) -> Option<AgentResponseKind> {
     }
 }
 
-fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
+pub(crate) fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
     let mut results = Vec::new();
     let mut depth = 0i32;
     let mut start = None;
@@ -2199,7 +2307,7 @@ struct ToolCallChunk {
     arguments: String,
 }
 
-async fn call_llm_streaming(
+pub(crate) async fn call_llm_streaming(
     api_key: &str,
     sys_prompt: &str,
     history: &[serde_json::Value],
@@ -2208,7 +2316,10 @@ async fn call_llm_streaming(
     provider_info: (&str, &str, &str),
     is_native: bool,
 ) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let (url, model, provider_name) = provider_info;
 
     let mut messages = vec![json!({ "role": "system", "content": sys_prompt })];
@@ -2223,18 +2334,47 @@ async fn call_llm_streaming(
     if let Some(t) = tools
         && !t.is_empty()
     {
-        body.as_object_mut().unwrap().insert("tools".to_string(), json!(t));
+        match body.as_object_mut() {
+            Some(obj) => {
+                obj.insert("tools".to_string(), json!(t));
+            }
+            None => anyhow::bail!("{} error: failed to build chat request body", provider_name),
+        }
     }
 
     tracing::info!("LLM Call: provider={}, model={}, url={}", provider_name, model, url);
 
-    let resp = client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+    let candidates = crate::config::llm_candidates(url);
+    let mut resp = None;
+    let mut last_err = String::new();
+    for candidate in &candidates {
+        match client
+            .post(candidate)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                tracing::warn!("LLM endpoint {} unreachable: {}", candidate, last_err);
+            }
+        }
+    }
+    let resp = match resp {
+        Some(r) => r,
+        None => anyhow::bail!(
+            "{} error: LLM unreachable (tried {}). Start LiteLLM on port 8000 or set ARIA_LLM_URL. Last error: {}",
+            provider_name,
+            candidates.join(", "),
+            last_err
+        ),
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -2398,8 +2538,26 @@ fn extract_payment_recipient_and_amount(
     }
 }
 
-fn is_question(text: &str) -> bool {
+pub(crate) fn is_question(text: &str) -> bool {
     let trimmed = text.trim();
+    // Rhetorical greetings / offers of help ("How can I help you today?")
+    // are answers, not clarifying questions. Classifying them as Ask parks
+    // the turn and renders a pointless Submit box duplicating the answer.
+    let lower = trimmed.to_lowercase();
+    const NON_QUESTIONS: &[&str] = &[
+        "how can i help",
+        "how may i help",
+        "what can i do for you",
+        "what can i help",
+        "let me know if you need",
+        "let me know if i can",
+        "anything else i can",
+        "happy to help",
+        "here to help",
+    ];
+    if NON_QUESTIONS.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
     if trimmed.ends_with('?') {
         return true;
     }

@@ -62,6 +62,12 @@ impl SkillManager {
         Ok(module)
     }
 
+    pub fn invalidate(&self, name: &str) {
+        if let Ok(mut modules) = self.modules.write() {
+            modules.remove(name);
+        }
+    }
+
     /// Run a skill with db key injection.
     pub async fn run_skill(
         &self,

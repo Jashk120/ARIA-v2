@@ -14,6 +14,10 @@ use crate::skills::paths::{
     get_daemon_root,
 };
 
+// Forge child prompt lives in its own module (full skill-authoring knowledge);
+// re-exported here so prompt consumers have one import surface.
+pub use super::forge_prompt::forge_system_prompt;
+
 // ── Trigger matching ──────────────────────────────────────────────────────────
 
 pub fn prompt_matches_triggers(

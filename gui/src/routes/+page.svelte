@@ -4,6 +4,8 @@
   import DirectView from '$lib/domains/direct/DirectView.svelte';
   import DashboardView from '$lib/domains/dashboard/DashboardView.svelte';
   import HistoryView from '$lib/domains/history/HistoryView.svelte';
+  import ModelsView from '$lib/domains/models/ModelsView.svelte';
+  import ForgeView from '$lib/domains/forge/ForgeView.svelte';
   import SettingsView from '$lib/domains/settings/SettingsView.svelte';
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { chatState } from '$lib/domains/chat/chatState.svelte.js';
@@ -35,6 +37,10 @@
     <DashboardView />
   {:else if activeTab === 'history'}
     <HistoryView />
+  {:else if activeTab === 'models'}
+    <ModelsView />
+  {:else if activeTab === 'forge'}
+    <ForgeView />
   {:else if activeTab === 'settings'}
     <SettingsView />
   {/if}

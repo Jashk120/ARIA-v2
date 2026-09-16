@@ -17,10 +17,84 @@ pub struct AppConfig {
 pub const CONFIG: AppConfig = AppConfig {
     use_provider: Provider::Ollama,
     openrouter_url: "https://openrouter.ai/api/v1/chat/completions",
-    ollama_url: "http://0.0.0.0:8000/v1/chat/completions", //"http://localhost:11434/v1/chat/completions",
+    ollama_url: "http://127.0.0.1:8000/v1/chat/completions", //"http://localhost:11434/v1/chat/completions",
     openrouter_model: "google/gemma-4-26b-a4b-it:free",
     ollama_model: "gemma-4-31b-it",
 };
+
+/// Resolve the LLM chat-completions endpoint.
+///
+/// Precedence: `ARIA_LLM_URL` > `OPENAI_BASE_URL` > `LITELLM_BASE_URL` > compiled
+/// default. Bare host:port values get `/v1/chat/completions` appended so
+/// `http://localhost:8000` just works. A `0.0.0.0` host (bind address, not a
+/// routable destination) is rewritten to `127.0.0.1`.
+pub fn llm_url() -> String {
+    let from_env = ["ARIA_LLM_URL", "OPENAI_BASE_URL", "LITELLM_BASE_URL"]
+        .iter()
+        .find_map(|v| {
+            std::env::var(v).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        });
+    let raw = from_env.unwrap_or_else(|| match CONFIG.use_provider {
+        Provider::OpenRouter => CONFIG.openrouter_url.to_string(),
+        Provider::Ollama => CONFIG.ollama_url.to_string(),
+    });
+    normalize_llm_url(&raw)
+}
+
+/// Resolve the LLM model name. `ARIA_LLM_MODEL` > `OPENAI_MODEL` > default.
+pub fn llm_model() -> String {
+    ["ARIA_LLM_MODEL", "OPENAI_MODEL"]
+        .iter()
+        .find_map(|v| {
+            std::env::var(v).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| match CONFIG.use_provider {
+            Provider::OpenRouter => CONFIG.openrouter_model.to_string(),
+            Provider::Ollama => CONFIG.ollama_model.to_string(),
+        })
+}
+
+fn normalize_llm_url(raw: &str) -> String {
+    let mut url = raw.trim().to_string();
+    // 0.0.0.0 is a listen address, not a dial address.
+    url = url.replace("0.0.0.0", "127.0.0.1");
+    if !url.contains("/v1/chat/completions") {
+        let base = url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            url = format!("{}/chat/completions", base);
+        } else if !base.contains("/v1/") {
+            url = format!("{}/v1/chat/completions", base);
+        }
+    }
+    url
+}
+
+/// Fallback candidates when the primary endpoint refuses connections.
+/// If primary is :8000, also try :4000 (and vice versa), plus a
+/// localhost<->127.0.0.1 swap. Deduped, primary first.
+pub fn llm_candidates(primary: &str) -> Vec<String> {
+    let mut out = vec![primary.to_string()];
+    let swap_port = if primary.contains(":8000") {
+        Some((":8000", ":4000"))
+    } else if primary.contains(":4000") {
+        Some((":4000", ":8000"))
+    } else {
+        None
+    };
+    if let Some((from, to)) = swap_port {
+        out.push(primary.replacen(from, to, 1));
+    }
+    if primary.contains("127.0.0.1") {
+        out.push(primary.replacen("127.0.0.1", "localhost", 1));
+    } else if primary.contains("localhost") {
+        out.push(primary.replacen("localhost", "127.0.0.1", 1));
+    }
+    out.sort();
+    out.dedup();
+    // Keep primary first.
+    out.sort_by_key(|u| if u == primary { 0 } else { 1 });
+    out
+}
 
 /// Loaded once at startup from db + skill manifests, lives in memory for the
 /// process lifetime. Never hits db again after init.

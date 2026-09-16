@@ -813,11 +813,25 @@ fn wire_exec(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 };
 
                 let timeout = std::time::Duration::from_millis(timeout_ms);
-                let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(Ok(out)) => {
-                        let _ = std::fs::remove_file(&script_path);
-                        (out, false)
-                    }
+                // `wait()` borrows the child, so the timeout branch below can
+                // still `kill()` it; output is collected afterwards with
+                // `wait_with_output()` (pipes still hold the exited child's bytes).
+                let output = match tokio::time::timeout(timeout, child.wait()).await {
+                    Ok(Ok(_)) => match child.wait_with_output().await {
+                        Ok(out) => {
+                            let _ = std::fs::remove_file(&script_path);
+                            (out, false)
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&script_path);
+                            eprintln!("[host_exec_run] wait failed: {}", e);
+                            return write_wasm_error(
+                                &mut caller,
+                                &format!("exec failed: {}", e),
+                            )
+                            .await;
+                        }
+                    },
                     Ok(Err(e)) => {
                         let _ = std::fs::remove_file(&script_path);
                         eprintln!("[host_exec_run] wait failed: {}", e);

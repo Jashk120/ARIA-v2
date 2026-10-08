@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::db::Db;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Provider {
     Ollama,
@@ -94,6 +96,228 @@ pub fn llm_candidates(primary: &str) -> Vec<String> {
     // Keep primary first.
     out.sort_by_key(|u| if u == primary { 0 } else { 1 });
     out
+}
+
+/// Wire protocol used to talk to the LLM endpoint. OpenCode Go exposes one
+/// gateway base but three protocols, selected by model family.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Protocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+    AnthropicMessages,
+}
+
+/// Select the wire protocol for a provider/model pair. Only `opencode-go`
+/// models ever leave chat-completions: `grok-*`/`gpt-*`/`muse-spark-*` use
+/// the Responses API, `claude-*`/`qwen3.8*`/`qwen3.7*`/`minimax-m3*`/
+/// `minimax-m2.7*` use the Anthropic Messages API.
+pub fn protocol_for(provider_id: &str, model: &str) -> Protocol {
+    if provider_id != "opencode-go" {
+        return Protocol::ChatCompletions;
+    }
+    let m = model.trim().to_lowercase();
+    if m.starts_with("grok-") || m.starts_with("gpt-") || m.starts_with("muse-spark-") {
+        Protocol::Responses
+    } else if m.starts_with("claude-")
+        || m.starts_with("qwen3.8")
+        || m.starts_with("qwen3.7")
+        || m.starts_with("minimax-m3")
+        || m.starts_with("minimax-m2.7")
+    {
+        Protocol::AnthropicMessages
+    } else {
+        Protocol::ChatCompletions
+    }
+}
+
+/// Path appended to the gateway base for a protocol.
+pub fn protocol_path(p: Protocol) -> &'static str {
+    match p {
+        Protocol::ChatCompletions => "/chat/completions",
+        Protocol::Responses => "/responses",
+        Protocol::AnthropicMessages => "/messages",
+    }
+}
+
+/// First-class provider preset: a named bundle of endpoint + auth env +
+/// default model + known model list surfaced to the GUI.
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub url: &'static str,
+    pub api_key_env: &'static str,
+    pub default_model: &'static str,
+    pub models: &'static [&'static str],
+}
+
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "local",
+        name: "Local (LiteLLM / Ollama)",
+        url: "http://127.0.0.1:8000/v1/chat/completions",
+        api_key_env: "",
+        default_model: "gemma-4-31b-it",
+        models: &[
+            "gemma-4-31b-it",
+            "gemma-4-26b-a4b-it",
+            "gemini/gemini-3.5-flash",
+            "gemini/gemma-4-31b-it",
+        ],
+    },
+    ProviderPreset {
+        id: "openrouter",
+        name: "OpenRouter",
+        url: "https://openrouter.ai/api/v1/chat/completions",
+        api_key_env: "OPENROUTER_API_KEY",
+        default_model: "google/gemma-4-26b-a4b-it:free",
+        models: &["google/gemma-4-26b-a4b-it:free"],
+    },
+    ProviderPreset {
+        id: "opencode-go",
+        name: "OpenCode Go",
+        url: "https://opencode.ai/zen/go/v1",
+        api_key_env: "OPENCODE_API_KEY",
+        default_model: "deepseek-v4.1-flash",
+        models: &[
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "glm-5.2",
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "mimo-v2.6-pro",
+            "mimo-v2.6-flash",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "longcat-2.5-preview-free",
+            "longcat-2.0",
+            "hy4-preview",
+            "hy3",
+            "space-bunny",
+            "grok-4.7",
+            "grok-4.6",
+            "gpt-6-luna",
+            "gpt-5.6-luna",
+            "muse-spark-1.3-contributor",
+            "muse-spark-1.2-contributor",
+            "claude-haiku-5-5",
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "qwen3.7-plus",
+            "minimax-m3",
+            "minimax-m2.7",
+        ],
+    },
+];
+
+/// Look up a provider preset by id. Empty/unknown ids match nothing.
+pub fn find_preset(id: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|p| p.id == id)
+}
+
+/// DB-aware LLM settings. DB/GUI values win, then env, then compiled default.
+pub struct LlmSettings {
+    pub url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub protocol: Protocol,
+    pub provider_id: String,
+}
+
+impl LlmSettings {
+    pub fn is_opencode_go(&self) -> bool {
+        self.provider_id == "opencode-go"
+    }
+}
+
+/// Replace every literal `{TOKEN}` in `template` with `token` (empty when `None`).
+pub fn apply_template(template: &str, token: Option<&str>) -> String {
+    template.replace("{TOKEN}", token.unwrap_or_default())
+}
+
+fn db_value(db: &Db, key: &str) -> Option<String> {
+    db.get_config(key).ok().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn is_go_base(url: &str) -> bool {
+    url.trim().contains("opencode.ai/zen/go")
+}
+
+/// Build the per-protocol Go endpoint from a gateway base: strip any
+/// trailing protocol path, then append the one for `protocol`.
+fn go_endpoint(base: &str, protocol: Protocol) -> String {
+    let mut trimmed = base.trim().to_string();
+    for suffix in ["/chat/completions", "/responses", "/messages"] {
+        if let Some(stripped) = trimmed.strip_suffix(suffix) {
+            trimmed = stripped.to_string();
+            break;
+        }
+    }
+    format!("{}{}", trimmed.trim_end_matches('/'), protocol_path(protocol))
+}
+
+/// Resolve LLM settings from the GUI config table with env/default fallbacks.
+///
+/// Precedence:
+/// - provider id: db `llm_provider` (empty/absent = no preset)
+/// - url: db `llm_url_template` (`{TOKEN}` via `llm_token`) > db `llm_url`
+///   (a Go-base value is re-pathed per protocol, anything else normalized
+///   to chat-completions) > preset url (same treatment) > `llm_url()`
+/// - model: db `llm_model` > preset default model > `llm_model()`
+/// - api_key: db `llm_api_key` > preset `api_key_env` env var > None
+/// - protocol: `protocol_for(provider_id, model)`
+pub fn resolve_llm(db: &Db) -> LlmSettings {
+    let provider_id = db_value(db, "llm_provider").unwrap_or_default();
+    let preset = if provider_id.is_empty() { None } else { find_preset(&provider_id) };
+    let token = db_value(db, "llm_token");
+    let model = match db_value(db, "llm_model") {
+        Some(m) => m,
+        None => match preset {
+            Some(p) => p.default_model.to_string(),
+            None => llm_model(),
+        },
+    };
+    let protocol = protocol_for(&provider_id, &model);
+    let is_go = provider_id == "opencode-go";
+    let url = match db_value(db, "llm_url_template") {
+        Some(template) => {
+            if template.contains("{TOKEN}") && token.as_deref().unwrap_or_default().is_empty() {
+                tracing::warn!(
+                    "llm_url_template contains {{TOKEN}} but llm_token is missing; substituting an empty string"
+                );
+            }
+            apply_template(&template, token.as_deref())
+        }
+        None => match db_value(db, "llm_url") {
+            Some(raw) => {
+                if is_go && is_go_base(&raw) {
+                    go_endpoint(&raw, protocol)
+                } else {
+                    normalize_llm_url(&raw)
+                }
+            }
+            None => match preset {
+                Some(p) if is_go => go_endpoint(p.url, protocol),
+                Some(p) => normalize_llm_url(p.url),
+                None => llm_url(),
+            },
+        },
+    };
+    let api_key = match db_value(db, "llm_api_key") {
+        Some(k) => Some(k),
+        None => match preset {
+            Some(p) if !p.api_key_env.is_empty() => std::env::var(p.api_key_env)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        },
+    };
+    LlmSettings { url, model, api_key, protocol, provider_id }
 }
 
 /// Loaded once at startup from db + skill manifests, lives in memory for the
@@ -275,5 +499,89 @@ impl RuntimeConfig {
         };
 
         Self { searxng_url, brave_api_key, injected_config: injected, governance }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_without_placeholder_is_unchanged() {
+        assert_eq!(apply_template("https://example.com/chat", None), "https://example.com/chat");
+    }
+
+    #[test]
+    fn template_with_placeholder_and_token() {
+        assert_eq!(
+            apply_template("https://example.com/{TOKEN}/chat", Some("secret")),
+            "https://example.com/secret/chat"
+        );
+    }
+
+    #[test]
+    fn protocol_for_classifies_opencode_go_families() {
+        for model in ["grok-4.7", "gpt-6-luna", "muse-spark-1.3-contributor", "MUSE-SPARK-1.2-X"] {
+            assert_eq!(protocol_for("opencode-go", model), Protocol::Responses, "{model}");
+        }
+        for model in ["claude-haiku-5-5", "qwen3.8-max", "qwen3.7-plus", "minimax-m3", "minimax-m2.7"] {
+            assert_eq!(protocol_for("opencode-go", model), Protocol::AnthropicMessages, "{model}");
+        }
+        for model in ["deepseek-v4.1-flash", "glm-5.3", "kimi-k3", "hy3", "space-bunny"] {
+            assert_eq!(protocol_for("opencode-go", model), Protocol::ChatCompletions, "{model}");
+        }
+        assert_eq!(protocol_for("local", "grok-4.7"), Protocol::ChatCompletions);
+        assert_eq!(protocol_for("", "claude-haiku-5-5"), Protocol::ChatCompletions);
+        assert_eq!(protocol_path(Protocol::ChatCompletions), "/chat/completions");
+        assert_eq!(protocol_path(Protocol::Responses), "/responses");
+        assert_eq!(protocol_path(Protocol::AnthropicMessages), "/messages");
+    }
+
+    #[test]
+    fn resolve_llm_precedence_db_template_and_key() -> anyhow::Result<()> {
+        let db = Db::open_test()?;
+        db.set_config("llm_provider", "opencode-go")?;
+        db.set_config("llm_url_template", "https://example.com/{TOKEN}/chat")?;
+        db.set_config("llm_token", "tok123")?;
+        db.set_config("llm_api_key", "db-key")?;
+        let settings = resolve_llm(&db);
+        assert_eq!(settings.url, "https://example.com/tok123/chat");
+        assert_eq!(settings.model, "deepseek-v4.1-flash");
+        assert_eq!(settings.api_key.as_deref(), Some("db-key"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_llm_go_base_repathed_per_protocol() -> anyhow::Result<()> {
+        let db = Db::open_test()?;
+        db.set_config("llm_provider", "opencode-go")?;
+        db.set_config("llm_model", "grok-4.7")?;
+        let settings = resolve_llm(&db);
+        assert_eq!(settings.url, "https://opencode.ai/zen/go/v1/responses");
+        assert_eq!(settings.protocol, Protocol::Responses);
+        assert!(settings.is_opencode_go());
+        db.set_config("llm_model", "claude-haiku-5-5")?;
+        let settings = resolve_llm(&db);
+        assert_eq!(settings.url, "https://opencode.ai/zen/go/v1/messages");
+        db.set_config("llm_url", "https://opencode.ai/zen/go/v1/chat/completions")?;
+        db.set_config("llm_model", "deepseek-v4.1-flash")?;
+        let settings = resolve_llm(&db);
+        assert_eq!(settings.url, "https://opencode.ai/zen/go/v1/chat/completions");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_llm_db_url_overrides_preset_and_falls_back_to_preset_env_key(
+    ) -> anyhow::Result<()> {
+        let db = Db::open_test()?;
+        db.set_config("llm_provider", "opencode-go")?;
+        db.set_config("llm_url", "http://localhost:9000")?;
+        unsafe { std::env::set_var("OPENCODE_API_KEY", "env-key") };
+        let settings = resolve_llm(&db);
+        assert_eq!(settings.url, "http://localhost:9000/v1/chat/completions");
+        assert_eq!(settings.model, "deepseek-v4.1-flash");
+        assert_eq!(settings.api_key.as_deref(), Some("env-key"));
+        unsafe { std::env::remove_var("OPENCODE_API_KEY") };
+        Ok(())
     }
 }

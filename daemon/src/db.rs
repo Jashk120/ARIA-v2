@@ -160,6 +160,17 @@ pub struct Db {
     conn: std::sync::Mutex<Connection>,
 }
 
+/// In-memory database for unit tests. Never touches `~/.aria/daemon.db`.
+#[cfg(test)]
+impl Db {
+    pub(crate) fn open_test() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let db = Self { conn: std::sync::Mutex::new(conn) };
+        db.run_migration()?;
+        Ok(db)
+    }
+}
+
 // ── Task status ───────────────────────────────────────────────────────────────
 
 pub enum TaskStatus {

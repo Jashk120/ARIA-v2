@@ -27,7 +27,7 @@ enum DirectDaemonEvent {
 // ── Tauri Commands ────────────────────────────────────────────────────────────
 
 /// Check if the ARIA daemon TCP socket is reachable.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn check_daemon() -> bool {
     tokio::task::spawn_blocking(daemon::ping)
         .await
@@ -35,13 +35,13 @@ async fn check_daemon() -> bool {
 }
 
 /// Process one user turn through the LLM agent loop.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn send_message(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), String> {
     agent::run_turn(app, history).await
 }
 
 /// Send one task directly to the daemon TCP socket without involving the chatbot.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> Result<(), String> {
     let task = task.trim().to_string();
     let skill_type = skill_type.trim().to_string();
@@ -99,7 +99,7 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
 /// needs a `url` field, and gets its own command below. Each call is its
 /// own TCP round trip — there is no background polling; panels call this
 /// once on mount and again whenever the user hits refresh.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn dashboard_query(query: String, limit: Option<i64>) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::send_query(&query, limit))
         .await
@@ -113,7 +113,7 @@ async fn dashboard_query(query: String, limit: Option<i64>) -> Result<Value, Str
 /// The Settings panel re-queries `query_allowlist` after this succeeds
 /// rather than trusting this response to update its list — this call only
 /// reports what the mutation itself did.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn mutate_allowlist(action: String, account: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::mutate_allowlist(&action, &account))
         .await
@@ -124,7 +124,7 @@ async fn mutate_allowlist(action: String, account: String) -> Result<Value, Stri
 /// converting it into a committed payment. Returns the daemon's response
 /// verbatim — the caller re-queries `query_holds`/`query_payment_history`
 /// afterward rather than trusting this response to update local state.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn approve_hold(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -160,7 +160,7 @@ async fn approve_hold(
 
 /// Release a pending hold via the daemon's `release_hold` TCP endpoint
 /// without paying it. Same re-query-after pattern as `approve_hold`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn release_hold(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -199,7 +199,7 @@ async fn release_hold(
 /// conflated on the wire or in the Settings UI. The caller re-queries
 /// `query_url_allowlist` afterward rather than trusting this response to
 /// update local state.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn mutate_url_allowlist(action: String, url: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::mutate_url_allowlist(&action, &url))
         .await
@@ -210,7 +210,7 @@ async fn mutate_url_allowlist(action: String, url: String) -> Result<Value, Stri
 /// via the daemon's `query_url_rate_status` TCP endpoint (e.g. "7/10 this
 /// hour"). Scoped to a single URL, unlike the other dashboard queries, so
 /// it isn't folded into the generic `dashboard_query` command.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn query_url_rate_status(url: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::query_url_rate_status(&url))
         .await
@@ -222,7 +222,7 @@ async fn query_url_rate_status(url: String) -> Result<Value, String> {
 /// (`{ agent_did, enabled }`). Own command (not folded into
 /// `dashboard_query`) so the Settings toggle has a typed round trip for
 /// exactly this flag.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn query_dlt_status() -> Result<Value, String> {
     tokio::task::spawn_blocking(daemon::query_dlt_status)
         .await
@@ -234,21 +234,21 @@ async fn query_dlt_status() -> Result<Value, String> {
 /// shape). Returns the daemon's response verbatim (`{ agent_did, enabled }`)
 /// — the caller re-queries `query_dlt_status` afterward rather than
 /// trusting this response to update local state.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn mutate_dlt(action: String) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::mutate_dlt(&action))
         .await
         .map_err(|e| format!("Block thread error: {e}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn get_llm_settings() -> Result<Value, String> {
     tokio::task::spawn_blocking(|| daemon::send_query("query_llm_settings", None))
         .await
         .map_err(|e| format!("Block thread error: {e}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn set_llm_settings(settings: Value) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || daemon::send_mutate("mutate_llm_settings", settings))
         .await
@@ -256,7 +256,7 @@ async fn set_llm_settings(settings: Value) -> Result<Value, String> {
 }
 
 /// Ensure a session exists in the DB (idempotent – safe to call every load).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn create_session(
     state: State<'_, AppState>,
     session_id: String,
@@ -269,7 +269,7 @@ async fn create_session(
 }
 
 /// Save a plain-text message to the database (back-compat; prefer save_event).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_message(
     state: State<'_, AppState>,
     session_id: String,
@@ -285,7 +285,7 @@ async fn save_message(
 /// Save any event (daemon thought/action/observation/final/chat, an ask,
 /// an error) so it survives a reload instead of only living in the
 /// in-memory UI state.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_event(
     state: State<'_, AppState>,
     session_id: String,
@@ -309,7 +309,7 @@ async fn save_event(
 }
 
 /// Load all messages for a session.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn load_messages(
     state: State<'_, AppState>,
     session_id: String,
@@ -320,7 +320,7 @@ async fn load_messages(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_pending_confirmation(
     state: State<'_, AppState>,
     session_id: String,
@@ -341,7 +341,7 @@ async fn save_pending_confirmation(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn load_pending_confirmation(
     state: State<'_, AppState>,
     session_id: String,
@@ -352,7 +352,7 @@ async fn load_pending_confirmation(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn clear_pending_confirmation(
     state: State<'_, AppState>,
     session_id: String,
@@ -364,7 +364,7 @@ async fn clear_pending_confirmation(
 }
 
 /// List all sessions.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_sessions(
     state: State<'_, AppState>,
 ) -> Result<Vec<(String, String, i64)>, String> {
@@ -372,7 +372,7 @@ async fn list_sessions(
 }
 
 /// Delete a session and its messages.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_session(
     state: State<'_, AppState>,
     session_id: String,
@@ -384,7 +384,7 @@ async fn delete_session(
 }
 
 /// Rename a session (replaces the default "New Chat" title).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn rename_session(
     state: State<'_, AppState>,
     session_id: String,
@@ -397,13 +397,13 @@ async fn rename_session(
 }
 
 /// List all GUI-local contract artifacts (newest first).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_contracts(state: State<'_, AppState>) -> Result<Vec<StoredContract>, String> {
     state.db.list_contracts().map_err(|e| e.to_string())
 }
 
 /// Insert or update a GUI-local contract artifact.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_contract(
     state: State<'_, AppState>,
     id: String,
@@ -419,19 +419,19 @@ async fn save_contract(
 }
 
 /// Delete a GUI-local contract artifact.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_contract(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.db.delete_contract(&id).map_err(|e| e.to_string())
 }
 
 /// List all GUI-local token artifacts (newest first).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_tokens(state: State<'_, AppState>) -> Result<Vec<StoredToken>, String> {
     state.db.list_tokens().map_err(|e| e.to_string())
 }
 
 /// Insert or update a GUI-local token artifact.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_token(
     state: State<'_, AppState>,
     id: String,
@@ -461,7 +461,7 @@ async fn save_token(
 }
 
 /// Delete a GUI-local token artifact.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_token(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.db.delete_token(&id).map_err(|e| e.to_string())
 }

@@ -172,11 +172,27 @@ impl Database {
         Ok(())
     }
 
-    /// List all sessions ordered by newest first.
+    /// List all sessions (newest first), deriving a title from the first user
+    /// message when the stored title is still the default "New Chat".
     pub fn list_sessions(&self) -> SqlResult<Vec<(String, String, i64)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id,
+                    CASE
+                      WHEN s.title = 'New Chat' THEN COALESCE(
+                        (SELECT substr(replace(m.content, char(10), ' '), 1, 60)
+                         FROM messages m
+                         WHERE m.session_id = s.id
+                           AND m.role = 'user'
+                           AND m.event_type = 'text'
+                         ORDER BY m.id ASC LIMIT 1),
+                        s.title)
+                      ELSE s.title
+                    END,
+                    s.created_at
+             FROM sessions s
+             ORDER BY s.created_at DESC",
+        )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<SqlResult<Vec<_>>>()?;

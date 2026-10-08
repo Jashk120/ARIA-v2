@@ -152,7 +152,7 @@ pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resume_daemon_task(
     app: AppHandle,
     state: State<'_, AppState>,

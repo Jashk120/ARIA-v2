@@ -17,7 +17,6 @@ members = [
     "skills/doc/write.xlsx",
     "skills/doc/write.docx",
     "skills/exec/run.exec",
-    "skills/create/token.create",
 ]
 
 [package]

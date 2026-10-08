@@ -17,7 +17,7 @@ use super::prompt::{
     build_native_tools_with_dlt,
     system_prompt_with_dlt,
 };
-use crate::config::CONFIG;
+use crate::config::{LlmSettings, Protocol};
 use crate::payments::governance::compute_payment_key;
 use crate::skills::manifest::{
     Capabilities,
@@ -380,6 +380,16 @@ fn static_capability(model: &str) -> Option<crate::db::ToolCapability> {
         || lower.contains("gemma-4")
         || lower.contains("deepseek-v4")
         || lower.contains("qwen")
+        || lower.contains("grok")
+        || lower.contains("mimo")
+        || lower.contains("glm")
+        || lower.contains("kimi")
+        || lower.contains("minimax")
+        || lower.contains("longcat")
+        || lower.contains("muse-spark")
+        || lower.contains("space-bunny")
+        || lower.contains("hy3")
+        || lower.contains("hy4")
         || lower.contains("llama-3.1")
         || lower.contains("llama-4")
         || lower.contains("mistral")
@@ -651,16 +661,8 @@ pub async fn run_react_loop(
     // `step` counts turns, not tool calls: one turn may dispatch up to
     // MAX_PARALLEL_ACTIONS concurrent actions (see plan_action_batch).
     while step < MAX_REACT_STEPS {
-        let resolved_url = crate::config::llm_url();
-        let resolved_model = crate::config::llm_model();
-        let (url, model, provider_name) = match CONFIG.use_provider {
-            crate::config::Provider::OpenRouter => {
-                (resolved_url.as_str(), resolved_model.as_str(), "OpenRouter")
-            }
-            crate::config::Provider::Ollama => {
-                (resolved_url.as_str(), resolved_model.as_str(), "Ollama")
-            }
-        };
+        let settings = crate::config::resolve_llm(&db);
+        let model: &str = settings.model.as_str();
 
         // Fetch capability every step in case it was updated
         let mut capability = {
@@ -706,12 +708,13 @@ pub async fn run_react_loop(
 
         // Stream the LLM response.
         let stream_result = call_llm_streaming(
+            &settings,
             &api_key,
+            &task_id,
             &sys_prompt,
             &history,
             &tx,
             tools,
-            (url, model, provider_name),
             is_native,
         )
         .await;
@@ -2073,6 +2076,193 @@ fn metadata_without(args: &serde_json::Value, excluded: &[&str]) -> Option<Strin
 mod tests {
     use super::*;
 
+    fn sample_history_with_tool_roundtrip() -> Vec<serde_json::Value> {
+        vec![
+            json!({"role": "user", "content": "What files match foo?"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{\"q\":\"foo\"}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "a.txt"}),
+        ]
+    }
+
+    fn sample_openai_tool() -> Vec<serde_json::Value> {
+        vec![json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search files",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        })]
+    }
+
+    #[test]
+    fn chat_body_carries_model_messages_and_openai_tools() {
+        let tools = sample_openai_tool();
+        let body = build_chat_body("m", "sys", &sample_history_with_tool_roundtrip(), Some(&tools));
+        assert_eq!(body["model"], json!("m"));
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["messages"][0], json!({"role": "system", "content": "sys"}));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(body["tools"], json!(tools));
+    }
+
+    #[test]
+    fn responses_body_flattens_tools_and_maps_tool_roundtrip() {
+        let tools = sample_openai_tool();
+        let body =
+            build_responses_body("grok-4.7", "sys", &sample_history_with_tool_roundtrip(), Some(&tools));
+        assert_eq!(body["model"], json!("grok-4.7"));
+        assert_eq!(body["instructions"], json!("sys"));
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "function", "name": "search", "description": "Search files",
+                    "parameters": {"type": "object", "properties": {}}}]),
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0], json!({"role": "user", "content": "What files match foo?"}));
+        assert_eq!(
+            input[1],
+            json!({"type": "function_call", "call_id": "call-1",
+                   "name": "search", "arguments": "{\"q\":\"foo\"}"}),
+        );
+        assert_eq!(
+            input[2],
+            json!({"type": "function_call_output", "call_id": "call-1", "output": "a.txt"}),
+        );
+    }
+
+    #[test]
+    fn messages_body_uses_input_schema_and_tool_result_blocks() {
+        let tools = sample_openai_tool();
+        let body =
+            build_messages_body("claude-haiku-5-5", "sys", &sample_history_with_tool_roundtrip(), Some(&tools));
+        assert_eq!(body["model"], json!("claude-haiku-5-5"));
+        assert_eq!(body["system"], json!("sys"));
+        assert_eq!(body["max_tokens"], json!(8192));
+        assert_eq!(
+            body["tools"],
+            json!([{"name": "search", "description": "Search files",
+                    "input_schema": {"type": "object", "properties": {}}}]),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["role"], json!("assistant"));
+        assert_eq!(
+            messages[1]["content"],
+            json!([{"type": "tool_use", "id": "call-1",
+                   "name": "search", "input": {"q": "foo"}}]),
+        );
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": [{"type": "tool_result",
+                   "tool_use_id": "call-1", "content": "a.txt"}]}),
+        );
+    }
+
+    #[test]
+    fn chat_frames_normalize_to_text_and_openai_tool_calls() {
+        let mut state = ChatStreamState::default();
+        let token = apply_chat_frame(
+            &mut state,
+            &json!({"choices": [{"delta": {"content": "hi"}}]}),
+        );
+        assert_eq!(token.as_deref(), Some("hi"));
+        assert!(apply_chat_frame(&mut state, &json!({"choices": [{"delta": {}}]})).is_none());
+        apply_chat_frame(
+            &mut state,
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call-1", "function": {"name": "search", "arguments": "{\"q\":"}},
+            ]}}]}),
+        );
+        apply_chat_frame(
+            &mut state,
+            &json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "\"foo\"}"}},
+            ]}}]}),
+        );
+        assert_eq!(state.content, "hi");
+        let calls = finalize_tool_calls(state.calls.into_values().collect());
+        assert_eq!(
+            calls,
+            vec![json!({"id": "call-1", "type": "function",
+                   "function": {"name": "search", "arguments": "{\"q\":\"foo\"}"}})],
+        );
+    }
+
+    #[test]
+    fn responses_frames_normalize_to_text_and_openai_tool_calls() {
+        let mut state = ResponsesStreamState::default();
+        let token = apply_responses_frame(
+            &mut state,
+            &json!({"type": "response.output_text.delta", "delta": "hello"}),
+        );
+        assert_eq!(token.as_deref(), Some("hello"));
+        apply_responses_frame(
+            &mut state,
+            &json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "call_id": "call-9",
+                            "name": "search"}}),
+        );
+        apply_responses_frame(
+            &mut state,
+            &json!({"type": "response.function_call_arguments.delta",
+                   "item_id": "call-9", "delta": "{\"q\":\"foo\"}"}),
+        );
+        assert_eq!(state.content, "hello");
+        let mut chunks = Vec::new();
+        for key in &state.order {
+            if let Some(chunk) = state.calls.get(key) {
+                chunks.push(chunk.clone());
+            }
+        }
+        let calls = finalize_tool_calls(chunks);
+        assert_eq!(
+            calls,
+            vec![json!({"id": "call-9", "type": "function",
+                   "function": {"name": "search", "arguments": "{\"q\":\"foo\"}"}})],
+        );
+    }
+
+    #[test]
+    fn anthropic_frames_normalize_to_text_and_openai_tool_calls() {
+        let mut state = AnthropicStreamState::default();
+        let token = apply_anthropic_frame(
+            &mut state,
+            &json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "yo"}}),
+        );
+        assert_eq!(token.as_deref(), Some("yo"));
+        apply_anthropic_frame(
+            &mut state,
+            &json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "tool_use", "id": "toolu-1", "name": "search"}}),
+        );
+        apply_anthropic_frame(
+            &mut state,
+            &json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"q\":"}}),
+        );
+        apply_anthropic_frame(
+            &mut state,
+            &json!({"type": "content_block_delta", "index": 1,
+                   "delta": {"type": "input_json_delta", "partial_json": "\"foo\"}"}}),
+        );
+        assert_eq!(state.content, "yo");
+        let calls = finalize_tool_calls(state.calls.into_values().collect());
+        assert_eq!(
+            calls,
+            vec![json!({"id": "toolu-1", "type": "function",
+                   "function": {"name": "search", "arguments": "{\"q\":\"foo\"}"}})],
+        );
+    }
+
     #[test]
     fn greeting_offer_of_help_is_not_a_question() {
         assert!(!is_question("Hello! How can I help you today?"));
@@ -2299,48 +2489,510 @@ pub(crate) fn parse_agent_responses(raw: &str) -> Vec<AgentResponseKind> {
 }
 
 // ── LLM streaming call ────────────────────────────────────────────────────────
+// OpenCode Go is one gateway with three wire protocols (see config::Protocol).
+// Each protocol gets its own body builder + SSE frame handler below, and every
+// result is normalized back to `(text, openai_tool_calls)` so the loop's
+// parsing of the return contract stays untouched.
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ToolCallChunk {
     id: String,
     name: String,
     arguments: String,
 }
 
-pub(crate) async fn call_llm_streaming(
-    api_key: &str,
+/// Split an OpenAI `{"type":"function","function":{...}}` tool def (tolerates
+/// an already-flat def) into name/description/parameters.
+fn openai_tool_parts(tool: &serde_json::Value) -> (String, String, serde_json::Value) {
+    let inner = tool.get("function").unwrap_or(tool);
+    let name = inner.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let description =
+        inner.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let parameters = inner
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    (name, description, parameters)
+}
+
+fn responses_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let (name, description, parameters) = openai_tool_parts(t);
+            json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            })
+        })
+        .collect()
+}
+
+fn anthropic_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let (name, description, parameters) = openai_tool_parts(t);
+            json!({
+                "name": name,
+                "description": description,
+                "input_schema": parameters,
+            })
+        })
+        .collect()
+}
+
+/// Map loop history (OpenAI message shape) to Responses `input` items.
+/// `{role:"system"}` is skipped — `instructions` carries it.
+fn map_history_to_responses_input(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for h in history {
+        match h.get("role").and_then(|r| r.as_str()).unwrap_or("") {
+            "system" => {}
+            "assistant" => {
+                let calls =
+                    h.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+                if calls.is_empty() {
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": h.get("content").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+                } else {
+                    if let Some(text) = h.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            out.push(json!({"role": "assistant", "content": text}));
+                        }
+                    }
+                    for tc in &calls {
+                        let func = tc.get("function");
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "name": func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
+                            "arguments": func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or(""),
+                        }));
+                    }
+                }
+            }
+            "tool" => {
+                let output = match h.get("content").cloned().unwrap_or(serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "output": output,
+                }));
+            }
+            "user" => {
+                out.push(json!({
+                    "role": "user",
+                    "content": h.get("content").cloned().unwrap_or(serde_json::Value::Null),
+                }));
+            }
+            _ => {
+                out.push(h.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Map loop history to Anthropic `messages`. The system prompt travels in the
+/// top-level `system` field, so `{role:"system"}` entries are skipped.
+fn map_history_to_anthropic_messages(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for h in history {
+        match h.get("role").and_then(|r| r.as_str()).unwrap_or("") {
+            "system" => {}
+            "assistant" => {
+                let calls =
+                    h.get("tool_calls").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+                if calls.is_empty() {
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": h.get("content").cloned().unwrap_or(serde_json::Value::Null),
+                    }));
+                } else {
+                    let mut blocks = Vec::new();
+                    if let Some(text) = h.get("content").and_then(|c| c.as_str()) {
+                        if !text.is_empty() {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    for tc in &calls {
+                        let func = tc.get("function");
+                        let args_str = func
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let input: serde_json::Value =
+                            serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "name": func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
+                            "input": input,
+                        }));
+                    }
+                    out.push(json!({"role": "assistant", "content": blocks}));
+                }
+            }
+            "tool" => {
+                let content = match h.get("content").cloned().unwrap_or(serde_json::Value::Null) {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "content": content,
+                });
+                // A parallel batch emits one history entry per tool call; Anthropic
+                // wants all tool_result blocks of a turn inside a single user message.
+                let appended = match out.last_mut() {
+                    Some(serde_json::Value::Object(last))
+                        if last.get("role").and_then(|r| r.as_str()) == Some("user") =>
+                    {
+                        match last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                            Some(arr)
+                                if arr
+                                    .first()
+                                    .and_then(|b| b.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    == Some("tool_result") =>
+                            {
+                                arr.push(block.clone());
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if !appended {
+                    out.push(json!({"role": "user", "content": [block]}));
+                }
+            }
+            "user" => {
+                out.push(json!({
+                    "role": "user",
+                    "content": h.get("content").cloned().unwrap_or(serde_json::Value::Null),
+                }));
+            }
+            _ => {
+                out.push(h.clone());
+            }
+        }
+    }
+    out
+}
+
+fn build_chat_body(
+    model: &str,
     sys_prompt: &str,
     history: &[serde_json::Value],
-    tx: &mpsc::Sender<AgentEvent>,
-    tools: Option<Vec<serde_json::Value>>,
-    provider_info: (&str, &str, &str),
-    is_native: bool,
-) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let (url, model, provider_name) = provider_info;
-
+    tools: Option<&Vec<serde_json::Value>>,
+) -> serde_json::Value {
     let mut messages = vec![json!({ "role": "system", "content": sys_prompt })];
     messages.extend_from_slice(history);
-
     let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": true,
     });
-
     if let Some(t) = tools
         && !t.is_empty()
     {
-        match body.as_object_mut() {
-            Some(obj) => {
-                obj.insert("tools".to_string(), json!(t));
+        body["tools"] = json!(t);
+    }
+    body
+}
+
+fn build_responses_body(
+    model: &str,
+    sys_prompt: &str,
+    history: &[serde_json::Value],
+    tools: Option<&Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "instructions": sys_prompt,
+        "input": map_history_to_responses_input(history),
+        "stream": true,
+    });
+    if let Some(t) = tools
+        && !t.is_empty()
+    {
+        body["tools"] = json!(responses_tools(t));
+    }
+    body
+}
+
+fn build_messages_body(
+    model: &str,
+    sys_prompt: &str,
+    history: &[serde_json::Value],
+    tools: Option<&Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "model": model,
+        "system": sys_prompt,
+        "messages": map_history_to_anthropic_messages(history),
+        "max_tokens": 8192,
+        "stream": true,
+    });
+    if let Some(t) = tools
+        && !t.is_empty()
+    {
+        body["tools"] = json!(anthropic_tools(t));
+    }
+    body
+}
+
+#[derive(Debug, Default)]
+struct ChatStreamState {
+    content: String,
+    calls: std::collections::BTreeMap<usize, ToolCallChunk>,
+}
+
+/// Fold one chat-completions SSE `data:` frame into state. Returns the text
+/// token to stream, if any.
+fn apply_chat_frame(
+    state: &mut ChatStreamState,
+    frame: &serde_json::Value,
+) -> Option<String> {
+    let delta = frame.get("choices")?.get(0)?.get("delta")?;
+    let mut token = None;
+    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+        state.content.push_str(content);
+        token = Some(content.to_string());
+    }
+    if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        for call in calls {
+            if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
+                let entry = state.calls.entry(index as usize).or_default();
+                if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
+                    entry.id = id.to_string();
+                }
+                if let Some(func) = call.get("function") {
+                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                        entry.arguments.push_str(args);
+                    }
+                }
             }
-            None => anyhow::bail!("{} error: failed to build chat request body", provider_name),
         }
     }
+    token
+}
+
+#[derive(Debug, Default)]
+struct ResponsesStreamState {
+    content: String,
+    calls: std::collections::BTreeMap<String, ToolCallChunk>,
+    order: Vec<String>,
+}
+
+/// Key the in-progress function call: prefer the frame's own `item_id`, then
+/// the item's `call_id`/`id`, else the most recent call.
+fn responses_call_key(
+    frame: &serde_json::Value,
+    state: &ResponsesStreamState,
+) -> Option<String> {
+    if let Some(id) = frame.get("item_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        return Some(id.to_string());
+    }
+    if let Some(item) = frame.get("item") {
+        for field in ["call_id", "id"] {
+            if let Some(id) = item.get(field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    state.order.last().cloned()
+}
+
+/// Fold one Responses SSE `data:` frame into state. Returns the text token
+/// to stream, if any.
+fn apply_responses_frame(
+    state: &mut ResponsesStreamState,
+    frame: &serde_json::Value,
+) -> Option<String> {
+    match frame.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "response.output_text.delta" => {
+            let text = frame.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+            state.content.push_str(text);
+            if text.is_empty() { None } else { Some(text.to_string()) }
+        }
+        "response.output_item.added" => {
+            let item = frame.get("item")?;
+            if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                return None;
+            }
+            let key = responses_call_key(frame, state)?;
+            if key.is_empty() {
+                return None;
+            }
+            let entry = state.calls.entry(key.clone()).or_default();
+            entry.id = key.clone();
+            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                entry.name = name.to_string();
+            }
+            if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                entry.arguments.push_str(args);
+            }
+            if !state.order.contains(&key) {
+                state.order.push(key);
+            }
+            None
+        }
+        "response.function_call_arguments.delta" => {
+            let key = responses_call_key(frame, state)?;
+            if key.is_empty() {
+                return None;
+            }
+            let entry = state.calls.entry(key.clone()).or_default();
+            if entry.id.is_empty() {
+                entry.id = key.clone();
+            }
+            if !state.order.contains(&key) {
+                state.order.push(key);
+            }
+            entry
+                .arguments
+                .push_str(frame.get("delta").and_then(|d| d.as_str()).unwrap_or(""));
+            None
+        }
+        "response.output_item.done" => {
+            let item = frame.get("item")?;
+            if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                return None;
+            }
+            let key = responses_call_key(frame, state)?;
+            if key.is_empty() {
+                return None;
+            }
+            let entry = state.calls.entry(key.clone()).or_default();
+            if entry.id.is_empty() {
+                entry.id = key.clone();
+            }
+            if entry.name.is_empty()
+                && let Some(name) = item.get("name").and_then(|v| v.as_str())
+            {
+                entry.name = name.to_string();
+            }
+            if entry.arguments.is_empty()
+                && let Some(args) = item.get("arguments").and_then(|v| v.as_str())
+            {
+                entry.arguments = args.to_string();
+            }
+            if !state.order.contains(&key) {
+                state.order.push(key);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    content: String,
+    calls: std::collections::BTreeMap<usize, ToolCallChunk>,
+}
+
+/// Fold one Anthropic SSE `data:` frame (dispatched on its JSON `type`) into
+/// state. Returns the text token to stream, if any.
+fn apply_anthropic_frame(
+    state: &mut AnthropicStreamState,
+    frame: &serde_json::Value,
+) -> Option<String> {
+    match frame.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "content_block_start" => {
+            let index = frame.get("index").and_then(|i| i.as_u64())? as usize;
+            let block = frame.get("content_block")?;
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                return None;
+            }
+            let entry = state.calls.entry(index).or_default();
+            entry.id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            entry.name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            None
+        }
+        "content_block_delta" => {
+            let index = frame.get("index").and_then(|i| i.as_u64())? as usize;
+            let delta = frame.get("delta")?;
+            match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text_delta" => {
+                    let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    state.content.push_str(text);
+                    if text.is_empty() { None } else { Some(text.to_string()) }
+                }
+                "input_json_delta" => {
+                    let entry = state.calls.entry(index).or_default();
+                    entry.arguments.push_str(
+                        delta.get("partial_json").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
+                    None
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Normalize accumulated chunks to OpenAI tool_call shape.
+fn finalize_tool_calls(chunks: Vec<ToolCallChunk>) -> Vec<serde_json::Value> {
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            json!({
+                "id": chunk.id,
+                "type": "function",
+                "function": {
+                    "name": chunk.name,
+                    "arguments": chunk.arguments,
+                }
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn call_llm_streaming(
+    settings: &LlmSettings,
+    api_key_fallback: &str,
+    session_id: &str,
+    sys_prompt: &str,
+    history: &[serde_json::Value],
+    tx: &mpsc::Sender<AgentEvent>,
+    tools: Option<Vec<serde_json::Value>>,
+    is_native: bool,
+) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let model = settings.model.as_str();
+    let url = settings.url.as_str();
+    let provider_name: &str =
+        crate::config::find_preset(&settings.provider_id).map(|p| p.name).unwrap_or("LLM");
+    let effective_key = settings.api_key.as_deref().unwrap_or(api_key_fallback);
+    let is_go = settings.is_opencode_go();
+
+    let body = match settings.protocol {
+        Protocol::ChatCompletions => build_chat_body(model, sys_prompt, history, tools.as_ref()),
+        Protocol::Responses => build_responses_body(model, sys_prompt, history, tools.as_ref()),
+        Protocol::AnthropicMessages => {
+            build_messages_body(model, sys_prompt, history, tools.as_ref())
+        }
+    };
 
     tracing::info!("LLM Call: provider={}, model={}, url={}", provider_name, model, url);
 
@@ -2348,14 +3000,23 @@ pub(crate) async fn call_llm_streaming(
     let mut resp = None;
     let mut last_err = String::new();
     for candidate in &candidates {
-        match client
-            .post(candidate)
-            .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
+        let mut request = client.post(candidate).header("Content-Type", "application/json");
+        if is_go {
+            request = request
+                .header("User-Agent", format!("aria-daemon/{}", env!("CARGO_PKG_VERSION")))
+                .header("x-opencode-session", session_id);
+            match settings.protocol {
+                Protocol::AnthropicMessages => {
+                    request = request.header("x-api-key", effective_key);
+                }
+                _ => {
+                    request = request.header("Authorization", format!("Bearer {}", effective_key));
+                }
+            }
+        } else {
+            request = request.header("Authorization", format!("Bearer {}", effective_key));
+        }
+        match request.json(&body).send().await {
             Ok(r) => {
                 resp = Some(r);
                 break;
@@ -2411,11 +3072,11 @@ pub(crate) async fn call_llm_streaming(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut full_content = String::new();
     let mut buffer = String::new();
-    let mut tool_calls_map: std::collections::BTreeMap<usize, ToolCallChunk> =
-        std::collections::BTreeMap::new();
     let mut seen_json_block = false;
+    let mut chat_state = ChatStreamState::default();
+    let mut responses_state = ResponsesStreamState::default();
+    let mut anthropic_state = AnthropicStreamState::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -2425,67 +3086,60 @@ pub(crate) async fn call_llm_streaming(
             let line = buffer[..newline_pos].trim().to_string();
             buffer = buffer[newline_pos + 1..].to_string();
 
-            if line.is_empty() || line == "data: [DONE]" {
+            if line.is_empty() || line == "data: [DONE]" || line.starts_with("event: ") {
                 continue;
             }
 
             let json_str = line.strip_prefix("data: ").unwrap_or(&line);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str)
-                && let Some(choices) = v.get("choices")
-                && let Some(delta) = choices.get(0).and_then(|c| c.get("delta"))
-            {
-                // 1. Content accumulation & streaming
-                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                    full_content.push_str(content);
-
-                    // Streaming safety fix - do not stream JSON to UI in fallback mode!
-                    if !is_native
-                        && (full_content.contains("```json") || full_content.contains("{"))
-                    {
-                        seen_json_block = true;
-                    }
-
-                    if is_native || !seen_json_block {
-                        let _ = tx.send(AgentEvent::Token { content: content.to_string() }).await;
-                    }
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                continue;
+            };
+            let (token, full_text) = match settings.protocol {
+                Protocol::ChatCompletions => {
+                    let token = apply_chat_frame(&mut chat_state, &frame);
+                    (token, chat_state.content.as_str())
+                }
+                Protocol::Responses => {
+                    let token = apply_responses_frame(&mut responses_state, &frame);
+                    (token, responses_state.content.as_str())
+                }
+                Protocol::AnthropicMessages => {
+                    let token = apply_anthropic_frame(&mut anthropic_state, &frame);
+                    (token, anthropic_state.content.as_str())
+                }
+            };
+            if let Some(content) = token {
+                // Streaming safety fix - do not stream JSON to UI in fallback mode!
+                if !is_native && (full_text.contains("```json") || full_text.contains("{")) {
+                    seen_json_block = true;
                 }
 
-                // 2. Tool calls accumulation (never streamed to UI)
-                if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                    for call in calls {
-                        if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
-                            let index = index as usize;
-                            let entry = tool_calls_map.entry(index).or_default();
-
-                            if let Some(id) = call.get("id").and_then(|i| i.as_str()) {
-                                entry.id = id.to_string();
-                            }
-                            if let Some(func) = call.get("function") {
-                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                    entry.name.push_str(name);
-                                }
-                                if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                    entry.arguments.push_str(args);
-                                }
-                            }
-                        }
-                    }
+                if is_native || !seen_json_block {
+                    let _ = tx.send(AgentEvent::Token { content }).await;
                 }
             }
         }
     }
 
-    let mut final_tool_calls = Vec::new();
-    for (_, chunk) in tool_calls_map {
-        final_tool_calls.push(json!({
-            "id": chunk.id,
-            "type": "function",
-            "function": {
-                "name": chunk.name,
-                "arguments": chunk.arguments,
+    let (full_content, final_tool_calls) = match settings.protocol {
+        Protocol::ChatCompletions => {
+            let chunks: Vec<ToolCallChunk> = chat_state.calls.into_values().collect();
+            (chat_state.content, finalize_tool_calls(chunks))
+        }
+        Protocol::Responses => {
+            let mut chunks = Vec::new();
+            for key in &responses_state.order {
+                if let Some(chunk) = responses_state.calls.get(key) {
+                    chunks.push(chunk.clone());
+                }
             }
-        }));
-    }
+            (responses_state.content, finalize_tool_calls(chunks))
+        }
+        Protocol::AnthropicMessages => {
+            let chunks: Vec<ToolCallChunk> = anthropic_state.calls.into_values().collect();
+            (anthropic_state.content, finalize_tool_calls(chunks))
+        }
+    };
 
     if full_content.is_empty() && final_tool_calls.is_empty() {
         tracing::warn!("LLM returned a successful response but NO tokens or tools were found.");

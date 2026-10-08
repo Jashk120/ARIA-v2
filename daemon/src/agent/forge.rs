@@ -638,29 +638,19 @@ pub async fn run_forge_subagent(
     let mut llm_error: Option<String> = None;
 
     while step < FORGE_MAX_STEPS {
-        let resolved_url = crate::config::llm_url();
-        let resolved_model = crate::config::llm_model();
-        let (url, model, provider_name) = match crate::config::CONFIG.use_provider {
-            crate::config::Provider::OpenRouter => (
-                resolved_url.as_str(),
-                resolved_model.as_str(),
-                "OpenRouter",
-            ),
-            crate::config::Provider::Ollama => {
-                (resolved_url.as_str(), resolved_model.as_str(), "Ollama")
-            }
-        };
+        let settings = crate::config::resolve_llm(&db);
         let dlt_enabled = crate::config::dlt_enabled_live(&db);
         let tools = if fallback { None } else { Some(build_forge_tools(&request, dlt_enabled)) };
         let sys_for_turn = if fallback { fallback_forge_prompt(&request) } else { sys.clone() };
 
         let stream_result = super::react_loop::call_llm_streaming(
+            &settings,
             &api_key,
+            &child_task_id,
             &sys_for_turn,
             &history,
             &tx,
             tools,
-            (url, model, provider_name),
             !fallback,
         )
         .await;

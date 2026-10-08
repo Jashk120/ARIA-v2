@@ -2437,7 +2437,8 @@ mod tests {
         let new_confirmation = payment_confirmation_message("transfer.pay", &revised_args);
         assert!(new_confirmation.contains("Payment Confirmation"));
         assert!(new_confirmation.contains("0.5 HBAR"));
-        assert!(new_confirmation.contains("• yes — execute exactly this transaction"));
+        assert!(new_confirmation.contains("Recipient"));
+        assert!(new_confirmation.contains("0.0.1234"));
     }
 
     #[test]

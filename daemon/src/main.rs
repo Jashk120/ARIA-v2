@@ -775,17 +775,27 @@ async fn handle_query(
                 };
             };
 
-            // Live read against Hedera on every call — intentionally not
-            // cached here.
-            match AccountBalanceQuery::new().account_id(account_id).execute(&client).await {
-                Ok(balance) => QueryResponse::QueryWalletBalance {
+            // Live read, uncached. The timeout is mandatory: when the network
+            // is Busy the SDK retries with exponential backoff, which without a
+            // cap hangs the caller (and the GUI dashboard) forever.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                AccountBalanceQuery::new().account_id(account_id).execute(&client),
+            )
+            .await
+            {
+                Ok(Ok(balance)) => QueryResponse::QueryWalletBalance {
                     agent_did: agent_did.to_string(),
                     account_id: account_id.to_string(),
                     balance_hbar: balance.hbars.to_tinybars() as f64 / 100_000_000.0,
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     QueryResponse::QueryError { message: format!("balance query failed: {}", e) }
                 }
+                Err(_) => QueryResponse::QueryError {
+                    message: "balance query timed out after 12s (Hedera network busy/unreachable)"
+                        .to_string(),
+                },
             }
         }
         other => QueryResponse::QueryError { message: format!("unknown query type: {}", other) },

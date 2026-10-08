@@ -1123,29 +1123,25 @@ pub async fn run_react_loop(
                         // Check 1a: Allowlist (aria.allowlist)
                         let is_allowed =
                             db.is_account_allowlisted(&agent_did, &recipient).unwrap_or(false);
-                        crate::payments::audit::write_payment_decision(
-                            audit_client.clone(),
-                            topic_id.clone(),
-                            crate::payments::audit::AriaRecord {
-                                v: 1,
-                                agent: agent_did.clone(),
-                                ts: now_ms,
-                                policy: Some("aria.allowlist".to_string()),
-                                method: Some(skill.clone()),
-                                amount: Some(amount_hbar),
-                                currency: Some("HBAR".to_string()),
-                                counterparty: Some(recipient.clone()),
-                                allowed: Some(is_allowed),
-                                reason: Some(if is_allowed {
-                                    "allowlisted".to_string()
-                                } else {
-                                    format!("not_allowlisted:{}", recipient)
-                                }),
-                                request_id: None,
-                            },
-                        );
 
                         if !is_allowed {
+                            crate::payments::audit::write_payment_decision(
+                                audit_client.clone(),
+                                topic_id.clone(),
+                                crate::payments::audit::AriaRecord {
+                                    v: 1,
+                                    agent: agent_did.clone(),
+                                    ts: now_ms,
+                                    policy: Some("aria.allowlist".to_string()),
+                                    method: Some(skill.clone()),
+                                    amount: Some(amount_hbar),
+                                    currency: Some("HBAR".to_string()),
+                                    counterparty: Some(recipient.clone()),
+                                    allowed: Some(false),
+                                    reason: Some(format!("not_allowlisted:{}", recipient)),
+                                    request_id: None,
+                                },
+                            );
                             let err_msg = format!(
                                 "Payment blocked by policy (aria.allowlist): account '{}' is not on the allowlist.",
                                 recipient
@@ -1196,29 +1192,24 @@ pub async fn run_react_loop(
                             )
                             .unwrap_or(false);
 
-                        crate::payments::audit::write_payment_decision(
-                            audit_client.clone(),
-                            topic_id.clone(),
-                            crate::payments::audit::AriaRecord {
-                                v: 1,
-                                agent: agent_did.clone(),
-                                ts: now_ms,
-                                policy: Some("aria.spend-limit".to_string()),
-                                method: Some(skill.clone()),
-                                amount: Some(amount_hbar),
-                                currency: Some("HBAR".to_string()),
-                                counterparty: Some(recipient.clone()),
-                                allowed: Some(reserved),
-                                reason: Some(if reserved {
-                                    "within_budget".to_string()
-                                } else {
-                                    "per_day_exceeded".to_string()
-                                }),
-                                request_id: None,
-                            },
-                        );
-
                         if !reserved {
+                            crate::payments::audit::write_payment_decision(
+                                audit_client.clone(),
+                                topic_id.clone(),
+                                crate::payments::audit::AriaRecord {
+                                    v: 1,
+                                    agent: agent_did.clone(),
+                                    ts: now_ms,
+                                    policy: Some("aria.spend-limit".to_string()),
+                                    method: Some(skill.clone()),
+                                    amount: Some(amount_hbar),
+                                    currency: Some("HBAR".to_string()),
+                                    counterparty: Some(recipient.clone()),
+                                    allowed: Some(false),
+                                    reason: Some("per_day_exceeded".to_string()),
+                                    request_id: None,
+                                },
+                            );
                             let err_msg = format!(
                                 "Payment blocked by policy (aria.spend-limit): payment of {} HBAR exceeds rolling 24-hour daily budget cap.",
                                 amount_hbar

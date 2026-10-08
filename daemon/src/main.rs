@@ -967,6 +967,12 @@ fn hedera_client_from(account_id_str: &str, private_key_str: &str) -> Option<(
         _ => Client::for_testnet(),
     };
     client.set_operator(operator_id, private_key.clone());
+    // Bound retries below the 120s tx validity (SDK default request budget is
+    // also 120s across 10 attempts x 7 nodes), so a slow node fails fast
+    // instead of hanging for minutes and surfacing TransactionExpired.
+    client.set_request_timeout(Some(std::time::Duration::from_secs(60)));
+    client.set_max_attempts(5);
+    client.set_max_nodes_per_request(Some(3));
 
     Some((client, operator_id, private_key))
 }

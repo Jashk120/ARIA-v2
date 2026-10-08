@@ -1,10 +1,9 @@
 mod agent;
 mod daemon;
 mod db;
-mod llm;
 
+use agent::ChatMessage;
 use db::{Database, PendingConfirmation, StoredContract, StoredMessage, StoredToken};
-use llm::ChatMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;

@@ -5,25 +5,19 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::daemon;
 use crate::AppState;
-// NOTE: the GUI owns no router LLM. `ChatMessage` is kept only so the
-// `send_message` command signature (history: Vec<ChatMessage>) stays stable
-// for the frontend; nothing in the chat path calls `llm::stream_chat`.
-use crate::llm::ChatMessage;
+// NOTE: the GUI owns no LLM — it is a pure daemon pass-through.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: Option<String>,
+}
 
 // ── Tauri Event Payloads ──────────────────────────────────────────────────────
 
 /// Events emitted to the Svelte frontend via Tauri's event bus.
 #[derive(Debug, Clone)]
 pub enum FrontendEvent {
-    /// A streamed text token from the GUI LLM
-    Token { content: String },
-    /// The LLM finished a normal text response
-    Done { full_text: String },
-    /// The router itself is asking a clarifying question, instead of
-    /// guessing and delegating or answering blind. Distinct from
-    /// AwaitingConfirmation below, which is the daemon pausing mid-task.
-    Ask { content: String },
-    /// The LLM is about to delegate a task to the daemon
+    /// The GUI is about to delegate a task to the daemon
     DaemonStarted { task: String, skill_type: String },
     AwaitingConfirmation { task_id: String, content: String, kind: Option<String> },
     /// An event forwarded from the daemon (thought, action, observation, final, etc.)
@@ -40,24 +34,6 @@ impl Serialize for FrontendEvent {
         S: Serializer,
     {
         match self {
-            FrontendEvent::Token { content } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("kind", "token")?;
-                map.serialize_entry("content", content)?;
-                map.end()
-            }
-            FrontendEvent::Done { full_text } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("kind", "done")?;
-                map.serialize_entry("full_text", full_text)?;
-                map.end()
-            }
-            FrontendEvent::Ask { content } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("kind", "ask_self")?;
-                map.serialize_entry("content", content)?;
-                map.end()
-            }
             FrontendEvent::DaemonStarted { task, skill_type } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("kind", "daemon_started")?;

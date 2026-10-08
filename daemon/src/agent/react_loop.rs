@@ -1019,6 +1019,47 @@ pub async fn run_react_loop(
                             break;
                         }
 
+                        // Asset-creation skills have no counterparty to
+                        // allowlist and no HBAR spend to cap, so the payment
+                        // governance below does not apply. They still require
+                        // an explicit human "yes" (network fees), so ask and
+                        // park here; approval resumes through `approve_hold`.
+                        if hts_asset_creation(&skill) {
+                            let question = payment_confirmation_message(&skill, &args);
+                            let _ = tx
+                                .send(AgentEvent::Ask {
+                                    content: question,
+                                    task_id: task_id.clone(),
+                                    kind: Some(AskKind::Payment),
+                                })
+                                .await;
+
+                            history.push(json!({
+                                "role": "assistant",
+                                "content": format!(
+                                    "Proposed token creation awaiting human confirmation: {}",
+                                    payment_action_summary(&skill, &args)
+                                )
+                            }));
+
+                            let history_json =
+                                serde_json::to_string(&history).unwrap_or_default();
+                            let pending_json = serde_json::to_string(&pending_payment_action(
+                                &skill,
+                                args.clone(),
+                                &injected_config,
+                            ))
+                            .unwrap_or_default();
+                            let _ = db.save_awaiting_confirmation(
+                                &task_id,
+                                &history_json,
+                                &pending_json,
+                            );
+
+                            should_continue = false;
+                            break;
+                        }
+
                         let runtime_cfg = crate::config::RuntimeConfig::load(&db);
                         let governance = &runtime_cfg.governance;
                         let audit_client = payment_vault
@@ -1891,6 +1932,14 @@ pub(crate) fn skill_requires_confirmation(skill: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// HTS skills that create a new asset instead of moving value to a
+/// counterparty. `token.create`'s optional `treasury` defaults to the operator
+/// (host-side) and its `amount` is an initial supply, not an HBAR spend, so the
+/// counterparty/allowlist/spend-hold gate has nothing to attach to.
+fn hts_asset_creation(skill: &str) -> bool {
+    matches!(skill, "token.create")
+}
+
 /// Air-gap proposal guard. Returns `Some(error)` when `skill` needs a DLT
 /// capability and `dlt_enabled` is off — the caller surfaces it as a
 /// proposal error so no spend hold is ever reserved and no HCS audit write
@@ -2026,10 +2075,22 @@ fn payment_proposal_error(skill: &str, args: &serde_json::Value) -> Option<Strin
     if capabilities.hedera_pay {
         return direct_payment_proposal_error(skill, args);
     }
-    if capabilities.hts
-        && let Err(reason) = extract_payment_recipient_and_amount(skill, args)
-    {
-        return Some(format!("Payment proposal for {} is invalid: {}.", skill, reason));
+    if capabilities.hts {
+        if hts_asset_creation(skill) {
+            let amount = ["amount", "initial_supply", "max_supply", "supply"]
+                .iter()
+                .find_map(|key| args.get(*key).and_then(json_number_as_f64));
+            return match amount {
+                Some(a) if a > 0.0 && a.is_finite() => None,
+                _ => Some(format!(
+                    "Payment proposal for {} is invalid: amount must be a positive number.",
+                    skill
+                )),
+            };
+        }
+        if let Err(reason) = extract_payment_recipient_and_amount(skill, args) {
+            return Some(format!("Payment proposal for {} is invalid: {}.", skill, reason));
+        }
     }
     None
 }
@@ -2550,6 +2611,14 @@ mod tests {
         assert!(extract_payment_recipient_and_amount("token.create", &no_amount).is_err());
         let zero = json!({"asset": "hbar", "spender": "0.0.5678", "amount": 0.0});
         assert!(extract_payment_recipient_and_amount("allowance.set", &zero).is_err());
+
+        // Creation: no treasury is valid, a missing/zero supply is not.
+        assert!(payment_proposal_error("token.create", &no_counterparty).is_none());
+        assert!(payment_proposal_error("token.create", &json!({"name": "T", "symbol": "T"})).is_some());
+        assert!(
+            payment_proposal_error("token.create", &json!({"name": "T", "symbol": "T", "amount": 0.0}))
+                .is_some()
+        );
 
         assert!(payment_proposal_error("allowance.set", &approve).is_none());
         assert!(payment_proposal_error("allowance.set", &zero).is_some());

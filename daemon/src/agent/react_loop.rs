@@ -540,6 +540,10 @@ pub async fn run_react_loop(
         }
     }
 
+    // A confirmed skill that already executed; if the follow-up LLM call fails,
+    // this result is surfaced deterministically instead of behind an LLM error.
+    let mut confirmed_result: Option<String> = None;
+
     // ── Resume: a pending payment confirmation takes priority over the LLM ─────
     // Interpreted deterministically (not re-asked to the model) so a
     // confirmation reply can't be reinterpreted into a different action right
@@ -629,6 +633,7 @@ pub async fn run_react_loop(
                             "role": "user",
                             "content": format!("User confirmed. Result of {}: {}", skill, observation)
                         }));
+                        confirmed_result = Some(format!("{} — {}", skill, observation));
                         // Falls through into the normal loop below so the LLM can
                         // synthesize a final user-facing response from the observation.
                     }
@@ -740,6 +745,26 @@ pub async fn run_react_loop(
                 }
 
                 let clean_err = err_str.replace("TOOL_REJECTION_ERROR ", "");
+
+                // The confirmed action already executed and its result is the
+                // ground truth — surface it deterministically rather than
+                // dropping it because the summarization call failed.
+                if let Some(result) = confirmed_result.take() {
+                    let _ = tx
+                        .send(AgentEvent::Final {
+                            content: format!(
+                                "The confirmed action completed, but I couldn't reach the model to summarize it. Result:\n\n{}\n\n(model error: {})",
+                                result, clean_err
+                            ),
+                            span_id: Some(new_span_id()),
+                            parent_span_id: None,
+                            depth: Some(0),
+                        })
+                        .await;
+                    let _ = tx.send(AgentEvent::Done).await;
+                    return Ok(());
+                }
+
                 let _ = tx
                     .send(AgentEvent::Error { content: format!("LLM error: {}", clean_err) })
                     .await;
@@ -761,6 +786,19 @@ pub async fn run_react_loop(
         if !is_native {
             parsed = parse_agent_responses(&raw);
             if parsed.is_empty() {
+                if let Some(result) = confirmed_result.take() {
+                    let _ = tx
+                        .send(AgentEvent::Final {
+                            content: format!(
+                                "The confirmed action completed successfully. Result:\n\n{}",
+                                result
+                            ),
+                            span_id: Some(new_span_id()),
+                            parent_span_id: None,
+                            depth: Some(0),
+                        })
+                        .await;
+                }
                 let _ = tx.send(AgentEvent::Done).await;
                 return Ok(());
             }
@@ -1454,6 +1492,22 @@ pub async fn run_react_loop(
         }
 
         step += 1;
+    }
+
+    if let Some(result) = confirmed_result.take() {
+        let _ = tx
+            .send(AgentEvent::Final {
+                content: format!(
+                    "The confirmed action completed successfully. Result:\n\n{}",
+                    result
+                ),
+                span_id: Some(new_span_id()),
+                parent_span_id: None,
+                depth: Some(0),
+            })
+            .await;
+        let _ = tx.send(AgentEvent::Done).await;
+        return Ok(());
     }
 
     let _ = tx

@@ -44,5 +44,7 @@
       Per-day cap: {dashboardState.dashboardBudget.per_day_cap === null ? 'None' : `${fmtHbar(dashboardState.dashboardBudget.per_day_cap)} ℏ`}
       &nbsp;(config-only — not editable here)
     </p>
+  {:else if dashboardState.dashboardLoading}
+    <p class="dash-caps-note">Loading…</p>
   {/if}
 </section>

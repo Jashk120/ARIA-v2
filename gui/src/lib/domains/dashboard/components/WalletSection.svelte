@@ -19,5 +19,7 @@
       <span class="dash-wallet-account">{dashboardState.dashboardWallet.account_id}</span>
       <span class="dash-wallet-balance">{fmtHbar(dashboardState.dashboardWallet.balance_hbar)} ℏ</span>
     </p>
+  {:else if dashboardState.dashboardLoading}
+    <p class="dash-caps-note">Loading wallet balance…</p>
   {/if}
 </section>

@@ -14,6 +14,8 @@
         <li>{account}</li>
       {/each}
     </ul>
+  {:else if dashboardState.dashboardLoading}
+    <p class="dash-caps-note">Loading…</p>
   {/if}
   <p class="dash-caps-note">Display only — manage entries from Settings.</p>
 </section>

@@ -33,22 +33,36 @@ class DashboardState {
   async loadDashboard() {
     if (this.dashboardLoading) return;
     this.dashboardLoading = true;
+    this.dashboardLoadedOnce = true;
     /** @type {Record<string, string>} */
     const errors = {};
+    this.dashboardErrors = errors;
 
-    const [budget, holds, allowlist, wallet] = await Promise.all([
-      tauriInvoke('dashboard_query', { query: 'query_budget' }).catch((e) => { errors.budget = String(e); return null; }),
-      tauriInvoke('dashboard_query', { query: 'query_holds' }).catch((e) => { errors.holds = String(e); return null; }),
-      tauriInvoke('dashboard_query', { query: 'query_allowlist' }).catch((e) => { errors.allowlist = String(e); return null; }),
-      tauriInvoke('dashboard_query', { query: 'query_wallet_balance' }).catch((e) => { errors.wallet = String(e); return null; }),
+    /**
+     * @param {string} key
+     * @param {Promise<any>} promise
+     * @param {(v: any) => void} assign
+     */
+    const section = async (key, promise, assign) => {
+      try {
+        assign(await promise);
+      } catch (e) {
+        errors[key] = String(e);
+      }
+      this.dashboardErrors = { ...errors };
+    };
+
+    await Promise.all([
+      section('budget', tauriInvoke('dashboard_query', { query: 'query_budget' }),
+        (v) => { this.dashboardBudget = /** @type {any} */ (v); }),
+      section('holds', tauriInvoke('dashboard_query', { query: 'query_holds' }),
+        (v) => { this.dashboardHolds = /** @type {any} */ (v)?.holds ?? null; }),
+      section('allowlist', tauriInvoke('dashboard_query', { query: 'query_allowlist' }),
+        (v) => { this.dashboardAllowlist = /** @type {any} */ (v)?.accounts ?? null; }),
+      section('wallet', tauriInvoke('dashboard_query', { query: 'query_wallet_balance' }),
+        (v) => { this.dashboardWallet = /** @type {any} */ (v); }),
     ]);
 
-    this.dashboardBudget = /** @type {any} */ (budget);
-    this.dashboardHolds = /** @type {any} */ (holds)?.holds ?? null;
-    this.dashboardAllowlist = /** @type {any} */ (allowlist)?.accounts ?? null;
-    this.dashboardWallet = /** @type {any} */ (wallet);
-    this.dashboardErrors = errors;
-    this.dashboardLoadedOnce = true;
     this.dashboardLoading = false;
   }
 

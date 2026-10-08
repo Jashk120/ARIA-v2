@@ -57,5 +57,7 @@
         {/each}
       </tbody>
     </table>
+  {:else if dashboardState.dashboardLoading}
+    <p class="dash-caps-note">Loading…</p>
   {/if}
 </section>

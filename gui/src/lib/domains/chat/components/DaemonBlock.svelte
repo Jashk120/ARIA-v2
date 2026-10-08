@@ -1,6 +1,9 @@
 <script>
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { chatState } from '$lib/domains/chat/chatState.svelte.js';
+  import { contractsState } from '$lib/domains/contracts/contractsState.svelte.js';
+  import { tokensState } from '$lib/domains/tokens/tokensState.svelte.js';
+  import { findCodeBlocks } from '$lib/domains/chat/codeBlocks.js';
   import { marked } from 'marked';
 
   /**
@@ -172,6 +175,13 @@
     finalAnswer ? /** @type {string} */ (marked.parse(finalAnswer.text, { async: false })) : ''
   );
 
+  /** Handoff buttons under the final answer (only once streaming is done) */
+  const handoffBlocks = $derived(
+    finalAnswer && !finalAnswer.streaming
+      ? findCodeBlocks(finalAnswer.text).filter((b) => b.kind !== 'other')
+      : []
+  );
+
   // Auto-collapse once done
   $effect(() => {
     if (!msg.streaming && finalAnswer && !finalAnswer.streaming) {
@@ -332,6 +342,21 @@
       <div class="daemon-final-text md-body">
         {@html finalHtml}{#if finalAnswer.streaming}<span class="streaming-caret">█</span>{/if}
       </div>
+      {#if handoffBlocks.length > 0}
+        <div class="confirmation-actions" style="margin-top: 0.5rem;">
+          {#each handoffBlocks as block, i (i)}
+            {#if block.kind === 'solidity'}
+              <button onclick={() => contractsState.openCode(block.code)}>
+                View in Contracts
+              </button>
+            {:else if block.kind === 'hts'}
+              <button onclick={() => tokensState.openCode(block.code)}>
+                View in Tokens
+              </button>
+            {/if}
+          {/each}
+        </div>
+      {/if}
     {/if}
 
   </div>

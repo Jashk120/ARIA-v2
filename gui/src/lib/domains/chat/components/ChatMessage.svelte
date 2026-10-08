@@ -2,6 +2,9 @@
   import DaemonBlock from './DaemonBlock.svelte';
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { chatState } from '$lib/domains/chat/chatState.svelte.js';
+  import { contractsState } from '$lib/domains/contracts/contractsState.svelte.js';
+  import { tokensState } from '$lib/domains/tokens/tokensState.svelte.js';
+  import { findCodeBlocks } from '$lib/domains/chat/codeBlocks.js';
   import { marked } from 'marked';
 
   /**
@@ -10,6 +13,10 @@
 
   /** @type {{ msg: UiMessage }} */
   let { msg } = $props();
+
+  const handoffBlocks = $derived(
+    !msg.streaming ? findCodeBlocks(msg.content ?? '').filter((b) => b.kind !== 'other') : []
+  );
 
   /**
    * @param {string | undefined} kind
@@ -36,6 +43,21 @@
     <div class="avatar avatar-ai">✦</div>
     <div class="bubble bubble-ai md-body">
       {@html marked.parse(msg.content ?? '', { async: false })}{#if msg.streaming}<span class="caret">█</span>{/if}
+      {#if handoffBlocks.length > 0}
+        <div class="chips" style="justify-content: flex-start; margin-top: 0.5rem;">
+          {#each handoffBlocks as block, i (i)}
+            {#if block.kind === 'solidity'}
+              <button class="chip" onclick={() => contractsState.openCode(block.code)}>
+                View in Contracts
+              </button>
+            {:else if block.kind === 'hts'}
+              <button class="chip" onclick={() => tokensState.openCode(block.code)}>
+                View in Tokens
+              </button>
+            {/if}
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
 

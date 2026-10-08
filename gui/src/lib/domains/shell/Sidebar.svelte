@@ -32,8 +32,6 @@
     <button class:active={activeTab === 'direct'} onclick={() => activeTab = 'direct'}>Direct TCP</button>
     <button class:active={activeTab === 'dashboard'} onclick={() => activeTab = 'dashboard'}>Dashboard</button>
     <button class:active={activeTab === 'history'} onclick={() => activeTab = 'history'}>History</button>
-    <button class:active={activeTab === 'models'} onclick={() => activeTab = 'models'}>Models</button>
-    <button class:active={activeTab === 'forge'} onclick={() => activeTab = 'forge'}>Skill Forge</button>
     <button class:active={activeTab === 'contracts'} onclick={() => activeTab = 'contracts'}>Contracts</button>
     <button class:active={activeTab === 'tokens'} onclick={() => activeTab = 'tokens'}>Tokens</button>
     <button class:active={activeTab === 'settings'} onclick={() => activeTab = 'settings'}>Settings</button>

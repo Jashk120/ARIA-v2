@@ -1320,14 +1320,31 @@ pub async fn run_react_loop(
                     }
 
                     if is_native {
-                        // Native tool_calls shape history appending
+                        // Native tool_calls shape history appending. Match by
+                        // name BUT skip calls already recorded in history, so
+                        // two same-name calls in one turn each keep their own id.
                         let matched_call = tool_calls.iter().find(|tc| {
-                            if let Some(f) = tc.get("function")
-                                && let Some(n) = f.get("name")
-                            {
-                                return n.as_str().unwrap_or_default() == skill;
+                            let name_matches = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(|n| n == skill)
+                                .unwrap_or(false);
+                            if !name_matches {
+                                return false;
                             }
-                            false
+                            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                            !history.iter().any(|m| {
+                                m.get("tool_calls")
+                                    .and_then(|t| t.as_array())
+                                    .map(|a| {
+                                        a.iter().any(|c| {
+                                            c.get("id").and_then(|v| v.as_str()).unwrap_or_default()
+                                                == id
+                                        })
+                                    })
+                                    .unwrap_or(false)
+                            })
                         });
                         if let Some(tc) = matched_call {
                             let tc_id = tc.get("id").and_then(|id| id.as_str()).unwrap_or_default();
@@ -2776,6 +2793,11 @@ fn anthropic_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
 /// `{role:"system"}` is skipped — `instructions` carries it.
 fn map_history_to_responses_input(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
+    // The Responses API rejects duplicate `function_call`/`function_call_output`
+    // for the same call_id, so dedupe each independently (the loop can, in edge
+    // cases with same-name calls, append the same call/result more than once).
+    let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for h in history {
         match h.get("role").and_then(|r| r.as_str()).unwrap_or("") {
             "system" => {}
@@ -2794,10 +2816,15 @@ fn map_history_to_responses_input(history: &[serde_json::Value]) -> Vec<serde_js
                         }
                     }
                     for tc in &calls {
+                        let call_id =
+                            tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !call_id.is_empty() && !seen_calls.insert(call_id.clone()) {
+                            continue;
+                        }
                         let func = tc.get("function");
                         out.push(json!({
                             "type": "function_call",
-                            "call_id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "call_id": call_id,
                             "name": func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
                             "arguments": func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or(""),
                         }));
@@ -2805,13 +2832,18 @@ fn map_history_to_responses_input(history: &[serde_json::Value]) -> Vec<serde_js
                 }
             }
             "tool" => {
+                let call_id =
+                    h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !call_id.is_empty() && !seen_outputs.insert(call_id.clone()) {
+                    continue;
+                }
                 let output = match h.get("content").cloned().unwrap_or(serde_json::Value::Null) {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
                 };
                 out.push(json!({
                     "type": "function_call_output",
-                    "call_id": h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "call_id": call_id,
                     "output": output,
                 }));
             }
@@ -2833,6 +2865,8 @@ fn map_history_to_responses_input(history: &[serde_json::Value]) -> Vec<serde_js
 /// top-level `system` field, so `{role:"system"}` entries are skipped.
 fn map_history_to_anthropic_messages(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
+    let mut seen_use: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_result: std::collections::HashSet<String> = std::collections::HashSet::new();
     for h in history {
         match h.get("role").and_then(|r| r.as_str()).unwrap_or("") {
             "system" => {}
@@ -2852,6 +2886,11 @@ fn map_history_to_anthropic_messages(history: &[serde_json::Value]) -> Vec<serde
                         }
                     }
                     for tc in &calls {
+                        let use_id =
+                            tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !use_id.is_empty() && !seen_use.insert(use_id.clone()) {
+                            continue;
+                        }
                         let func = tc.get("function");
                         let args_str = func
                             .and_then(|f| f.get("arguments"))
@@ -2861,7 +2900,7 @@ fn map_history_to_anthropic_messages(history: &[serde_json::Value]) -> Vec<serde
                             serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
                         blocks.push(json!({
                             "type": "tool_use",
-                            "id": tc.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "id": use_id,
                             "name": func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
                             "input": input,
                         }));
@@ -2870,13 +2909,18 @@ fn map_history_to_anthropic_messages(history: &[serde_json::Value]) -> Vec<serde
                 }
             }
             "tool" => {
+                let use_id =
+                    h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !use_id.is_empty() && !seen_result.insert(use_id.clone()) {
+                    continue;
+                }
                 let content = match h.get("content").cloned().unwrap_or(serde_json::Value::Null) {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
                 };
                 let block = json!({
                     "type": "tool_result",
-                    "tool_use_id": h.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "tool_use_id": use_id,
                     "content": content,
                 });
                 // A parallel batch emits one history entry per tool call; Anthropic

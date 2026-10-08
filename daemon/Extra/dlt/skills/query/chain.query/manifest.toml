@@ -1,0 +1,53 @@
+name        = "chain.query"
+version     = "0.1.0"
+description = "Reads public Hedera on-chain data via the Mirror Node REST API (no keys, no signing): account info, HBAR balance and EVM address, token holdings, allowances, NFT holdings, token info and balances, HCS topic info and messages, contract info and results, transactions, blocks, and network supply."
+triggers = []
+
+[display]
+action = "Querying on-chain {kind} {id}"
+
+[capabilities]
+chain_read = true
+
+[call]
+args_schema   = '{"kind":"<required — account|account_tokens|account_allowances|account_nfts|balances|token|token_balances|topic|topic_messages|contract|contract_results|transaction|transactions|block|network_supply>","id":"<optional — account/token/topic/contract/transaction/block id, e.g. 0.0.1234; for account/account_tokens/account_allowances/account_nfts/balances defaults to the agent own account>","limit":"<optional — max rows, default 25, cap 100>","order":"<optional — asc|desc, default desc>","type":"<optional — transaction type filter for transactions>","token_id":"<optional — token filter for transactions>","topic_id":"<optional — topic filter for transactions>","account_id":"<optional — account filter for transactions>"}'
+output_schema = '{"mirror_node_response":"object — raw Mirror Node JSON for the requested kind"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.kind]
+type = "string"
+description = "Required. One of: account, account_tokens, account_allowances, account_nfts, balances, token, token_balances, topic, topic_messages, contract, contract_results, transaction, transactions, block, network_supply."
+
+[call.parameters.properties.id]
+type = "string"
+description = "Optional account/token/topic/contract/transaction/block id (e.g. 0.0.1234). For account, account_tokens, account_allowances, account_nfts and balances it defaults to the agent's own account when omitted."
+
+[call.parameters.properties.limit]
+type = "integer"
+description = "Optional max rows for list queries (default 25, cap 100)."
+
+[call.parameters.properties.order]
+type = "string"
+description = "Optional sort order for list queries: asc or desc (default desc)."
+
+[call.parameters.properties.type]
+type = "string"
+description = "Optional transaction type filter for transactions (e.g. CRYPTOTRANSFER)."
+
+[call.parameters.properties.token_id]
+type = "string"
+description = "Optional token id filter for transactions (e.g. 0.0.456)."
+
+[call.parameters.properties.topic_id]
+type = "string"
+description = "Optional topic id filter for transactions (e.g. 0.0.789)."
+
+[call.parameters.properties.account_id]
+type = "string"
+description = "Optional account id filter for transactions (e.g. 0.0.1234)."
+
+[react]
+# No max_steps: reads are cheap and the per-task turn budget already bounds
+# how many queries a task can make. (Set a number here to cap it if needed.)

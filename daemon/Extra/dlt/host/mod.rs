@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod chain;
 pub mod direct;
 pub mod facilitator_client;
 pub mod governance;

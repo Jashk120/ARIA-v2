@@ -137,6 +137,9 @@ pub async fn run_wasm_instance_async(
     if manifest.capabilities.hts {
         wire_hts(&mut linker)?;
     }
+    if manifest.capabilities.chain_read {
+        wire_chain_query(&mut linker)?;
+    }
 
     linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {
         // No-op for now as we use a fixed buffer, but prevents skill crash
@@ -2104,10 +2107,74 @@ fn wire_hts(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn wire_chain_query(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "aria",
+        "host_chain_query",
+        |mut caller: Caller<'_, HostState>,
+         (kind_ptr, kind_len, id_ptr, id_len, opts_ptr, opts_len): (
+            i32, i32, i32, i32, i32, i32,
+        )| {
+            Box::new(async move {
+                let kind = match read_wasm_str(&mut caller, kind_ptr, kind_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_chain_query] bad kind: {}", e);
+                        return write_wasm_error(
+                            &mut caller,
+                            &format!("chain.query: could not read kind argument: {}", e),
+                        )
+                        .await;
+                    }
+                };
+                let id_raw = read_wasm_str(&mut caller, id_ptr, id_len).unwrap_or_default();
+                let id_opt = {
+                    let t = id_raw.trim();
+                    if t.is_empty() { None } else { Some(t.to_string()) }
+                };
+                let opts_str =
+                    read_wasm_str(&mut caller, opts_ptr, opts_len).unwrap_or_else(|_| "{}".to_string());
+                let opts: Value = if opts_str.trim().is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(&opts_str).unwrap_or(Value::Null)
+                };
+                let default_account = caller
+                    .data()
+                    .x402_vault
+                    .as_ref()
+                    .map(|v| v.account_id().to_string())
+                    .or_else(|| {
+                        caller.data().payment_vault.as_ref().map(|v| v.account_id().to_string())
+                    });
+
+                let id_as_deref = id_opt.as_deref();
+                match crate::payments::chain::query(
+                    kind.trim(),
+                    id_as_deref,
+                    &opts,
+                    default_account.as_deref(),
+                )
+                .await
+                {
+                    Ok(v) => {
+                        let bytes = serde_json::to_vec(&v).unwrap_or_default();
+                        write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+                    }
+                    Err(e) => {
+                        eprintln!("[host_chain_query] query failed: {}", e);
+                        write_wasm_error(&mut caller, &format!("chain.query: {}", e)).await
+                    }
+                }
+            })
+        },
+    )?;
+    Ok(())
+}
+
 /// Decode NFT metadata bytes: hex (with optional `0x` prefix), else base64,
-/// else raw UTF-8 bytes.
-fn decode_metadata(s: &str) -> Vec<u8> {
-    let hex_part = s.strip_prefix("0x").unwrap_or(s);
+// else raw UTF-8 bytes.
+fn decode_metadata(s: &str) -> Vec<u8> {    let hex_part = s.strip_prefix("0x").unwrap_or(s);
     if !hex_part.is_empty() && hex_part.chars().all(|c| c.is_ascii_hexdigit()) && hex_part.len() % 2 == 0
         && let Ok(bytes) = hex::decode(hex_part)
     {

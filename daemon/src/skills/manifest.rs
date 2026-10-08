@@ -52,6 +52,8 @@ pub struct Capabilities {
     pub hts: bool,
     #[serde(default)]
     pub exec: bool,
+    #[serde(default)]
+    pub chain_read: bool,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]

@@ -14,7 +14,7 @@ use std::time::Duration;
 /// Base URL for the Hedera Mirror Node REST API, selected the same way
 /// `payments/direct.rs` picks a network client — via `HEDERA_NETWORK`
 /// (defaulting to testnet).
-fn mirror_base_url() -> &'static str {
+pub fn mirror_base_url() -> &'static str {
     match std::env::var("HEDERA_NETWORK").unwrap_or_else(|_| "testnet".to_string()).as_str() {
         "mainnet" => "https://mainnet-public.mirrornode.hedera.com",
         _ => "https://testnet.mirrornode.hedera.com",

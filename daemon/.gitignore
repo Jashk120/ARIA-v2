@@ -7,3 +7,5 @@
 
 #/target
 .env
+.omo/
+embedded-skills/

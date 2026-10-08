@@ -41,6 +41,15 @@ pub async fn query(
     }
 }
 
+/// Extract the HBAR balance (in tinybars) from an `/api/v1/accounts/{id}`
+/// mirror-node response body (`{"balance":{"balance":<tinybars>, ...}}`).
+/// Returns `None` when the shape is unexpected (e.g. a "Not found" envelope
+/// or any other error response), so callers can surface a clean error rather
+/// than a bogus zero.
+pub fn account_balance_tinybars(body: &serde_json::Value) -> Option<i64> {
+    body.get("balance")?.get("balance")?.as_i64()
+}
+
 /// Build the full `{base}/api/v1/...` mirror-node URL (including query
 /// string) for `kind`. Pure constructor — no I/O, so unit tests cover the
 /// routing table without touching the network.
@@ -227,5 +236,21 @@ mod tests {
     fn unknown_kind_errors() {
         let err = build_path("nope", None, &json!({}), None).unwrap_err();
         assert!(err.to_string().contains("unknown chain query kind"), "{}", err);
+    }
+
+    #[test]
+    fn account_balance_extracts_tinybars() {
+        let body = json!({
+            "account": "0.0.1001",
+            "balance": { "balance": 50_454_064_945i64, "timestamp": "1791466599.404755770" }
+        });
+        assert_eq!(account_balance_tinybars(&body), Some(50_454_064_945));
+    }
+
+    #[test]
+    fn account_balance_missing_returns_none() {
+        let not_found = json!({"_status": {"messages": [{"message": "Not found"}]}});
+        assert_eq!(account_balance_tinybars(&not_found), None);
+        assert_eq!(account_balance_tinybars(&json!({})), None);
     }
 }

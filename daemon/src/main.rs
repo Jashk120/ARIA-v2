@@ -761,12 +761,10 @@ async fn handle_query(
             },
         },
         "query_wallet_balance" => {
-            use hiero_sdk::AccountBalanceQuery;
-
-            let (client, account_id) = if let Some(pv) = payment_vault {
-                (pv.client(), pv.account_id())
+            let account_id = if let Some(pv) = payment_vault {
+                pv.account_id()
             } else if let Some(xv) = x402_vault {
-                (xv.client(), xv.account_id())
+                xv.account_id()
             } else {
                 return QueryResponse::QueryError {
                     message:
@@ -775,27 +773,35 @@ async fn handle_query(
                 };
             };
 
-            // Live read, uncached. The timeout is mandatory: when the network
-            // is Busy the SDK retries with exponential backoff, which without a
-            // cap hangs the caller (and the GUI dashboard) forever.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(12),
-                AccountBalanceQuery::new().account_id(account_id).execute(&client),
+            // Read from the Mirror Node REST API, not the SDK's gRPC
+            // `AccountBalanceQuery`: the mirror node answers over plain HTTPS
+            // in one round trip, whereas the query nodes routinely reply
+            // `BUSY` and the SDK then retries with exponential backoff until
+            // the caller's timeout fires — leaving the dashboard with no
+            // balance. `chain.query` uses the same `balance.balance` field.
+            let account_str = account_id.to_string();
+            match crate::payments::chain::query(
+                "account",
+                Some(&account_str),
+                &serde_json::json!({}),
+                None,
             )
             .await
             {
-                Ok(Ok(balance)) => QueryResponse::QueryWalletBalance {
-                    agent_did: agent_did.to_string(),
-                    account_id: account_id.to_string(),
-                    balance_hbar: balance.hbars.to_tinybars() as f64 / 100_000_000.0,
+                Ok(body) => match crate::payments::chain::account_balance_tinybars(&body) {
+                    Some(tinybars) => QueryResponse::QueryWalletBalance {
+                        agent_did: agent_did.to_string(),
+                        account_id: account_str,
+                        balance_hbar: tinybars as f64 / 100_000_000.0,
+                    },
+                    None => QueryResponse::QueryError {
+                        message: "mirror node account response missing balance.balance"
+                            .to_string(),
+                    },
                 },
-                Ok(Err(e)) => {
+                Err(e) => {
                     QueryResponse::QueryError { message: format!("balance query failed: {}", e) }
                 }
-                Err(_) => QueryResponse::QueryError {
-                    message: "balance query timed out after 12s (Hedera network busy/unreachable)"
-                        .to_string(),
-                },
             }
         }
         other => QueryResponse::QueryError { message: format!("unknown query type: {}", other) },

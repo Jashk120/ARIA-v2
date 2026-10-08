@@ -128,7 +128,10 @@ fetching; only stop and report back once you have the actual resource content or
 You may call `delegate_task` to hand a self-contained multi-step sub-task to a focused subagent \
 that returns a report; it cannot move money or ask the user, so keep payments in the main loop. \
 You may call up to 5 independent tools in a single turn (for example, reading several documents at \
-once) — they run concurrently and each result is labeled with its skill so you can attribute outcomes.{}",
+once) — they run concurrently and each result is labeled with its skill so you can attribute outcomes. \
+Every skill name ends in a domain suffix that says what it operates on: `.fs` = local file system (list/read/write/find files), \
+`.web` = internet (search/scrape), `.doc` = document writing, `.exec` = shell/Python, `.pay`/`.query`/`.create`/`.mint`/`.set` = Hedera on-chain. \
+Only call a skill whose domain matches the user's actual request — never call a `.fs` (file system) skill for a request that is not about local files.{}",
             ASK_TOOL_NAME, ASK_TOOL_NAME, user_context
         );
     }
@@ -171,6 +174,9 @@ For normal conversation (no tools needed):
 {{"type":"chat","content":"your response here"}}
 
 {}
+
+== SKILL NAME DOMAINS ==
+Every skill name ends in a domain suffix that says what it operates on: `.fs` = local file system (list/read/write/find files and folders), `.web` = internet (search/scrape), `.doc` = document writing (pdf/xlsx/docx), `.exec` = run a shell/Python snippet, `.pay`/`.query`/`.create`/`.mint`/`.set` = Hedera on-chain payments, queries and tokens. Only call a skill whose domain matches what the user actually asked for — never use a `.fs` (file system) skill such as `list.fs` or `read.fs` for a request that is not about local files.
 
 == RULES ==
 - Always emit a thought before every action

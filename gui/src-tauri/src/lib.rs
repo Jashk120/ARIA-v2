@@ -24,6 +24,24 @@ enum DirectDaemonEvent {
     Error { message: String },
 }
 
+// Events emitted to the Tokens screen while a `token.create` daemon task
+// runs. `AwaitingConfirmation` carries the daemon's payment `ask` so the
+// screen can render Yes/No inline; the terminal `final`/`chat` text is
+// delivered exactly once via `Done`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TokenDaemonEvent {
+    Started { task: String, skill_type: String },
+    Event { event_type: String, payload: Value },
+    AwaitingConfirmation {
+        task_id: String,
+        content: String,
+        confirm_kind: Option<String>,
+    },
+    Done { result: String },
+    Error { message: String },
+}
+
 // ── Tauri Commands ────────────────────────────────────────────────────────────
 
 /// Check if the ARIA daemon TCP socket is reachable.
@@ -89,6 +107,99 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
             Err(message)
         }
     }
+}
+
+/// Send one `token.create` task to the daemon for the Tokens screen.
+/// Mirrors `send_direct_task`, but handles the payment-confirmation flow:
+/// the terminal `final`/`chat` text is accumulated and delivered exactly
+/// once via `Done`, and a daemon `ask` is translated into a single
+/// `AwaitingConfirmation` (the parked task emits nothing further).
+#[tauri::command(rename_all = "snake_case")]
+async fn send_token_task(
+    app: AppHandle,
+    task: String,
+    skill_type: String,
+    task_id: Option<String>,
+) -> Result<(), String> {
+    let task = task.trim().to_string();
+    let skill_type = skill_type.trim().to_string();
+
+    if task.is_empty() {
+        return Err("Task cannot be empty".to_string());
+    }
+
+    if skill_type.is_empty() {
+        return Err("Type cannot be empty".to_string());
+    }
+
+    app.emit(
+        "token-daemon-event",
+        TokenDaemonEvent::Started {
+            task: task.clone(),
+            skill_type: skill_type.clone(),
+        },
+    )
+    .ok();
+
+    let app_events = app.clone();
+    let (daemon_res, final_result, awaiting) = tokio::task::spawn_blocking(move || {
+        let mut final_result = String::new();
+        let mut awaiting = false;
+        let res = daemon::submit_task(&task, &skill_type, task_id, |event| {
+            if event.event_type == "ask" {
+                awaiting = true;
+                if let (Some(task_id), Some(content)) = (
+                    event.payload["task_id"].as_str(),
+                    event.payload["content"].as_str(),
+                ) {
+                    app_events
+                        .emit(
+                            "token-daemon-event",
+                            TokenDaemonEvent::AwaitingConfirmation {
+                                task_id: task_id.to_string(),
+                                content: content.to_string(),
+                                confirm_kind: event.payload["kind"]
+                                    .as_str()
+                                    .map(str::to_string),
+                            },
+                        )
+                        .ok();
+                }
+                return;
+            }
+            if event.event_type == "final" || event.event_type == "chat" {
+                if let Some(content) = event.payload["content"].as_str() {
+                    final_result = content.to_string();
+                }
+                return;
+            }
+            app_events
+                .emit(
+                    "token-daemon-event",
+                    TokenDaemonEvent::Event {
+                        event_type: event.event_type,
+                        payload: event.payload,
+                    },
+                )
+                .ok();
+        });
+        (res, final_result, awaiting)
+    })
+    .await
+    .map_err(|e| format!("Block thread error: {e}"))?;
+
+    // Transport failure: surface verbatim via the invoke rejection.
+    let () = daemon_res?;
+    if !awaiting {
+        app.emit(
+            "token-daemon-event",
+            TokenDaemonEvent::Done {
+                result: final_result,
+            },
+        )
+        .ok();
+    }
+    Ok(())
 }
 
 /// Run one read-only daemon query on demand (`query_budget`, `query_holds`,
@@ -443,6 +554,8 @@ async fn save_token(
     memo: Option<String>,
     source: Option<String>,
     status: String,
+    treasury: Option<String>,
+    token_id: Option<String>,
 ) -> Result<(), String> {
     state
         .db
@@ -456,6 +569,8 @@ async fn save_token(
             memo.as_deref(),
             source.as_deref(),
             &status,
+            treasury.as_deref(),
+            token_id.as_deref(),
         )
         .map_err(|e| e.to_string())
 }
@@ -489,6 +604,7 @@ pub fn run() {
             check_daemon,
             send_message,
             send_direct_task,
+            send_token_task,
             dashboard_query,
             mutate_allowlist,
             approve_hold,

@@ -122,6 +122,8 @@ fetch that next. If that fetch returns a payment_required (402) error, immediate
 calling the paywall-unlock skill (e.g. x402.pay) on that same URL to complete the request — this is \
 pre-authorized within governance limits, so do not stop and ask the user whether to continue paying or \
 fetching; only stop and report back once you have the actual resource content or a genuine failure. \
+You may call `delegate_task` to hand a self-contained multi-step sub-task to a focused subagent \
+that returns a report; it cannot move money or ask the user, so keep payments in the main loop. \
 You may call up to 5 independent tools in a single turn (for example, reading several documents at \
 once) — they run concurrently and each result is labeled with its skill so you can attribute outcomes.{}",
             ASK_TOOL_NAME, user_context
@@ -155,6 +157,9 @@ observation is labeled [i/N from skill] so you can attribute results.
 
 To ask the user for confirmation or clarification:
 {{"type":"ask","content":"your question here"}}
+
+To delegate a self-contained multi-step sub-task to a focused subagent (no payments, no user contact):
+{{"type":"action","skill":"delegate_task","args":{{"task":"..."}}}}
 
 To give the final answer after all tool steps:
 {{"type":"final","content":"your response here"}}
@@ -303,7 +308,7 @@ pub fn build_native_tools_with_dlt(
     dlt_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let all_skills = load_all_skills();
-    let mut tools = vec![ask_tool_definition()];
+    let mut tools = vec![ask_tool_definition(), super::subagent::delegate_tool_definition()];
     let mut matched_any_skill = false;
 
     for m in &all_skills {

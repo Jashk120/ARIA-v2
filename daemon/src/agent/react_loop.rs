@@ -425,6 +425,9 @@ pub async fn run_react_loop(
 ) -> anyhow::Result<()> {
     let mut skill_fire_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // Subagent spawns this task has used (bounded by
+    // `crate::agent::subagent::MAX_DELEGATIONS_PER_TASK`).
+    let mut delegations = 0usize;
 
     let mut step = 0;
     let mut force_fallback_this_turn = false;
@@ -860,6 +863,71 @@ pub async fn run_react_loop(
                         .await;
                 }
                 AgentResponseKind::Action { skill, args } => {
+                    // Delegation never runs concurrently and never touches
+                    // payment/DLT handling below: the child report folds back
+                    // into history as a normal observation and the turn continues.
+                    if skill == crate::agent::subagent::DELEGATE_TOOL_NAME {
+                        executed_tools = true;
+                        let task = args
+                            .get("task")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let action_span = new_span_id();
+                        if task.is_empty() {
+                            let msg =
+                                "delegate_task needs a non-empty 'task' description.".to_string();
+                            let _ = tx.send(AgentEvent::Error { content: msg.clone() }).await;
+                            history.push(json!({
+                                "role": "user",
+                                "content": format!("Error from delegate_task: {}", msg)
+                            }));
+                        } else if delegations
+                            >= crate::agent::subagent::MAX_DELEGATIONS_PER_TASK
+                        {
+                            let msg = format!(
+                                "Delegation limit reached (max {} per task) — handle remaining work in the main loop.",
+                                crate::agent::subagent::MAX_DELEGATIONS_PER_TASK
+                            );
+                            let _ = tx.send(AgentEvent::Error { content: msg.clone() }).await;
+                            history.push(json!({
+                                "role": "user",
+                                "content": format!("Error from delegate_task: {}", msg)
+                            }));
+                        } else {
+                            delegations += 1;
+                            let _ = tx
+                                .send(AgentEvent::Action {
+                                    skill: skill.clone(),
+                                    args: args.clone(),
+                                    span_id: Some(action_span.clone()),
+                                    parent_span_id: None,
+                                    depth: Some(0),
+                                })
+                                .await;
+                            let result =
+                                crate::agent::subagent::run_subagent(&db, &skills, &task_id, &task)
+                                    .await;
+                            let body = match result.error {
+                                Some(e) => format!("Subagent failed: {e}"),
+                                None => result.report,
+                            };
+                            let _ = tx
+                                .send(AgentEvent::Observation {
+                                    content: body.clone(),
+                                    span_id: Some(new_span_id()),
+                                    parent_span_id: Some(action_span.clone()),
+                                    depth: Some(1),
+                                })
+                                .await;
+                            history.push(json!({
+                                "role": "user",
+                                "content": format!("Observation from delegate_task: {body}")
+                            }));
+                        }
+                        continue;
+                    }
                     if let Some((start, _, _, _)) = parallel_at.as_ref()
                         && pos == *start
                     {
@@ -1406,6 +1474,13 @@ fn plan_action_batch(
         return None;
     }
 
+    // Delegation never runs concurrently: a run containing `delegate_task`
+    // stays fully sequential so the child report folds back into history
+    // before the next action runs.
+    if run.iter().any(|(skill, _)| skill == crate::agent::subagent::DELEGATE_TOOL_NAME) {
+        return None;
+    }
+
     // Payment governance: never concurrent. Only the first payment action
     // runs (via today's proposal/Ask/park path); the rest are deferred.
     if let Some(rel) = run.iter().position(|(skill, _)| skill_requires_confirmation(skill)) {
@@ -1781,7 +1856,7 @@ fn skill_capabilities(skill: &str) -> Option<Capabilities> {
 /// x402 governance (allowlist, per-task cap, per-day cap, rate limit) is
 /// enforced autonomously inside `host_x402_pay()` in `wasm_runtime.rs` after
 /// the 402 response has been parsed — that path must not be duplicated here.
-fn skill_requires_confirmation(skill: &str) -> bool {
+pub(crate) fn skill_requires_confirmation(skill: &str) -> bool {
     skill_capabilities(skill)
         .map(|capabilities| capabilities.hedera_pay)
         .unwrap_or(false)
@@ -2413,6 +2488,22 @@ mod tests {
             !is_auto_above,
             "Amount above AUTO_UNDER threshold must require human confirmation"
         );
+    }
+
+    #[test]
+    fn delegation_action_never_plans_a_parallel_batch() {
+        let db = crate::db::Db::open_test().expect("in-memory db");
+        let parsed = vec![
+            AgentResponseKind::Action {
+                skill: crate::agent::subagent::DELEGATE_TOOL_NAME.to_string(),
+                args: json!({"task": "research foo"}),
+            },
+            AgentResponseKind::Action {
+                skill: "search.web".to_string(),
+                args: json!({}),
+            },
+        ];
+        assert!(plan_action_batch(&parsed, &db, &[]).is_none());
     }
 }
 

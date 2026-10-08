@@ -216,40 +216,6 @@ class ChatState {
     const { kind, ...data } = event;
 
     switch (kind) {
-      case 'token': {
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant' && last.streaming) {
-          last.content += data.content;
-          this.messages = this.messages;
-        } else {
-          this.messages = [...this.messages, { id: ++msgId, role: 'assistant', content: data.content, streaming: true }];
-        }
-        this.scrollBottom();
-        break;
-      }
-
-      case 'done': {
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
-          last.streaming = false;
-          this.messages = this.messages;
-          this.history = [...this.history, { role: 'assistant', content: last.content }];
-          this.persistEvent('assistant', last.content, 'text');
-        }
-        this.isThinking = false;
-        this.scrollBottom();
-        break;
-      }
-
-      case 'ask_self': {
-        this.messages = [...this.messages, { id: ++msgId, role: 'ask_self', content: data.content }];
-        this.history = [...this.history, { role: 'assistant', content: data.content }];
-        this.persistEvent('assistant', data.content, 'ask_self');
-        this.isThinking = false;
-        this.scrollBottom();
-        break;
-      }
-
       case 'daemon_started': {
         this.activeDaemonSkillType = data.skill_type;
         this.#currentGroupId = `dg_${Date.now()}_${++msgId}`;

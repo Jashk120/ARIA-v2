@@ -65,6 +65,11 @@ pub struct StoredToken {
     pub source: Option<String>,
     pub status: String,
     pub created_at: i64,
+    /// Hedera account id that funds/owns the token (required by the
+    /// daemon's payment-governance path for `token.create`).
+    pub treasury: Option<String>,
+    /// HTS token id returned by the daemon on success (e.g. `0.0.12345`).
+    pub token_id: Option<String>,
 }
 
 // ── Global DB connection (Mutex-protected single connection) ─────────────────
@@ -130,7 +135,9 @@ impl Database {
                 memo        TEXT,
                 source      TEXT,
                 status      TEXT NOT NULL DEFAULT 'draft',
-                created_at  INTEGER NOT NULL
+                created_at  INTEGER NOT NULL,
+                treasury    TEXT,
+                token_id    TEXT
             );
             ",
         )?;
@@ -155,6 +162,12 @@ impl Database {
                 "CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)",
                 [],
             )?;
+        }
+        if !column_exists(&conn, "tokens", "treasury")? {
+            conn.execute("ALTER TABLE tokens ADD COLUMN treasury TEXT", [])?;
+        }
+        if !column_exists(&conn, "tokens", "token_id")? {
+            conn.execute("ALTER TABLE tokens ADD COLUMN token_id TEXT", [])?;
         }
         Ok(())
     }
@@ -396,7 +409,7 @@ impl Database {
     pub fn list_tokens(&self) -> SqlResult<Vec<StoredToken>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, symbol, token_type, supply, decimals, memo, source, status, created_at
+            "SELECT id, name, symbol, token_type, supply, decimals, memo, source, status, created_at, treasury, token_id
              FROM tokens
              ORDER BY created_at DESC",
         )?;
@@ -413,6 +426,8 @@ impl Database {
                     source: row.get(7)?,
                     status: row.get(8)?,
                     created_at: row.get(9)?,
+                    treasury: row.get(10)?,
+                    token_id: row.get(11)?,
                 })
             })?
             .collect::<SqlResult<Vec<_>>>()?;
@@ -432,12 +447,14 @@ impl Database {
         memo: Option<&str>,
         source: Option<&str>,
         status: &str,
+        treasury: Option<&str>,
+        token_id: Option<&str>,
     ) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         let now = unix_now();
         conn.execute(
-            "INSERT INTO tokens (id, name, symbol, token_type, supply, decimals, memo, source, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO tokens (id, name, symbol, token_type, supply, decimals, memo, source, status, created_at, treasury, token_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 symbol = excluded.symbol,
@@ -446,8 +463,10 @@ impl Database {
                 decimals = excluded.decimals,
                 memo = excluded.memo,
                 source = excluded.source,
-                status = excluded.status",
-            params![id, name, symbol, token_type, supply, decimals, memo, source, status, now],
+                status = excluded.status,
+                treasury = excluded.treasury,
+                token_id = excluded.token_id",
+            params![id, name, symbol, token_type, supply, decimals, memo, source, status, now, treasury, token_id],
         )?;
         Ok(())
     }
@@ -475,5 +494,36 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> SqlResult<bool
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<SqlResult<Vec<_>>>()?;
     Ok(rows.iter().any(|name| name == column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_treasury_and_token_id_round_trip() {
+        let db = Database::open(PathBuf::from(":memory:")).expect("open in-memory db");
+        db.save_token(
+            "tok_test_1",
+            "TestToken",
+            "TTK",
+            "fungible",
+            "1000000",
+            2,
+            Some("test memo"),
+            Some("test source"),
+            "draft",
+            Some("0.0.12345"),
+            Some("0.0.99999"),
+        )
+        .expect("save token with treasury + token_id");
+        let rows = db.list_tokens().expect("list tokens");
+        let token = rows
+            .iter()
+            .find(|t| t.id == "tok_test_1")
+            .expect("saved token present");
+        assert_eq!(token.treasury.as_deref(), Some("0.0.12345"));
+        assert_eq!(token.token_id.as_deref(), Some("0.0.99999"));
+    }
 }
 

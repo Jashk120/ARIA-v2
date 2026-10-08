@@ -2891,8 +2891,13 @@ struct ResponsesStreamState {
     order: Vec<String>,
 }
 
-/// Key the in-progress function call: prefer the frame's own `item_id`, then
-/// the item's `call_id`/`id`, else the most recent call.
+/// Key the in-progress function call by its *item* id: the top-level `item_id`
+/// on delta frames, or the item's `id` on the added/done frames (the Responses
+/// API's `item_id` equals the item's `id`, NOT its `call_id`). Keying the
+/// `output_item.added` frame by `call_id` instead would split one function call
+/// into two entries (one named, one empty) — the empty one then poisons the
+/// next request with a nameless `function_call`. The OpenAI tool-call `id`
+/// reported back is set separately from the item's `call_id`.
 fn responses_call_key(
     frame: &serde_json::Value,
     state: &ResponsesStreamState,
@@ -2901,7 +2906,7 @@ fn responses_call_key(
         return Some(id.to_string());
     }
     if let Some(item) = frame.get("item") {
-        for field in ["call_id", "id"] {
+        for field in ["id", "call_id"] {
             if let Some(id) = item.get(field).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                 return Some(id.to_string());
             }
@@ -2932,7 +2937,15 @@ fn apply_responses_frame(
                 return None;
             }
             let entry = state.calls.entry(key.clone()).or_default();
-            entry.id = key.clone();
+            // OpenAI tool-call id is the item's `call_id` (what the model
+            // expects echoed back in `function_call_output`), not the item id
+            // used as the streaming key.
+            entry.id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| key.clone());
             if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                 entry.name = name.to_string();
             }
@@ -2972,7 +2985,12 @@ fn apply_responses_frame(
             }
             let entry = state.calls.entry(key.clone()).or_default();
             if entry.id.is_empty() {
-                entry.id = key.clone();
+                entry.id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| key.clone());
             }
             if entry.name.is_empty()
                 && let Some(name) = item.get("name").and_then(|v| v.as_str())

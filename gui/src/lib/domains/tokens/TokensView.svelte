@@ -21,7 +21,8 @@
     const name = formName.trim() || 'MyToken';
     const symbol = formSymbol.trim() || 'MTK';
     const isNft = formType === 'nft';
-    const decimals = isNft ? 0 : formDecimals;
+    const parsed = Number.parseInt(String(formDecimals), 10);
+    const decimals = isNft ? 0 : Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
     const supply = formSupply.trim() || (isNft ? '500' : '1000000');
     const memo = formMemo.trim() || `${name} token`;
     const typeExpr = isNft ? 'TokenType.NonFungibleUnique' : 'TokenType.FungibleCommon';
@@ -69,6 +70,7 @@ const tx = new TokenCreateTransaction()
     formSupply = '';
     formDecimals = 0;
     formMemo = '';
+    importedScript = null;
     saveError = '';
   }
 
@@ -99,6 +101,11 @@ const tx = new TokenCreateTransaction()
 
   async function saveToken() {
     if (!formName.trim() || !formSymbol.trim() || !formSupply.trim() || saving) return;
+    const d = Number.parseInt(String(formDecimals), 10);
+    if (formType !== 'nft' && (!Number.isInteger(d) || d < 0)) {
+      saveError = 'Decimals must be a non-negative integer.';
+      return;
+    }
     saving = true;
     saveError = '';
     try {
@@ -109,7 +116,7 @@ const tx = new TokenCreateTransaction()
         symbol: formSymbol.trim(),
         token_type: formType,
         supply: formSupply.trim(),
-        decimals: formType === 'nft' ? 0 : formDecimals,
+        decimals: formType === 'nft' ? 0 : d,
         memo: formMemo.trim(),
         source,
         status: selected?.status ?? 'draft'
@@ -139,11 +146,8 @@ const tx = new TokenCreateTransaction()
 
   /** @param {number} ts */
   function fmtDate(ts) {
-    try {
-      return new Date(ts * 1000).toLocaleDateString();
-    } catch {
-      return '';
-    }
+    const d = new Date(ts * 1000);
+    return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString();
   }
 </script>
 
@@ -181,11 +185,13 @@ const tx = new TokenCreateTransaction()
         <label>
           <span class="sr-label">Decimals</span>
           <input
-            type="text"
+            type="number"
             placeholder="Decimals"
             bind:value={formDecimals}
             aria-label="Decimals"
             inputmode="numeric"
+            min="0"
+            step="1"
             disabled={formType === 'nft'}
           />
         </label>
@@ -201,8 +207,8 @@ const tx = new TokenCreateTransaction()
 
     <section class="dash-section">
       <h2>HTS script preview</h2>
-      <section class="dash-section-sub">
-        <pre>{importedScript ?? preview}</pre>
+      <section class="dash-source-section">
+        <pre class="source-pre">{importedScript ?? preview}</pre>
       </section>
       {#if importedScript}
         <p class="dash-caps-note">IMPORTED FROM CHAT — NAME THE TOKEN ABOVE, THEN SAVE.</p>
@@ -232,6 +238,7 @@ const tx = new TokenCreateTransaction()
         <p class="dash-caps-note">LOADING TOKENS…</p>
       {:else if tokensState.error}
         <p class="dash-error">Failed to load tokens: {tokensState.error}</p>
+        <button onclick={() => tokensState.retry()}>↻ Retry</button>
       {:else if tokensState.items.length === 0}
         <p class="dash-caps-note">NO TOKENS YET — DEFINE ONE ABOVE TO GET STARTED.</p>
       {:else}
@@ -271,9 +278,9 @@ const tx = new TokenCreateTransaction()
         </table>
       {/if}
       {#if selected?.source}
-        <section class="dash-section-sub">
+        <section class="dash-source-section">
           <h3>Saved script — {selected.name}</h3>
-          <pre>{selected.source}</pre>
+          <pre class="source-pre">{selected.source}</pre>
         </section>
       {/if}
     </section>

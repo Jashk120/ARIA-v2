@@ -77,6 +77,10 @@ impl Database {
     /// Open (or create) the SQLite database at the given path and run migrations.
     pub fn open(path: PathBuf) -> SqlResult<Self> {
         let conn = Connection::open(path)?;
+        // SQLite does not enforce foreign keys by default. The `messages` table
+        // declares `ON DELETE CASCADE`, but without this pragma deleting a
+        // session left its messages orphaned forever. Enable it per connection.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Database {
             conn: Mutex::new(conn),
         };
@@ -183,6 +187,16 @@ impl Database {
     pub fn delete_session(&self, id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Rename a session (replaces the default "New Chat" title).
+    pub fn rename_session(&self, id: &str, title: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
         Ok(())
     }
 

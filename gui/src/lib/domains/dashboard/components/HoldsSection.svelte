@@ -1,6 +1,14 @@
 <script>
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { dashboardState } from '../dashboardState.svelte.js';
+
+  /**
+   * Daemon-shaped numbers may be missing; never let `.toFixed` throw in the template.
+   * @param {number | null | undefined} v
+   */
+  function fmtHbar(v) {
+    return Number(v ?? 0).toFixed(4);
+  }
 </script>
 
 <section class="dash-section">
@@ -21,12 +29,12 @@
         {#each dashboardState.dashboardHolds as hold (hold.payment_key)}
           <tr>
             <td>{hold.payment_key}</td>
-            <td>{hold.amount_hbar.toFixed(4)} ℏ</td>
+            <td>{fmtHbar(hold.amount_hbar)} ℏ</td>
             <td>{hold.timestamp}</td>
             <td>
               {#if dashboardState.holdPendingAction && dashboardState.holdPendingAction.payment_key === hold.payment_key}
                 <span class="hold-confirm">
-                  Confirm {dashboardState.holdPendingAction.action === 'approve' ? 'approval' : 'release'} of {hold.amount_hbar.toFixed(4)} ℏ?
+                  Confirm {dashboardState.holdPendingAction.action === 'approve' ? 'approval' : 'release'} of {fmtHbar(hold.amount_hbar)} ℏ?
                   <button onclick={() => dashboardState.confirmHoldAction()} disabled={dashboardState.holdActionInFlight}>
                     {dashboardState.holdActionInFlight ? 'Working…' : 'Confirm'}
                   </button>

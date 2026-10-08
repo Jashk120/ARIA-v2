@@ -109,7 +109,15 @@ class ChatState {
     const groupBlocks = new Map();
 
     for (const row of stored) {
-      const payload = row.payload_json ? JSON.parse(row.payload_json) : {};
+      /** @type {Record<string, any>} */
+      let payload = {};
+      if (row.payload_json) {
+        try {
+          payload = JSON.parse(row.payload_json);
+        } catch {
+          payload = {};
+        }
+      }
 
       if (row.group_id) {
         let block = groupBlocks.get(row.group_id);
@@ -207,6 +215,23 @@ class ChatState {
         await this.newSession();
       }
     }
+  }
+
+  /** @param {string} title */
+  async renameCurrentSession(title) {
+    if (!this.currentSession) return;
+    await tauriInvoke('rename_session', { session_id: this.currentSession, title }).catch(() => {});
+    await this.refreshSessions();
+  }
+
+  /**
+   * @param {string} text
+   */
+  maybeTitleSession(text) {
+    const session = this.sessions.find((s) => s.id === this.currentSession);
+    if (!session || session.title !== 'New Chat') return;
+    const title = text.length > 48 ? `${text.slice(0, 48).trimEnd()}…` : text;
+    this.renameCurrentSession(title);
   }
 
   // ── Event Handling ─────────────────────────────────────────────────────────
@@ -345,6 +370,7 @@ class ChatState {
     this.isThinking = true;
 
     this.persistEvent('user', trimmed, 'text');
+    this.maybeTitleSession(trimmed);
     this.scrollBottom();
 
     try {

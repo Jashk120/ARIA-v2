@@ -337,12 +337,9 @@ select:focus {
 .session-item {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.6rem;
   border-radius: var(--radius-sm);
   color: var(--text-dim);
   font-size: 0.83rem;
-  cursor: pointer;
 }
 
 .session-item:hover {
@@ -353,6 +350,27 @@ select:focus {
 .session-item.active {
   background: var(--bg-elevated);
   color: var(--text);
+}
+
+.session-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.6rem;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: inherit;
+  text-align: left;
+  border-radius: var(--radius-sm);
+}
+
+.session-open:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+  color: inherit;
 }
 
 .session-title {
@@ -377,6 +395,10 @@ select:focus {
 }
 
 .session-item:hover .session-del {
+  opacity: 1;
+}
+
+.session-item:focus-within .session-del {
   opacity: 1;
 }
 
@@ -1263,6 +1285,26 @@ select:focus {
   gap: 0.5rem;
 }
 
+.log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.45rem 0.7rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.log-type {
+  flex-shrink: 0;
+  min-width: 5rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
 /* ── Dashboard ────────────────────────────────────────────────────────── */
 
 .dashboard-panel {
@@ -1375,6 +1417,37 @@ select:focus {
   font-size: 0.78rem;
 }
 
+.dash-source-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1.1rem 1.3rem;
+  background: var(--bg-elevated);
+  margin-top: 1.2rem;
+}
+
+.dash-source-section h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.source-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--text-dim);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.9rem;
+  max-height: 24rem;
+  overflow: auto;
+}
+
 /* ── Dashboard holds — Approve/Release ──────────────────────────────────── */
 
 .hold-actions {
@@ -1454,15 +1527,30 @@ select:focus {
 }
 
 .settings-section-account,
-.settings-section-url {
+.settings-section-url,
+.settings-section-dlt {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 1.1rem 1.3rem;
   background: var(--bg-elevated);
 }
 
-.settings-section-account {
+.settings-section-account,
+.settings-section-dlt {
   margin-bottom: 1.6rem;
+}
+
+.settings-dlt-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.settings-dlt-toggle input {
+  cursor: pointer;
 }
 
 .settings-url {

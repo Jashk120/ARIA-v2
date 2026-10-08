@@ -53,8 +53,8 @@ class TokensState {
   error = $state(null);
 
   /** Load tokens; seed 2 samples on first run when the table is empty. */
-  async load() {
-    if (this.loaded) return;
+  async load(force = false) {
+    if (this.loaded && !force) return;
     this.error = null;
     try {
       let rows = /** @type {TokenItem[]} */ (await tauriInvoke('list_tokens'));
@@ -64,11 +64,15 @@ class TokensState {
       }
       this.items = rows;
       if (!this.selectedId && rows.length > 0) this.selectedId = rows[0].id;
+      this.loaded = true;
     } catch (e) {
       this.error = String(e);
-    } finally {
-      this.loaded = true;
     }
+  }
+
+  async retry() {
+    this.loaded = false;
+    await this.load();
   }
 
   async #seed() {

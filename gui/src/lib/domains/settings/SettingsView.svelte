@@ -24,9 +24,6 @@
     if (!settingsState.dltLoadedOnce) {
       settingsState.loadDltStatus();
     }
-    if (daemonState.online && !llmLoadedOnce && !llmLoading) {
-      loadLlmSettings();
-    }
   });
 
   function refreshAll() {
@@ -134,12 +131,23 @@
     llmSaveError = '';
   }
 
+  // Auto-load LLM settings once each time the daemon becomes reachable.
+  //
+  // A dedicated "attempt started" flag is used on purpose instead of keying the
+  // retry on `llmLoadedOnce`/`llmLoading`. The previous guard re-fired the effect
+  // whenever `llmLoading` toggled, so a *failed* load (llmLoadedOnce stays false,
+  // llmLoading flips true→false in `finally`) looped forever and froze the app.
+  let llmAutoLoadStarted = $state(false);
+
   $effect(() => {
-    if (daemonState.online && !llmLoadedOnce && !llmLoading) {
-      loadLlmSettings();
-    }
     if (!daemonState.online) {
+      llmAutoLoadStarted = false;
       llmLoadedOnce = false;
+      return;
+    }
+    if (!llmAutoLoadStarted) {
+      llmAutoLoadStarted = true;
+      loadLlmSettings();
     }
   });
 

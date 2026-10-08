@@ -48,7 +48,7 @@ class HistoryState {
       if (!topicId) throw new Error('Daemon did not return an audit_topic_id');
 
       const res = await fetch(
-        `https://testnet.mirrornode.hedera.com/api/v1/topics/${encodeURIComponent(topicId)}/messages?order=desc`
+        `https://testnet.mirrornode.hedera.com/api/v1/topics/${encodeURIComponent(topicId)}/messages?order=desc&limit=100`
       );
       if (!res.ok) throw new Error(`Mirror Node returned ${res.status}`);
       const body = await res.json();
@@ -66,11 +66,6 @@ class HistoryState {
     } finally {
       this.historyHcsLoading = false;
     }
-  }
-
-  async loadHistory() {
-    this.loadHistoryPayments();
-    this.loadHistoryHcs();
   }
 
   /** @param {Record<string, any>} payload */

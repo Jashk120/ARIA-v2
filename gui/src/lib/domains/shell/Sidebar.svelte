@@ -47,18 +47,17 @@
     <!-- Sessions list -->
     <div class="sessions-list">
       {#each chatState.sessions as sess (sess.id)}
-        <div
-          class="session-item"
-          class:active={sess.id === chatState.currentSession}
-          role="button"
-          tabindex="0"
-          onclick={() => chatState.openSession(sess.id)}
-          onkeydown={(e) => e.key === 'Enter' && chatState.openSession(sess.id)}
-        >
-          <span class="session-title">{sess.title}</span>
+        <div class="session-item" class:active={sess.id === chatState.currentSession}>
+          <button
+            class="session-open"
+            onclick={() => chatState.openSession(sess.id)}
+            title={sess.title}
+          >
+            <span class="session-title">{sess.title}</span>
+          </button>
           <button
             class="session-del"
-            onclick={(e) => { e.stopPropagation(); chatState.deleteSession(sess.id); }}
+            onclick={() => chatState.deleteSession(sess.id)}
             aria-label="Delete session"
           >✕</button>
         </div>

@@ -33,7 +33,6 @@ class DashboardState {
   async loadDashboard() {
     if (this.dashboardLoading) return;
     this.dashboardLoading = true;
-    this.dashboardLoadedOnce = true;
     /** @type {Record<string, string>} */
     const errors = {};
 
@@ -49,6 +48,7 @@ class DashboardState {
     this.dashboardAllowlist = /** @type {any} */ (allowlist)?.accounts ?? null;
     this.dashboardWallet = /** @type {any} */ (wallet);
     this.dashboardErrors = errors;
+    this.dashboardLoadedOnce = true;
     this.dashboardLoading = false;
   }
 

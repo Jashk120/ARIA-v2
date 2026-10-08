@@ -44,7 +44,7 @@
    * @param {string} txId
    */
   function copyToClipboard(txId) {
-    navigator.clipboard.writeText(txId).catch(() => {});
+    navigator.clipboard?.writeText(txId).catch(() => {});
   }
 </script>
 
@@ -73,29 +73,31 @@
       <ul class="trail-items">
         {#each historyState.historyPayments as p (p.transaction_id)}
           {@const isSelected = selectedPayment?.transaction_id === p.transaction_id}
-          <li
-            class="trail-item {isSelected ? 'trail-item-selected' : ''}"
-            role="button"
-            tabindex="0"
-            onclick={() => selectPayment(p)}
-            onkeydown={(e) => e.key === 'Enter' && selectPayment(p)}
-          >
-            <div class="trail-item-accent {statusClass(p.status)}"></div>
-            <div class="trail-item-body">
-              <div class="trail-item-top">
-                <span class="trail-item-type">{p.skill_called ?? 'payment'}</span>
-                <span class="trail-status-badge {statusClass(p.status)}">
-                  {p.status ?? 'unknown'}
-                </span>
+          <li>
+            <div
+              class="trail-item {isSelected ? 'trail-item-selected' : ''}"
+              role="button"
+              tabindex="0"
+              onclick={() => selectPayment(p)}
+              onkeydown={(e) => e.key === 'Enter' && selectPayment(p)}
+            >
+              <div class="trail-item-accent {statusClass(p.status)}"></div>
+              <div class="trail-item-body">
+                <div class="trail-item-top">
+                  <span class="trail-item-type">{p.skill_called ?? 'payment'}</span>
+                  <span class="trail-status-badge {statusClass(p.status)}">
+                    {p.status ?? 'unknown'}
+                  </span>
+                </div>
+                <div class="trail-item-txid">{p.transaction_id}</div>
+                <div class="trail-item-meta">
+                  <span class="trail-item-recipient" title={p.recipient}>{p.recipient}</span>
+                  <span class="trail-item-amount">{Number(p.amount_hbar ?? 0).toFixed(8)} ℏ</span>
+                  <span class="trail-item-ts">{formatTimestamp(p.timestamp)}</span>
+                </div>
               </div>
-              <div class="trail-item-txid">{p.transaction_id}</div>
-              <div class="trail-item-meta">
-                <span class="trail-item-recipient" title={p.recipient}>{p.recipient}</span>
-                <span class="trail-item-amount">{Number(p.amount_hbar ?? 0).toFixed(4)} ℏ</span>
-                <span class="trail-item-ts">{formatTimestamp(p.timestamp)}</span>
-              </div>
+              <div class="trail-item-arrow">{isSelected ? '▾' : '▸'}</div>
             </div>
-            <div class="trail-item-arrow">{isSelected ? '▾' : '▸'}</div>
           </li>
         {/each}
       </ul>

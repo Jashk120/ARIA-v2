@@ -5,9 +5,6 @@
    * @typedef {import('$lib/types/history.js').HcsRecordItem} HcsRecordItem
    */
 
-  /** @type {Set<number>} */
-  let expandedSeqs = $state(new Set());
-
   /** @type {boolean} */
   let showX402 = $state(true);
 
@@ -18,19 +15,6 @@
       return method !== 'x402.pay';
     })
   );
-
-  /**
-   * @param {number} seq
-   */
-  function toggleExpand(seq) {
-    const next = new Set(expandedSeqs);
-    if (next.has(seq)) {
-      next.delete(seq);
-    } else {
-      next.add(seq);
-    }
-    expandedSeqs = next;
-  }
 
   /** @type {HcsRecordItem | null} */
   let selectedHcs = $state(null);
@@ -120,28 +104,30 @@
       <ul class="trail-items">
         {#each filteredHcs as msg (msg.sequence_number)}
           {@const isSelected = selectedHcs?.sequence_number === msg.sequence_number}
-          <li
-            class="trail-item {isSelected ? 'trail-item-selected' : ''} {msg.decodeError ? 'trail-item-error' : ''}"
-            role="button"
-            tabindex="0"
-            onclick={() => !msg.decodeError && selectHcs(msg)}
-            onkeydown={(e) => e.key === 'Enter' && !msg.decodeError && selectHcs(msg)}
-          >
-            <div class="trail-item-accent hcs-accent {recordDecisionClass(msg.record)}"></div>
-            <div class="trail-item-body">
-              <div class="trail-item-top">
-                <span class="hcs-seq-badge">#{msg.sequence_number}</span>
-                {#if msg.decodeError}
-                  <span class="trail-status-badge trail-status-failed">decode error</span>
-                {:else if msg.record}
-                  <span class="hcs-summary-label">{recordSummary(msg.record)}</span>
-                {/if}
+          <li>
+            <div
+              class="trail-item {isSelected ? 'trail-item-selected' : ''} {msg.decodeError ? 'trail-item-error' : ''}"
+              role="button"
+              tabindex="0"
+              onclick={() => !msg.decodeError && selectHcs(msg)}
+              onkeydown={(e) => e.key === 'Enter' && !msg.decodeError && selectHcs(msg)}
+            >
+              <div class="trail-item-accent hcs-accent {recordDecisionClass(msg.record)}"></div>
+              <div class="trail-item-body">
+                <div class="trail-item-top">
+                  <span class="hcs-seq-badge">#{msg.sequence_number}</span>
+                  {#if msg.decodeError}
+                    <span class="trail-status-badge trail-status-failed">decode error</span>
+                  {:else if msg.record}
+                    <span class="hcs-summary-label">{recordSummary(msg.record)}</span>
+                  {/if}
+                </div>
+                <div class="trail-item-ts">{formatHcsTimestamp(msg.consensus_timestamp)}</div>
               </div>
-              <div class="trail-item-ts">{formatHcsTimestamp(msg.consensus_timestamp)}</div>
+              {#if !msg.decodeError}
+                <div class="trail-item-arrow">{isSelected ? '▾' : '▸'}</div>
+              {/if}
             </div>
-            {#if !msg.decodeError}
-              <div class="trail-item-arrow">{isSelected ? '▾' : '▸'}</div>
-            {/if}
           </li>
         {/each}
       </ul>

@@ -383,6 +383,19 @@ async fn delete_session(
         .map_err(|e| e.to_string())
 }
 
+/// Rename a session (replaces the default "New Chat" title).
+#[tauri::command]
+async fn rename_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    state
+        .db
+        .rename_session(&session_id, &title)
+        .map_err(|e| e.to_string())
+}
+
 /// List all GUI-local contract artifacts (newest first).
 #[tauri::command]
 async fn list_contracts(state: State<'_, AppState>) -> Result<Vec<StoredContract>, String> {
@@ -496,6 +509,7 @@ pub fn run() {
             clear_pending_confirmation,
             list_sessions,
             delete_session,
+            rename_session,
             list_contracts,
             save_contract,
             delete_contract,

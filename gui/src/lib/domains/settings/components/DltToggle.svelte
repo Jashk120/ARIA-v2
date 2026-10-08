@@ -1,5 +1,13 @@
 <script>
   import { settingsState } from '../settingsState.svelte.js';
+
+  // Local mirror of the daemon value so the checkbox is controlled. When a flip
+  // fails, `settingsState.dltEnabled` is unchanged and this effect re-asserts the
+  // authoritative value instead of leaving the checkbox showing the failed toggle.
+  let checked = $state(settingsState.dltEnabled ?? true);
+  $effect(() => {
+    checked = settingsState.dltEnabled ?? true;
+  });
 </script>
 
 <section class="dash-section settings-section-dlt">
@@ -19,7 +27,7 @@
     <label class="settings-dlt-toggle">
       <input
         type="checkbox"
-        checked={settingsState.dltEnabled ?? true}
+        bind:checked={checked}
         disabled={settingsState.dltMutating}
         onchange={(e) => settingsState.setDltEnabled(e.currentTarget.checked)}
         aria-label="Enable DLT skills"

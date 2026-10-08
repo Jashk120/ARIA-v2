@@ -6,6 +6,7 @@
 
   type QueueRow = {
     skill: string;
+    kind: string;
     requestedBy: string;
     stage: 'Draft' | 'Building' | 'Staged';
     log: string;
@@ -19,10 +20,10 @@
   };
 
   let queue = $state<QueueRow[]>([
-    { skill: 'summarize.pdf', requestedBy: 'operator', stage: 'Building', log: 'chunking pdf → embedding 128/240 pages…' },
-    { skill: 'translate.hcs', requestedBy: 'analyst', stage: 'Draft', log: 'drafting consensus prompt from template…' },
-    { skill: 'fetch.web', requestedBy: 'operator', stage: 'Building', log: 'crawling allowlisted docs → 42 pages indexed…' },
-    { skill: 'pay.x402', requestedBy: 'treasury', stage: 'Draft', log: 'scaffolding payment guardrails + caps check…' }
+    { skill: 'summarize.pdf', kind: 'Files', requestedBy: 'operator', stage: 'Building', log: 'chunking pdf → embedding 128/240 pages…' },
+    { skill: 'translate.hcs', kind: 'Web', requestedBy: 'analyst', stage: 'Draft', log: 'drafting consensus prompt from template…' },
+    { skill: 'fetch.web', kind: 'Web', requestedBy: 'operator', stage: 'Building', log: 'crawling allowlisted docs → 42 pages indexed…' },
+    { skill: 'pay.x402', kind: 'Payments', requestedBy: 'treasury', stage: 'Draft', log: 'scaffolding payment guardrails + caps check…' }
   ]);
 
   let staged = $state<StagedSkill[]>([
@@ -39,7 +40,8 @@
   function forgeSkill() {
     const name = skillName.trim();
     if (!name) return;
-    queue = [{ skill: name, requestedBy: 'operator', stage: 'Draft', log: 'queued locally — drafting skill scaffold…' }, ...queue];
+    if (queue.some((r) => r.skill === name) || staged.some((s) => s.skill === name)) return;
+    queue = [{ skill: name, kind: skillKind, requestedBy: 'operator', stage: 'Draft', log: 'queued locally — drafting skill scaffold…' }, ...queue];
     skillName = '';
   }
 
@@ -97,7 +99,7 @@
         <tbody>
           {#each queue as row (row.skill)}
             <tr>
-              <td>{row.skill}</td>
+              <td>{row.skill} <span class="trail-status-badge trail-status-unknown">{row.kind}</span></td>
               <td>{row.requestedBy}</td>
               <td><span class={stageBadgeClass(row.stage)}>{row.stage}</span></td>
               <td>{row.log}</td>

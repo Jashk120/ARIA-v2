@@ -57,6 +57,17 @@
     saveError = '';
   }
 
+  function cancelEdit() {
+    if (selected) syncForm(selected);
+    else {
+      formId = null;
+      formName = '';
+      formSource = '';
+      editing = false;
+      saveError = '';
+    }
+  }
+
   async function saveContract() {
     if (!formName.trim() || !formSource.trim() || saving) return;
     saving = true;
@@ -97,11 +108,8 @@
 
   /** @param {number} ts */
   function fmtDate(ts) {
-    try {
-      return new Date(ts * 1000).toLocaleDateString();
-    } catch {
-      return '';
-    }
+    const d = new Date(ts * 1000);
+    return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString();
   }
 </script>
 
@@ -117,9 +125,10 @@
         <p class="dash-caps-note">LOADING CONTRACTS…</p>
       {:else if contractsState.error}
         <p class="dash-error">Failed to load contracts: {contractsState.error}</p>
-      {:else if contractsState.items.length === 0 && !formSource}
+        <button onclick={() => contractsState.retry()}>↻ Retry</button>
+      {:else if contractsState.items.length === 0}
         <p class="dash-caps-note">NO CONTRACTS YET — CREATE ONE TO GET STARTED.</p>
-      {:else if contractsState.items.length > 0}
+      {:else}
         <table class="dash-table">
           <thead>
             <tr>
@@ -171,7 +180,7 @@
             <option value="hardhat">Hardhat</option>
           </select>
         </label>
-        <section class="dash-section-sub">
+        <section class="dash-source-section">
           <h3>Source</h3>
           {#if editing}
             <textarea
@@ -182,7 +191,7 @@
               spellcheck={false}
             ></textarea>
           {:else}
-            <pre>{formSource}</pre>
+            <pre class="source-pre">{formSource}</pre>
           {/if}
         </section>
         {#if selected}
@@ -201,6 +210,8 @@
             </button>
             {#if formId}
               <button onclick={() => selected && syncForm(selected)}>Cancel</button>
+            {:else}
+              <button onclick={cancelEdit}>Cancel</button>
             {/if}
           {:else}
             <button onclick={() => (editing = true)}>Edit</button>

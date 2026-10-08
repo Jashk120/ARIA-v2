@@ -13,6 +13,13 @@
       dashboardState.loadDashboard();
     }
   });
+
+  const hasAnyData = $derived(
+    dashboardState.dashboardBudget !== null ||
+      dashboardState.dashboardHolds !== null ||
+      dashboardState.dashboardAllowlist !== null ||
+      dashboardState.dashboardWallet !== null
+  );
 </script>
 
 <section class="chat-panel">
@@ -25,7 +32,7 @@
   <div class="dashboard-panel">
     {#if !daemonState.online}
       <p>Daemon offline. Start the daemon to load dashboard data.</p>
-    {:else if !dashboardState.dashboardLoadedOnce}
+    {:else if !dashboardState.dashboardLoadedOnce || (dashboardState.dashboardLoading && !hasAnyData)}
       <p>Loading…</p>
     {:else}
       <BudgetSection />

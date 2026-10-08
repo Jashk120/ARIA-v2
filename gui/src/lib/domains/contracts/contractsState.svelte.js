@@ -71,8 +71,8 @@ class ContractsState {
   error = $state(null);
 
   /** Load contracts; seed 2 samples on first run when the table is empty. */
-  async load() {
-    if (this.loaded) return;
+  async load(force = false) {
+    if (this.loaded && !force) return;
     this.error = null;
     try {
       let rows = /** @type {ContractItem[]} */ (
@@ -86,11 +86,16 @@ class ContractsState {
       }
       this.items = rows;
       if (!this.selectedId && rows.length > 0) this.selectedId = rows[0].id;
+      this.loaded = true;
     } catch (e) {
       this.error = String(e);
-    } finally {
-      this.loaded = true;
     }
+  }
+
+  /** Clear the loaded flag so the user can retry after a load failure. */
+  async retry() {
+    this.loaded = false;
+    await this.load();
   }
 
   async #seed() {

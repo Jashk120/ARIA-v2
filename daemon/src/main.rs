@@ -39,6 +39,14 @@ use crate::db::Db;
 use crate::identity::IdentityVault;
 use crate::skills::SkillManager;
 
+/// One prior conversation turn supplied by a client when starting a FRESH
+/// task. Only `role`/`content` are carried — tool traces stay daemon-side.
+#[derive(serde::Deserialize)]
+struct HistoryTurn {
+    role: String,
+    content: String,
+}
+
 #[derive(serde::Deserialize)]
 struct DaemonRequest {
     #[serde(default)]
@@ -48,6 +56,14 @@ struct DaemonRequest {
     /// If set and the task is awaiting confirmation, resume it with `task`
     /// treated as the human's yes/no reply instead of a new instruction.
     task_id: Option<String>,
+    /// Prior conversation turns (oldest first), each
+    /// `{"role": "user"|"assistant", "content": "..."}`. Used only when
+    /// starting a FRESH task, to seed the ReAct loop with real context so a
+    /// follow-up message isn't interpreted with no memory of what came
+    /// before. Ignored on the resume path — the parked task's own
+    /// `history_json` wins there.
+    #[serde(default)]
+    history: Vec<HistoryTurn>,
     /// Read-only daemon query, short-circuited before any task/ReAct-loop
     /// dispatch: "query_budget", "query_holds", "query_allowlist",
     /// "query_url_allowlist", "query_payment_history",
@@ -79,6 +95,44 @@ struct DaemonRequest {
     limit: Option<i64>,
     #[serde(default)]
     payload: Option<serde_json::Value>,
+}
+
+/// Build the ReAct loop's initial history from a client-supplied transcript.
+///
+/// Falls back to a single user message — the pre-continuity behaviour — when
+/// no history is sent (one-off callers such as the Direct/Tokens screens).
+/// The returned vec always ends with the current `task` as a `user` turn, so
+/// the model sees the live message exactly once even if the client's
+/// transcript is stale or omits it. Capped to the most recent
+/// `MAX_HISTORY_TURNS` turns to bound prompt cost.
+fn seed_conversation_history(turns: &[HistoryTurn], task: &str) -> Vec<serde_json::Value> {
+    const MAX_HISTORY_TURNS: usize = 40;
+
+    let mut out: Vec<serde_json::Value> = turns
+        .iter()
+        .filter(|t| matches!(t.role.as_str(), "user" | "assistant"))
+        .filter(|t| !t.content.trim().is_empty())
+        .map(|t| serde_json::json!({ "role": t.role, "content": t.content }))
+        .collect();
+
+    if out.len() > MAX_HISTORY_TURNS {
+        out.drain(0..out.len() - MAX_HISTORY_TURNS);
+    }
+
+    let task = task.trim();
+    let ends_with_task = out
+        .last()
+        .map(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content").and_then(|c| c.as_str()) == Some(task)
+        })
+        .unwrap_or(false);
+
+    if !ends_with_task && !task.is_empty() {
+        out.push(serde_json::json!({ "role": "user", "content": task }));
+    }
+
+    out
 }
 
 /// One row of `query_payment_history`'s response. `status`/`chain_verified`
@@ -1408,14 +1462,10 @@ async fn run_daemon() -> anyhow::Result<()> {
                                 return;
                             }
                         };
-                        (
-                            id,
-                            vec![serde_json::json!({
-                                "role": "user",
-                                "content": req.task.clone()
-                            })],
-                            None,
-                        )
+                        // Seed the loop with the client's transcript so a
+                        // follow-up message keeps its conversation context
+                        // instead of starting fresh with one sentence.
+                        (id, seed_conversation_history(&req.history, &req.task), None)
                     };
 
                     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -1726,5 +1776,64 @@ async fn main() -> anyhow::Result<()> {
                 .init();
             run_daemon().await
         }
+    }
+}
+
+#[cfg(test)]
+mod history_seed_tests {
+    use super::{seed_conversation_history, HistoryTurn};
+
+    fn turn(role: &str, content: &str) -> HistoryTurn {
+        HistoryTurn { role: role.to_string(), content: content.to_string() }
+    }
+
+    fn role_content(v: &serde_json::Value) -> (String, String) {
+        (
+            v.get("role").and_then(|r| r.as_str()).unwrap_or_default().to_string(),
+            v.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string(),
+        )
+    }
+
+    #[test]
+    fn empty_history_yields_single_user_message() {
+        let out = seed_conversation_history(&[], "hello");
+        assert_eq!(out.len(), 1);
+        assert_eq!(role_content(&out[0]), ("user".to_string(), "hello".to_string()));
+    }
+
+    #[test]
+    fn prior_turns_are_preserved_in_order_and_end_with_task() {
+        let turns = [turn("user", "my name is jayesh"), turn("assistant", "nice to meet you")];
+        let out = seed_conversation_history(&turns, "what is my name?");
+        assert_eq!(out.len(), 3);
+        assert_eq!(role_content(&out[0]), ("user".into(), "my name is jayesh".into()));
+        assert_eq!(role_content(&out[1]), ("assistant".into(), "nice to meet you".into()));
+        assert_eq!(role_content(&out[2]), ("user".into(), "what is my name?".into()));
+    }
+
+    #[test]
+    fn task_already_present_is_not_duplicated() {
+        let turns = [turn("user", "hi"), turn("assistant", "hello"), turn("user", "how are you?")];
+        let out = seed_conversation_history(&turns, "how are you?");
+        assert_eq!(out.len(), 3);
+        assert_eq!(role_content(out.last().unwrap()).0, "user");
+    }
+
+    #[test]
+    fn non_conversational_and_empty_turns_are_dropped() {
+        let turns = [turn("system", "ignore me"), turn("user", "   "), turn("assistant", "kept")];
+        let out = seed_conversation_history(&turns, "next");
+        assert_eq!(out.len(), 2);
+        assert_eq!(role_content(&out[0]), ("assistant".into(), "kept".into()));
+        assert_eq!(role_content(&out[1]), ("user".into(), "next".into()));
+    }
+
+    #[test]
+    fn history_is_capped_to_most_recent_turns() {
+        let turns: Vec<HistoryTurn> = (0..60).map(|i| turn("user", &format!("m{i}"))).collect();
+        let out = seed_conversation_history(&turns, "m59b");
+        assert_eq!(out.len(), 41);
+        assert_eq!(role_content(&out[0]), ("user".into(), "m20".into()));
+        assert_eq!(role_content(out.last().unwrap()), ("user".into(), "m59b".into()));
     }
 }

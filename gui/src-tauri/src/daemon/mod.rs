@@ -10,6 +10,15 @@ const BASE_RETRY_MS: u64 = 300;
 
 // ── Daemon Wire Types ─────────────────────────────────────────────────────────
 
+/// One prior conversation turn forwarded to the daemon when starting a
+/// fresh task, so the daemon can seed the ReAct loop with real context
+/// instead of only the latest user sentence.
+#[derive(Debug, Serialize)]
+pub struct HistoryTurn {
+    pub role: String,
+    pub content: String,
+}
+
 /// The JSON request we send to the daemon over TCP.
 #[derive(Debug, Serialize)]
 pub struct DaemonRequest {
@@ -17,6 +26,10 @@ pub struct DaemonRequest {
     #[serde(rename = "Type")]
     pub skill_type: String,
     pub task_id: Option<String>,
+    /// Prior turns, oldest first. Omitted entirely when empty so one-off
+    /// callers (Direct/Tokens screens) keep the original wire shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<HistoryTurn>>,
 }
 
 /// Every line the daemon sends back is a `DaemonEvent`.
@@ -356,6 +369,7 @@ pub fn submit_task<F>(
     task: &str,
     skill_type: &str,
     task_id: Option<String>,
+    history: Option<Vec<HistoryTurn>>,
     mut on_event: F,
 ) -> Result<(), String>
 where
@@ -368,6 +382,7 @@ where
         task: task.to_string(),
         skill_type: skill_type.to_string(),
         task_id,
+        history,
     };
 
     let request_json =

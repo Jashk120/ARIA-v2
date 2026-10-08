@@ -93,7 +93,7 @@ impl FrontendEvent {
 
 /// Process one user turn as a pure pass-through to the daemon.
 ///
-/// The GUI owns NO router LLM: the last user message from `history` goes
+/// The GUI owns NO router LLM: the latest user message from `history` goes
 /// straight to `run_daemon_task` (daemon `submit_task` over TCP) on a
 /// blocking thread, daemon events stream to the frontend via
 /// `forward_daemon_event`, and the daemon's terminal answer is delivered
@@ -101,6 +101,10 @@ impl FrontendEvent {
 /// `Error` on transport failure, otherwise a single `DaemonDone`.
 /// An `awaiting_confirmation` turn emits no `DaemonDone` — the confirmation
 /// card was already emitted and `resume_daemon_task` drives what happens next.
+///
+/// The prior transcript is forwarded alongside the latest message so the
+/// daemon can seed the loop with conversation context; without it every turn
+/// is a fresh, memoryless task.
 pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), String> {
     let task = history
         .iter()
@@ -119,6 +123,7 @@ pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), S
         return Ok(());
     }
 
+    let prior_turns = wire_history(&history);
     let skill_type = "fs".to_string();
 
     FrontendEvent::DaemonStarted {
@@ -130,9 +135,11 @@ pub async fn run_turn(app: AppHandle, history: Vec<ChatMessage>) -> Result<(), S
     // TcpStream is synchronous — run it in a blocking thread pool
     let app_daemon = app.clone();
     let (res, final_result, _daemon_gave_final_answer, awaiting_confirmation) =
-        tokio::task::spawn_blocking(move || run_daemon_task(app_daemon, task, skill_type, None))
-            .await
-            .map_err(|e| format!("Block thread error: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            run_daemon_task(app_daemon, task, skill_type, None, prior_turns)
+        })
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?;
 
     if let Err(e) = res {
         FrontendEvent::Error { message: e }.emit(&app);
@@ -169,7 +176,7 @@ pub async fn resume_daemon_task(
     let (res, final_result, _daemon_gave_final_answer, _awaiting_confirmation) = tokio::task::spawn_blocking({
         let app_daemon = app.clone();
         let task_id = task_id.clone();
-        move || run_daemon_task(app_daemon, reply, skill_type, Some(task_id))
+        move || run_daemon_task(app_daemon, reply, skill_type, Some(task_id), None)
     })
     .await
     .map_err(|e| format!("Block thread error: {e}"))?;
@@ -192,16 +199,47 @@ fn run_daemon_task(
     task: String,
     skill_type: String,
     task_id: Option<String>,
+    history: Option<Vec<daemon::HistoryTurn>>,
 ) -> (Result<(), String>, String, bool, bool) {
     let mut final_result = String::new();
     let mut is_terminal_answer = false;
     let mut is_awaiting_confirmation = false;
 
-    let res = daemon::submit_task(&task, &skill_type, task_id, |event| {
+    let res = daemon::submit_task(&task, &skill_type, task_id, history, |event| {
         forward_daemon_event(&app, event, &mut final_result, &mut is_terminal_answer, &mut is_awaiting_confirmation);
     });
 
     (res, final_result, is_terminal_answer, is_awaiting_confirmation)
+}
+
+/// Max prior turns forwarded to the daemon, bounding payload size and prompt
+/// cost. The daemon's request reader tolerates up to 1 MiB.
+const MAX_HISTORY_TURNS: usize = 40;
+
+/// Map the frontend transcript into wire turns, dropping non-user/assistant
+/// or empty lines, then keeping only the most recent `MAX_HISTORY_TURNS`.
+fn wire_history(history: &[ChatMessage]) -> Option<Vec<daemon::HistoryTurn>> {
+    let mut turns: Vec<daemon::HistoryTurn> = history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter_map(|m| {
+            let content = m.content.as_deref().unwrap_or("").trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(daemon::HistoryTurn {
+                    role: m.role.clone(),
+                    content: content.to_string(),
+                })
+            }
+        })
+        .collect();
+
+    if turns.len() > MAX_HISTORY_TURNS {
+        turns.drain(0..turns.len() - MAX_HISTORY_TURNS);
+    }
+
+    if turns.is_empty() { None } else { Some(turns) }
 }
 
 /// Forwards one daemon event to the frontend. `final_result` accumulates the
@@ -249,4 +287,42 @@ pub fn forward_daemon_event(
     }
 
     FrontendEvent::DaemonEvent { event_type: ev_type, payload: event.payload }.emit(app);
+}
+
+#[cfg(test)]
+mod wire_history_tests {
+    use super::{wire_history, ChatMessage, MAX_HISTORY_TURNS};
+
+    fn msg(role: &str, content: Option<&str>) -> ChatMessage {
+        ChatMessage { role: role.to_string(), content: content.map(str::to_string) }
+    }
+
+    #[test]
+    fn drops_non_conversational_and_empty() {
+        let hist = [msg("system", Some("x")), msg("user", Some("  ")), msg("assistant", Some("hi"))];
+        let out = wire_history(&hist).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "assistant");
+        assert_eq!(out[0].content, "hi");
+    }
+
+    #[test]
+    fn none_when_nothing_usable() {
+        assert!(wire_history(&[]).is_none());
+        assert!(wire_history(&[msg("user", None)]).is_none());
+    }
+
+    #[test]
+    fn caps_to_most_recent() {
+        let hist: Vec<ChatMessage> = (0..50).map(|i| msg("user", Some(&format!("m{i}")))).collect();
+        let out = wire_history(&hist).unwrap();
+        assert_eq!(out.len(), MAX_HISTORY_TURNS);
+        assert_eq!(out[0].content, "m10");
+    }
+
+    #[test]
+    fn trims_content() {
+        let out = wire_history(&[msg("user", Some("  hello  "))]).unwrap();
+        assert_eq!(out[0].content, "hello");
+    }
 }

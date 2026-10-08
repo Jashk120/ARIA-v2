@@ -10,13 +10,17 @@ To initiate a task, the GUI opens a TCP connection and sends a one-off JSON payl
 {
   "task": "String",
   "Type": "String (Optional)",
-  "images": ["String (Optional)"]
+  "images": ["String (Optional)"],
+  "task_id": "String (Optional)",
+  "history": [{ "role": "user | assistant", "content": "String" }]
 }
 ```
 
 - `task`: The user's prompt or instruction.
 - `Type`: Indicates the category or group of skills to inject into the daemon (e.g., `"fs"`, `"web"`, `"os"`). This restricts or focuses the daemon to a specific subset of tool capabilities.
 - `images`: Optional list of absolute local file paths (e.g. `"/abs/a.png"`) that the daemon reads itself and forwards to the LLM as vision parts. Paths only — not base64. If any path is missing, not a file, or larger than 10 MiB, the daemon replies with an `error` event naming the path, followed by `done`, without running the task. Omit the field when no images are needed.
+- `task_id` (optional): Resume a task previously paused on a human confirmation (`ask`). When present and the named task is in `awaiting_confirmation`, the daemon reloads that task's parked history and treats `task` as the human's reply. Otherwise a fresh task is started and this field is ignored.
+- `history` (optional): Prior conversation turns, oldest first, used only when starting a **fresh** task. The daemon seeds the ReAct loop's LLM context with these turns (capped to the most recent 40), so a follow-up message keeps its conversation context instead of starting from nothing. The daemon ensures the final turn is the current `task`, so it is safe to include the in-flight user message. Ignored on the `task_id` resume path. Omit or send `[]` for stateless one-off callers.
 
 **Example:**
 ```json

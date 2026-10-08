@@ -83,7 +83,7 @@ async fn send_direct_task(app: AppHandle, task: String, skill_type: String) -> R
 
     let app_events = app.clone();
     let result = tokio::task::spawn_blocking(move || {
-        daemon::submit_task(&task, &skill_type, None, |event| {
+        daemon::submit_task(&task, &skill_type, None, None, |event| {
             app_events
                 .emit(
                     "direct-daemon-event",
@@ -145,7 +145,7 @@ async fn send_token_task(
     let (daemon_res, final_result, awaiting) = tokio::task::spawn_blocking(move || {
         let mut final_result = String::new();
         let mut awaiting = false;
-        let res = daemon::submit_task(&task, &skill_type, task_id, |event| {
+        let res = daemon::submit_task(&task, &skill_type, task_id, None, |event| {
             if event.event_type == "ask" {
                 awaiting = true;
                 if let (Some(task_id), Some(content)) = (

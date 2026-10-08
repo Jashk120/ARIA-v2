@@ -77,6 +77,8 @@ struct DaemonRequest {
     /// For `query: "query_payment_history"`: max rows to return (default 50).
     #[serde(default)]
     limit: Option<i64>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
 }
 
 /// One row of `query_payment_history`'s response. `status`/`chain_verified`
@@ -189,6 +191,9 @@ enum QueryResponse {
     },
     QueryError {
         message: String,
+    },
+    Ok {
+        settings: serde_json::Value,
     },
 }
 
@@ -1007,9 +1012,69 @@ fn prompt_api_key(db: &Db) -> anyhow::Result<String> {
     }
 }
 
+fn llm_settings_value(db: &Db) -> anyhow::Result<serde_json::Value> {
+    let raw = |key: &str| -> anyhow::Result<String> { Ok(db.get_config(key)?.unwrap_or_default()) };
+    let provider = raw("llm_provider")?;
+    let url_template = raw("llm_url_template")?;
+    let token = raw("llm_token")?;
+    let url = raw("llm_url")?;
+    let model = raw("llm_model")?;
+    let api_key = raw("llm_api_key")?;
+    let resolved = crate::config::resolve_llm(db);
+    let providers: Vec<serde_json::Value> = crate::config::PROVIDER_PRESETS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "url": p.url,
+                "api_key_env": p.api_key_env,
+                "default_model": p.default_model,
+                "models": p.models,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "type": "llm_settings",
+        "provider": provider,
+        "url_template": url_template,
+        "token": token,
+        "url": url,
+        "model": model,
+        "api_key": api_key,
+        "resolved_url": resolved.url,
+        "resolved_model": resolved.model,
+        "providers": providers,
+    }))
+}
+
+fn apply_llm_mutation(db: &Db, payload: &Option<serde_json::Value>) -> anyhow::Result<()> {
+    let obj = match payload {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => anyhow::bail!("mutate_llm_settings payload must be an object"),
+    };
+    for (field, key) in [
+        ("provider", "llm_provider"),
+        ("url_template", "llm_url_template"),
+        ("token", "llm_token"),
+        ("url", "llm_url"),
+        ("model", "llm_model"),
+        ("api_key", "llm_api_key"),
+    ] {
+        if let Some(v) = obj.get(field) {
+            let value = match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            db.set_config(key, &value)?;
+        }
+    }
+    Ok(())
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
     let db = Arc::new(bootstrap_db()?);
-
     // One Hedera client, built once, shared by identity bootstrap, x402, and
     // direct transfers. Read from env first; prompt on a terminal if unset.
     let operator = build_hedera_client().or_else(prompt_hedera_credentials);
@@ -1037,10 +1102,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     let api_key = prompt_api_key(&db)?;
-    let llm_url = crate::config::llm_url();
-    let llm_model = crate::config::llm_model();
-    info!("LLM endpoint: {} model: {}", llm_url, llm_model);
-    let probe_base = llm_url
+    let resolved = crate::config::resolve_llm(&db);
+    info!("LLM endpoint: {} model: {}", resolved.url, resolved.model);
+    let probe_base = resolved
+        .url
         .trim_end_matches("/chat/completions")
         .trim_end_matches('/')
         .to_string();
@@ -1057,7 +1122,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "LLM probe {} unreachable: {} (daemon continues; tasks will try {} fallbacks)",
             probe_base,
             e,
-            crate::config::llm_candidates(&llm_url).len()
+            crate::config::llm_candidates(&resolved.url).len()
         ),
     }
     let runtime_cfg = RuntimeConfig::load(&db);
@@ -1199,6 +1264,12 @@ async fn run_daemon() -> anyhow::Result<()> {
                                 &agent_did,
                                 &db,
                             ),
+                            "mutate_llm_settings" => match apply_llm_mutation(&db, &req.payload)
+                                .and_then(|_| llm_settings_value(&db))
+                            {
+                                Ok(settings) => QueryResponse::Ok { settings },
+                                Err(e) => QueryResponse::QueryError { message: e.to_string() },
+                            },
                             "approve_hold" => {
                                 handle_approve_hold(
                                     req.payment_key.as_deref(),
@@ -1239,6 +1310,14 @@ async fn run_daemon() -> anyhow::Result<()> {
                     }
 
                     if let Some(query_kind) = req.query.as_deref() {
+                        if query_kind == "query_llm_settings" {
+                            let line = match llm_settings_value(&db) {
+                                Ok(v) => v.to_string(),
+                                Err(e) => serde_json::json!({"type": "query_error", "message": e.to_string()}).to_string(),
+                            };
+                            let _ = socket.write_all(format!("{}\n", line).as_bytes()).await;
+                            return;
+                        }
                         let agent_did = vault.did();
                         let response = handle_query(
                             query_kind,

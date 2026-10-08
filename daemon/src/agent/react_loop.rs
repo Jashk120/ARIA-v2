@@ -809,6 +809,18 @@ pub async fn run_react_loop(
             }
         }
 
+        // Greetings / small talk: a lone `ask_user` here is the model answering
+        // a "hi" with a clarifying question. Surface it as a plain Final reply
+        // instead of parking an interactive question card in the GUI.
+        if is_small_talk(&user_prompt)
+            && parsed.len() == 1
+            && matches!(parsed.first(), Some(AgentResponseKind::Ask(_)))
+        {
+            if let Some(AgentResponseKind::Ask(q)) = parsed.pop() {
+                parsed.push(AgentResponseKind::Final(q));
+            }
+        }
+
         let mut should_continue = true;
         let mut executed_tools = false;
 
@@ -2391,6 +2403,20 @@ mod tests {
     }
 
     #[test]
+    fn small_talk_is_detected_but_real_requests_are_not() {
+        assert!(is_small_talk("hi"));
+        assert!(is_small_talk("Hi!"));
+        assert!(is_small_talk("hey there"));
+        assert!(is_small_talk("thanks"));
+        assert!(is_small_talk("how are you"));
+        assert!(is_small_talk("good morning"));
+        assert!(!is_small_talk("read my resume"));
+        assert!(!is_small_talk("hey can you send 1 HBAR to 0.0.8812811"));
+        assert!(!is_small_talk("fetch http://127.0.0.1:3000/protected"));
+        assert!(!is_small_talk(""));
+    }
+
+    #[test]
     fn confirmation_decision_treats_modification_as_conversation() {
         assert_eq!(
             confirmation_decision("Can you make it 0.5 HBAR instead?"),
@@ -3411,6 +3437,39 @@ fn extract_payment_recipient_and_amount(
     } else {
         Err(format!("Skill {} is not a supported payment skill.", skill))
     }
+}
+
+/// True for greetings / thanks / trivial small talk — where a clarifying
+/// question (`ask_user`) is the wrong move and a direct reply is expected.
+pub(crate) fn is_small_talk(text: &str) -> bool {
+    let cleaned: String = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "hi", "hii", "hiya", "hello", "helo", "hey", "heyy", "yo", "sup", "thanks",
+        "thank you", "thx", "ty", "bye", "goodbye", "good morning", "good afternoon",
+        "good evening", "good night", "gm", "gn", "ok", "okay", "cool", "nice", "great",
+        "how are you",
+    ];
+    if PHRASES.contains(&cleaned) {
+        return true;
+    }
+    // Short messages that merely open with a greeting ("hi there", "hey bud").
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.len() <= 3 {
+        const OPENERS: &[&str] = &["hi", "hello", "hey", "yo", "sup", "thanks", "gm", "gn"];
+        if OPENERS.contains(&words[0]) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn is_question(text: &str) -> bool {

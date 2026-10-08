@@ -128,6 +128,23 @@ pub fn send_query(query: &str, limit: Option<i64>) -> Result<Value, String> {
     send_request(&DaemonQueryRequest { query, limit })
 }
 
+// ── LLM Settings Mutation ───────────────────────────────────────────────────
+//
+// Payload-style mutation: serializes `{"mutate": "<mutate>", "payload":
+// <payload>}` over the existing single-shot TCP request/response helper.
+// Named `DaemonPayloadMutateRequest` (not `DaemonMutateRequest`) to avoid
+// colliding with the allowlist `DaemonMutateRequest { mutate, action,
+// account }` above.
+#[derive(Debug, Serialize)]
+struct DaemonPayloadMutateRequest<'a> {
+    mutate: &'a str,
+    payload: Value,
+}
+
+pub fn send_mutate(mutate: &str, payload: Value) -> Result<Value, String> {
+    send_request(&DaemonPayloadMutateRequest { mutate, payload })
+}
+
 // ── Allowlist Mutation ────────────────────────────────────────────────────────
 
 /// The JSON request for the `mutate_allowlist` daemon endpoint. Distinct from

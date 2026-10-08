@@ -242,6 +242,20 @@ async fn mutate_dlt(action: String) -> Result<Value, String> {
         .map_err(|e| format!("Block thread error: {e}"))?
 }
 
+#[tauri::command]
+async fn get_llm_settings() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| daemon::send_query("query_llm_settings", None))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
+#[tauri::command]
+async fn set_llm_settings(settings: Value) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || daemon::send_mutate("mutate_llm_settings", settings))
+        .await
+        .map_err(|e| format!("Block thread error: {e}"))?
+}
+
 /// Ensure a session exists in the DB (idempotent – safe to call every load).
 #[tauri::command]
 async fn create_session(
@@ -401,6 +415,8 @@ pub fn run() {
             query_url_rate_status,
             query_dlt_status,
             mutate_dlt,
+            get_llm_settings,
+            set_llm_settings,
             agent::resume_daemon_task,
             create_session,
             save_message,

@@ -66,7 +66,7 @@ fn ask_tool_definition() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": ASK_TOOL_NAME,
-            "description": "Ask the user a clarifying question or request confirmation before proceeding, instead of guessing missing details or calling a skill with incomplete/uncertain arguments. Use this whenever the request is ambiguous or you're missing information you need (e.g. which file, which recipient, which of several matches). Do not use this for payments — payment skills already pause for confirmation on their own.",
+            "description": "Ask the user a clarifying question ONLY while you are already executing a task and genuinely need a specific missing detail to proceed (e.g. which file, which recipient, which of several matches). This is a mid-task tool: never call it during normal conversation, greetings, or small talk — reply directly to those instead. Do not use this for payments — payment skills already pause for confirmation on their own.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,8 +111,9 @@ pub fn system_prompt_with_dlt(
           
             "You are a tool-execution agent. Use the tools provided to fulfill the user's request. \
 If the request is ambiguous or you're missing information required to act safely and correctly, \
-call `{}` to ask the user instead of guessing. For greetings, thanks, small talk, or general \
-questions that need no tools, reply directly in plain text instead of asking a clarifying question. \
+call `{}` to ask the user instead of guessing. `{}` is a mid-task tool: use it ONLY while you are already \
+executing a task and need a specific missing detail to proceed — never during normal conversation, greetings, \
+or small talk, where you should reply directly in plain text. \
 If a tool call returns an error, do not immediately \
 retry with different arguments. First diagnose from the error message whether retrying could plausibly \
 help (e.g. a bad query) versus whether it's a systemic failure (e.g. connection, parsing, auth, timeout) \
@@ -128,7 +129,7 @@ You may call `delegate_task` to hand a self-contained multi-step sub-task to a f
 that returns a report; it cannot move money or ask the user, so keep payments in the main loop. \
 You may call up to 5 independent tools in a single turn (for example, reading several documents at \
 once) — they run concurrently and each result is labeled with its skill so you can attribute outcomes.{}",
-            ASK_TOOL_NAME, user_context
+            ASK_TOOL_NAME, ASK_TOOL_NAME, user_context
         );
     }
 

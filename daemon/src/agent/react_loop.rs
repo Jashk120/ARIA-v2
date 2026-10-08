@@ -809,12 +809,12 @@ pub async fn run_react_loop(
             }
         }
 
-        // Greetings / small talk: a lone `ask_user` here is the model answering
-        // a "hi" with a clarifying question. Surface it as a plain Final reply
-        // instead of parking an interactive question card in the GUI.
-        if is_small_talk(&user_prompt)
-            && parsed.len() == 1
+        // `ask_user` is a mid-task tool. A lone ask on a greeting/small-talk
+        // message, or before any tool has run in this task, is normal chat —
+        // surface it as a plain Final reply instead of parking an interaction card.
+        if parsed.len() == 1
             && matches!(parsed.first(), Some(AgentResponseKind::Ask(_)))
+            && (is_small_talk(&user_prompt) || !history_has_tool_activity(&history))
         {
             if let Some(AgentResponseKind::Ask(q)) = parsed.pop() {
                 parsed.push(AgentResponseKind::Final(q));
@@ -2417,6 +2417,17 @@ mod tests {
     }
 
     #[test]
+    fn mid_task_requires_prior_tool_activity() {
+        assert!(!history_has_tool_activity(&[json!({"role": "user", "content": "hi"})]));
+        assert!(history_has_tool_activity(&[
+            json!({"role": "assistant", "tool_calls": [{"id": "call_1"}]})
+        ]));
+        assert!(history_has_tool_activity(&[
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"})
+        ]));
+    }
+
+    #[test]
     fn confirmation_decision_treats_modification_as_conversation() {
         assert_eq!(
             confirmation_decision("Can you make it 0.5 HBAR instead?"),
@@ -3437,6 +3448,16 @@ fn extract_payment_recipient_and_amount(
     } else {
         Err(format!("Skill {} is not a supported payment skill.", skill))
     }
+}
+
+/// True once the current task has actually invoked a tool — an assistant
+/// `tool_calls` message or a `tool` result present in the loop history. Until
+/// then the model is not "mid-task", so a lone `ask_user` is really chat.
+fn history_has_tool_activity(history: &[serde_json::Value]) -> bool {
+    history.iter().any(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("tool")
+            || m.get("tool_calls").and_then(|t| t.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+    })
 }
 
 /// True for greetings / thanks / trivial small talk — where a clarifying

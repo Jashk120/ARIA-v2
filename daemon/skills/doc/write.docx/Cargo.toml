@@ -1,0 +1,15 @@
+[package]
+name = "write_docx"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Hand-rolled .docx writer: zip/deflate only (pure Rust, no C dependencies;
+# cross-compiles to wasm32-wasip1). Same zip approach read.fs uses for
+# parsing, in reverse — see read.fs Cargo.toml for the backend rationale.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

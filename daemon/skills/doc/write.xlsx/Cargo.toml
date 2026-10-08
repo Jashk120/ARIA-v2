@@ -1,0 +1,13 @@
+[package]
+name = "write_xlsx"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pure-Rust XLSX writer (no C dependencies; cross-compiles to wasm32-wasip1).
+rust_xlsxwriter = "0.64"

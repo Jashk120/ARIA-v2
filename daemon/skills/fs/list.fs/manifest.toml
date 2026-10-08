@@ -1,0 +1,41 @@
+name        = "list.fs"
+version     = "0.1.0"
+description = "List files and directories inside a given directory"
+
+triggers = []
+
+[display]
+action = "Listing {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string"}'
+output_schema = '{"path":"string","entries":[{"name":"string","is_dir":"bool","size":"number"}]}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Directory path to list files and subdirectories from"
+
+[react]
+max_steps = 3
+
+[config.fs_root]
+default = "~/"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

@@ -1,0 +1,32 @@
+name        = "allowance.set"
+version     = "0.1.0"
+description = "Approves a HIP-336 allowance from the operator account on the configured network (testnet by default): an HBAR allowance when asset is hbar, or an HTS fungible-token allowance when asset is a token id. The spender may then move up to the approved amount. Requires human confirmation."
+triggers = []
+
+[display]
+action = "Approving {amount} {asset} allowance for {spender}"
+
+[capabilities]
+hts = true
+
+[call]
+args_schema   = '{"asset":"<required — hbar or an HTS token id, e.g. 0.0.1234>","spender":"<required — Hedera AccountId allowed to spend>","amount":"<required — HBAR (human units) or human token units to approve>"}'
+output_schema = '{"transaction_id":"string","hashscan_url":"string","status":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.asset]
+type = "string"
+description = "Asset to approve: hbar for an HBAR allowance, or an HTS token id for a token allowance. Required."
+
+[call.parameters.properties.spender]
+type = "string"
+description = "The Hedera AccountId allowed to spend from the operator account. Required — this skill has no default spender."
+
+[call.parameters.properties.amount]
+type = "number"
+description = "Amount to approve: HBAR (human units) for hbar, human token units otherwise. Required — no default exists."
+
+[react]
+max_steps = 2

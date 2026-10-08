@@ -1,0 +1,54 @@
+name        = "read.fs"
+version     = "0.1.0"
+description = "Read and extract text from a file (txt, pdf, docx, xlsx/xls/ods, pptx) on the local filesystem"
+
+triggers = []
+
+[display]
+action = "Reading {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","line_range":[1,50],"max_bytes":1048576,"max_rows_per_sheet":500}'
+output_schema = '{"path":"string","format":"string","content":"string","total_lines":"number","truncated":"bool"}'
+
+[call.parameters]
+type = "object"
+required = ["path"]
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path of the file to read and extract text from (txt, pdf, docx, xlsx/xls/ods, pptx)"
+
+[call.parameters.properties.line_range]
+type = "array"
+description = "Optional 1-indexed [start, end] line range applied to the extracted text (e.g. [1, 50])"
+
+[call.parameters.properties.max_bytes]
+type = "integer"
+description = "Maximum raw bytes to read for plain-text files (default: 1048576)"
+
+[call.parameters.properties.max_rows_per_sheet]
+type = "integer"
+description = "Maximum rows rendered per sheet for spreadsheets (default: 500)"
+
+[react]
+max_steps = 3
+
+[config.fs_root]
+default = "~/"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

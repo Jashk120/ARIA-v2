@@ -1,0 +1,28 @@
+name        = "scrape.web"
+version     = "0.1.0"
+description = "Fetch and extract text content from a URL. If the URL requires payment (HTTP 402), returns {\"error\":\"payment_required:url=<url>\"} instead of page text — the agent should then call x402.pay with that URL to unlock the content."
+triggers = []
+
+[display]
+action = "Reading {url}"
+
+[capabilities]
+http = true
+
+[call]
+args_schema   = '{"url":"string","max_chars":4000}'
+output_schema = '{"url":"string","text":"string","chars":"number"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.url]
+type = "string"
+description = "Full URL of the web page to fetch and extract text from"
+
+[call.parameters.properties.max_chars]
+type = "integer"
+description = "Maximum number of characters to extract (default: 4000)"
+
+[react]
+max_steps = 5

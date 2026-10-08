@@ -1,0 +1,25 @@
+name        = "x402.pay"
+version     = "0.1.0"
+description = "Fetches and returns the unlocked content of a paywalled URL by paying automatically via Hedera x402. Use this ONLY as a fallback when a prior scrape.web attempt on the URL returned a payment_required error. Once this skill is called, it returns the page content in the 'data' field, so do not call scrape.web again.Also always send the transaction URL back to user"
+triggers = []
+
+[display]
+action = "Paying for \"{url}\""
+
+[capabilities]
+http = true
+x402_pay = true
+
+[call]
+args_schema   = '{"url":"<required — full URL of the paywalled or authenticated resource>"}'
+output_schema = '{"data":"object","transaction_id":"string","hashscan_url":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.url]
+type = "string"
+description = "The full URL of the resource to fetch or pay for. Required — this skill has no default target and will return an error if omitted."
+
+[react]
+max_steps = 2

@@ -1,0 +1,105 @@
+[workspace]
+members = [
+    ".",
+    "skills/web/search.web",
+    "skills/web/scrape.web",
+    "skills/fs/find.fs",
+    "skills/fs/list.fs",
+    "skills/fs/read.fs",
+    "skills/fs/write.fs",
+    "Extra/dlt/skills/pay/x402.pay",
+    "Extra/dlt/skills/pay/query.pay",
+    "Extra/dlt/skills/pay/transfer.pay",
+    "Extra/dlt/skills/query/chain.query",
+    "Extra/dlt/skills/create/token.create",
+    "Extra/dlt/skills/mint/token.mint",
+    "Extra/dlt/skills/set/allowance.set",
+    "skills/doc/write.pdf",
+    "skills/doc/write.xlsx",
+    "skills/doc/write.docx",
+    "skills/exec/run.exec",
+]
+
+[package]
+name = "aria-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "aria"
+path = "src/main.rs"
+
+
+[dependencies]
+futures-util = { version = "0.3", features = ["io"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WASM sandbox
+wasmtime-wasi = { version = "45.0.1" }
+wasmtime = { version = "45.0.1", features = ["async"] }
+
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Config (manifest.toml parsing)
+toml = "0.8"
+
+# Cross-platform paths (~/.aria/ on all OS)
+dirs = "5"
+
+# Cross-platform file watching (inotify on Linux, ReadDirectoryChangesW on Windows)
+notify = "6"
+
+# HTTP client (for LLM API calls from host functions)
+reqwest = { version = "0.x", features = ["json", "stream"] }
+
+# Cron scheduler
+tokio-cron-scheduler = "0.10"
+
+# Hashing (sha256 for WASM verification)
+sha2 = "0.10"
+hex = "0.4"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# PDF extraction (for read_pdf host function)
+pdf-extract = "0.7"
+
+# Crypto layer (Phase 2)
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+aes-gcm = "0.10"
+rand = "0.8"
+argon2 = "0.5"
+bs58 = "0.5"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+hiero-sdk = { version = "0.45.0", features = ["serde"] }
+dotenvy = "0.15"
+k256 = { version = "0.14.0", features = ["ecdsa"] }
+sha3 = "0.12.0"
+prost = "0.14.4"
+hiero-did-sdk = "0.1.3"
+hiero-did-registrar = "0.1.3"
+hiero-did-core = "0.1.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

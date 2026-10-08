@@ -1,0 +1,38 @@
+name        = "search.web"
+version     = "0.1.0"
+description = "Web search via SearXNG or Brave"
+triggers = []
+
+[display]
+action = "Searching the web for \"{query}\""
+
+[capabilities]
+http = true
+
+[call]
+args_schema   = '{"query":"string","max_results":5}'
+output_schema = '{"results":[{"title":"string","url":"string","snippet":"string"}],"source":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.query]
+type = "string"
+description = "Web search query string"
+
+[call.parameters.properties.max_results]
+type = "integer"
+description = "Maximum number of search results to return (default: 5)"
+
+[react]
+max_steps = 5
+
+[config.searxng_url]
+default = "http://10.8.0.1:8080"
+inject  = true
+secret  = false
+
+[config.brave_api_key]
+default = ""
+inject  = true
+secret  = true

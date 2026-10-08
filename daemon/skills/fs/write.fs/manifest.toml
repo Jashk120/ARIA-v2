@@ -1,0 +1,49 @@
+name        = "write.fs"
+version     = "0.1.0"
+description = "Write or overwrite a text file on the local filesystem"
+
+triggers = []
+
+[display]
+action = "Writing {path}"
+
+[capabilities]
+fs = true
+
+[call]
+args_schema   = '{"path":"string","content":"string","mode":"overwrite|append"}'
+output_schema = '{"path":"string","bytes_written":"number"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.path]
+type = "string"
+description = "Path to the text file to write on the local filesystem"
+
+[call.parameters.properties.content]
+type = "string"
+description = "The text content to write to the file"
+
+[call.parameters.properties.mode]
+type = "string"
+description = "Write mode: 'overwrite' to replace file content or 'append' to append (default: 'overwrite')"
+
+[react]
+max_steps = 1
+
+[config.fs_root]
+default = "~/aria-workspace"
+inject  = true
+
+[config.fs_mode]
+default = "whitelist"
+inject  = true
+
+[config.fs_allow]
+default = "*"
+inject  = true
+
+[config.fs_deny]
+default = ""
+inject  = true

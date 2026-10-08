@@ -1,0 +1,36 @@
+name        = "token.mint"
+version     = "0.1.0"
+description = "Mints additional supply of an existing HTS token into its treasury on the configured network (testnet by default): fungible amount (human units) when metadata is omitted, or one NFT with the given metadata otherwise. Requires human confirmation."
+triggers = []
+
+[display]
+action = "Minting {amount} of {token_id}"
+
+[capabilities]
+hts = true
+
+[call]
+args_schema   = '{"token_id":"<required — HTS token id, e.g. 0.0.1234>","recipient":"<required — Hedera AccountId the minted supply is intended for (treasury receives on-chain)>","amount":"<required — human token units to mint (fungible); ignored for NFT mints>","metadata":"<optional — NFT metadata as hex (optional 0x prefix), base64, or raw text. Omit for fungible>"}'
+output_schema = '{"transaction_id":"string","hashscan_url":"string","status":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.token_id]
+type = "string"
+description = "The HTS token id to mint, e.g. 0.0.1234. Required."
+
+[call.parameters.properties.recipient]
+type = "string"
+description = "The Hedera AccountId the minted supply is intended for. Minted supply lands in the token treasury on-chain. Required — this skill has no default recipient."
+
+[call.parameters.properties.amount]
+type = "number"
+description = "Human token units to mint (fungible). Ignored when metadata is provided (NFT mint). Required — no default exists."
+
+[call.parameters.properties.metadata]
+type = "string"
+description = "Optional NFT metadata: hex (optional 0x prefix), base64, or raw text. When provided, mints one NFT instead of fungible supply."
+
+[react]
+max_steps = 2

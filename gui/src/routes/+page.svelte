@@ -7,11 +7,12 @@
   import ModelsView from '$lib/domains/models/ModelsView.svelte';
   import ForgeView from '$lib/domains/forge/ForgeView.svelte';
   import SettingsView from '$lib/domains/settings/SettingsView.svelte';
+  import ContractsView from '$lib/domains/contracts/ContractsView.svelte';
+  import TokensView from '$lib/domains/tokens/TokensView.svelte';
   import { daemonState } from '$lib/services/daemonState.svelte.js';
   import { chatState } from '$lib/domains/chat/chatState.svelte.js';
+  import { navigationState } from '$lib/domains/shell/navigationState.svelte.js';
   import { onMount, onDestroy } from 'svelte';
-
-  let activeTab = $state('chat');
 
   onMount(() => {
     daemonState.init();
@@ -27,21 +28,25 @@
 <svelte:head><title>ARIA — AI Assistant</title></svelte:head>
 
 <main class="shell">
-  <Sidebar bind:activeTab />
+  <Sidebar bind:activeTab={navigationState.tab} />
 
-  {#if activeTab === 'chat'}
+  {#if navigationState.tab === 'chat'}
     <ChatView />
-  {:else if activeTab === 'direct'}
+  {:else if navigationState.tab === 'direct'}
     <DirectView />
-  {:else if activeTab === 'dashboard'}
+  {:else if navigationState.tab === 'dashboard'}
     <DashboardView />
-  {:else if activeTab === 'history'}
+  {:else if navigationState.tab === 'history'}
     <HistoryView />
-  {:else if activeTab === 'models'}
+  {:else if navigationState.tab === 'models'}
     <ModelsView />
-  {:else if activeTab === 'forge'}
+  {:else if navigationState.tab === 'forge'}
     <ForgeView />
-  {:else if activeTab === 'settings'}
+  {:else if navigationState.tab === 'contracts'}
+    <ContractsView />
+  {:else if navigationState.tab === 'tokens'}
+    <TokensView />
+  {:else if navigationState.tab === 'settings'}
     <SettingsView />
   {/if}
 </main>

@@ -3,7 +3,7 @@ mod daemon;
 mod db;
 mod llm;
 
-use db::{Database, PendingConfirmation, StoredMessage};
+use db::{Database, PendingConfirmation, StoredContract, StoredMessage, StoredToken};
 use llm::ChatMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -384,6 +384,76 @@ async fn delete_session(
         .map_err(|e| e.to_string())
 }
 
+/// List all GUI-local contract artifacts (newest first).
+#[tauri::command]
+async fn list_contracts(state: State<'_, AppState>) -> Result<Vec<StoredContract>, String> {
+    state.db.list_contracts().map_err(|e| e.to_string())
+}
+
+/// Insert or update a GUI-local contract artifact.
+#[tauri::command]
+async fn save_contract(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    source: String,
+    compiler: String,
+    status: String,
+) -> Result<(), String> {
+    state
+        .db
+        .save_contract(&id, &name, &source, &compiler, &status)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a GUI-local contract artifact.
+#[tauri::command]
+async fn delete_contract(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.db.delete_contract(&id).map_err(|e| e.to_string())
+}
+
+/// List all GUI-local token artifacts (newest first).
+#[tauri::command]
+async fn list_tokens(state: State<'_, AppState>) -> Result<Vec<StoredToken>, String> {
+    state.db.list_tokens().map_err(|e| e.to_string())
+}
+
+/// Insert or update a GUI-local token artifact.
+#[tauri::command]
+async fn save_token(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    symbol: String,
+    token_type: String,
+    supply: String,
+    decimals: i64,
+    memo: Option<String>,
+    source: Option<String>,
+    status: String,
+) -> Result<(), String> {
+    state
+        .db
+        .save_token(
+            &id,
+            &name,
+            &symbol,
+            &token_type,
+            &supply,
+            decimals,
+            memo.as_deref(),
+            source.as_deref(),
+            &status,
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a GUI-local token artifact.
+#[tauri::command]
+async fn delete_token(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.db.delete_token(&id).map_err(|e| e.to_string())
+}
+
 // ── App Entry Point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -426,7 +496,13 @@ pub fn run() {
             load_pending_confirmation,
             clear_pending_confirmation,
             list_sessions,
-            delete_session
+            delete_session,
+            list_contracts,
+            save_contract,
+            delete_contract,
+            list_tokens,
+            save_token,
+            delete_token
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARIA GUI");

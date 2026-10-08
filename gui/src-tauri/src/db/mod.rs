@@ -43,6 +43,30 @@ pub struct PendingConfirmation {
     pub skill_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredContract {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub compiler: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredToken {
+    pub id: String,
+    pub name: String,
+    pub symbol: String,
+    pub token_type: String,
+    pub supply: String,
+    pub decimals: i64,
+    pub memo: Option<String>,
+    pub source: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+}
+
 // ── Global DB connection (Mutex-protected single connection) ─────────────────
 
 pub struct Database {
@@ -82,6 +106,28 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+            CREATE TABLE IF NOT EXISTS contracts (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                compiler    TEXT NOT NULL DEFAULT 'foundry',
+                status      TEXT NOT NULL DEFAULT 'draft',
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tokens (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                symbol      TEXT NOT NULL,
+                token_type  TEXT NOT NULL DEFAULT 'fungible',
+                supply      TEXT NOT NULL,
+                decimals    INTEGER NOT NULL DEFAULT 0,
+                memo        TEXT,
+                source      TEXT,
+                status      TEXT NOT NULL DEFAULT 'draft',
+                created_at  INTEGER NOT NULL
+            );
             ",
         )?;
         if !column_exists(&conn, "sessions", "pending_confirmation")? {
@@ -256,6 +302,131 @@ impl Database {
             })?
             .collect::<SqlResult<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    // ── Contract Operations (GUI-local artifacts, no daemon involvement) ─────
+
+    /// List all contracts ordered by newest first.
+    pub fn list_contracts(&self) -> SqlResult<Vec<StoredContract>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, source, compiler, status, created_at
+             FROM contracts
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredContract {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    source: row.get(2)?,
+                    compiler: row.get(3)?,
+                    status: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or replace a contract row.
+    pub fn save_contract(
+        &self,
+        id: &str,
+        name: &str,
+        source: &str,
+        compiler: &str,
+        status: &str,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = unix_now();
+        conn.execute(
+            "INSERT INTO contracts (id, name, source, compiler, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                source = excluded.source,
+                compiler = excluded.compiler,
+                status = excluded.status",
+            params![id, name, source, compiler, status, now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a contract by id.
+    pub fn delete_contract(&self, id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM contracts WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ── Token Operations (GUI-local artifacts, no daemon involvement) ─────────
+
+    /// List all tokens ordered by newest first.
+    pub fn list_tokens(&self) -> SqlResult<Vec<StoredToken>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, symbol, token_type, supply, decimals, memo, source, status, created_at
+             FROM tokens
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredToken {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    symbol: row.get(2)?,
+                    token_type: row.get(3)?,
+                    supply: row.get(4)?,
+                    decimals: row.get(5)?,
+                    memo: row.get(6)?,
+                    source: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or replace a token row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_token(
+        &self,
+        id: &str,
+        name: &str,
+        symbol: &str,
+        token_type: &str,
+        supply: &str,
+        decimals: i64,
+        memo: Option<&str>,
+        source: Option<&str>,
+        status: &str,
+    ) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = unix_now();
+        conn.execute(
+            "INSERT INTO tokens (id, name, symbol, token_type, supply, decimals, memo, source, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                symbol = excluded.symbol,
+                token_type = excluded.token_type,
+                supply = excluded.supply,
+                decimals = excluded.decimals,
+                memo = excluded.memo,
+                source = excluded.source,
+                status = excluded.status",
+            params![id, name, symbol, token_type, supply, decimals, memo, source, status, now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a token by id.
+    pub fn delete_token(&self, id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM tokens WHERE id = ?1", params![id])?;
+        Ok(())
     }
 }
 

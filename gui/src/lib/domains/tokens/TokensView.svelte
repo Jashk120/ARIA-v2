@@ -1,7 +1,9 @@
 <script>
   import TopBar from '$lib/domains/shell/TopBar.svelte';
   import { tokensState } from './tokensState.svelte.js';
-  import { onMount } from 'svelte';
+  import { daemonState } from '$lib/services/daemonState.svelte.js';
+  import { tauriInvoke } from '$lib/services/tauri.js';
+  import { onMount, onDestroy } from 'svelte';
 
   let formId = $state(/** @type {string | null} */ (null));
   let formName = $state('');
@@ -10,11 +12,26 @@
   let formSupply = $state('');
   let formDecimals = $state(0);
   let formMemo = $state('');
+  let formTreasury = $state('');
   let saveError = $state('');
   let saving = $state(false);
+  let dltEnabled = $state(true);
 
   const selected = $derived(
     tokensState.items.find((t) => t.id === tokensState.selectedId) ?? null
+  );
+
+  const tokenizeBusy =
+    $derived(tokensState.tokenizeStatus === 'running' || tokensState.tokenizeStatus === 'awaiting');
+
+  const canTokenize = $derived(
+    daemonState.online &&
+      dltEnabled &&
+      !tokenizeBusy &&
+      !!formName.trim() &&
+      !!formSymbol.trim() &&
+      !!formSupply.trim() &&
+      !!formTreasury.trim()
   );
 
   const preview = $derived.by(() => {
@@ -37,7 +54,7 @@ const tx = new TokenCreateTransaction()
   .setInitialSupply(${isNft ? 0 : supply})
   .setSupplyType(TokenSupplyType.Finite)
   .setMaxSupply(${supply})
-  .setTreasuryAccountId("0.0.12345")
+  .setTreasuryAccountId(${JSON.stringify(formTreasury.trim() || '0.0.12345')})
   .setTokenMemo(${JSON.stringify(memo)});
 
 // const receipt = await (await tx.execute(client)).getReceipt(client);
@@ -46,6 +63,7 @@ const tx = new TokenCreateTransaction()
   });
 
   onMount(async () => {
+    await tokensState.init();
     resetForm();
     await tokensState.load();
     const draft = tokensState.consumeDraft();
@@ -57,7 +75,30 @@ const tx = new TokenCreateTransaction()
     } else if (selected) {
       syncForm(selected);
     }
+    // Best-effort treasury auto-fill from the daemon wallet (skip silently
+    // when the daemon is offline or has no Hedera keys).
+    if (daemonState.online && !formTreasury.trim()) {
+      try {
+        const wallet = /** @type {{ account_id?: string }} */ (
+          await tauriInvoke('dashboard_query', { query: 'query_wallet_balance' })
+        );
+        if (wallet?.account_id) formTreasury = wallet.account_id;
+      } catch {
+        // ignore — the user can type the treasury account by hand
+      }
+    }
+    // Best-effort DLT air-gap flag (default stays enabled on error).
+    try {
+      const dlt = /** @type {{ enabled?: boolean }} */ (
+        await tauriInvoke('dashboard_query', { query: 'query_dlt_status' })
+      );
+      if (typeof dlt?.enabled === 'boolean') dltEnabled = dlt.enabled;
+    } catch {
+      // ignore — assume DLT is enabled
+    }
   });
+
+  onDestroy(() => tokensState.destroy());
 
   /** Raw script imported from chat (shown instead of the generated preview). */
   let importedScript = $state(/** @type {string | null} */ (null));
@@ -70,11 +111,12 @@ const tx = new TokenCreateTransaction()
     formSupply = '';
     formDecimals = 0;
     formMemo = '';
+    formTreasury = '';
     importedScript = null;
     saveError = '';
   }
 
-  /** @param {{ id: string, name: string, symbol: string, token_type: string, supply: string, decimals: number, memo: string | null }} t */
+  /** @param {{ id: string, name: string, symbol: string, token_type: string, supply: string, decimals: number, memo: string | null, treasury?: string | null }} t */
   function syncForm(t) {
     formId = t.id;
     formName = t.name;
@@ -83,6 +125,7 @@ const tx = new TokenCreateTransaction()
     formSupply = t.supply;
     formDecimals = t.decimals;
     formMemo = t.memo ?? '';
+    formTreasury = t.treasury ?? '';
     importedScript = null;
     saveError = '';
   }
@@ -119,7 +162,9 @@ const tx = new TokenCreateTransaction()
         decimals: formType === 'nft' ? 0 : d,
         memo: formMemo.trim(),
         source,
-        status: selected?.status ?? 'draft'
+        status: selected?.status ?? 'draft',
+        treasury: formTreasury.trim(),
+        token_id: selected?.token_id ?? null
       });
       importedScript = null;
       const cur = tokensState.items.find((t) => t.id === tokensState.selectedId) ?? null;
@@ -129,6 +174,26 @@ const tx = new TokenCreateTransaction()
     } finally {
       saving = false;
     }
+  }
+
+  async function tokenizeToken() {
+    if (!canTokenize) return;
+    const d = Number.parseInt(String(formDecimals), 10);
+    // No form re-sync here: on success the done-event handler persists the
+    // token id + status and reloads the list; the selected row updates via
+    // the derived `selected` below.
+    await tokensState.tokenize({
+      id: formId ?? undefined,
+      name: formName.trim(),
+      symbol: formSymbol.trim(),
+      token_type: formType,
+      supply: formSupply.trim(),
+      decimals: formType === 'nft' ? 0 : Number.isInteger(d) && d >= 0 ? d : 0,
+      memo: formMemo.trim(),
+      treasury: formTreasury.trim(),
+      status: selected?.status ?? 'draft',
+      token_id: selected?.token_id ?? null
+    });
   }
 
   /** @param {string} id */
@@ -196,6 +261,15 @@ const tx = new TokenCreateTransaction()
           />
         </label>
         <label>
+          <span class="sr-label">Treasury</span>
+          <input
+            type="text"
+            placeholder="0.0.12345"
+            bind:value={formTreasury}
+            aria-label="Treasury account"
+          />
+        </label>
+        <label>
           <span class="sr-label">Memo</span>
           <input type="text" placeholder="Memo" bind:value={formMemo} aria-label="Memo" />
         </label>
@@ -224,12 +298,52 @@ const tx = new TokenCreateTransaction()
           {saving ? 'Saving…' : 'Save'}
         </button>
         <button
-          disabled
-          title="Tokenize is not wired to the daemon yet — coming soon."
-          aria-label="Tokenize (disabled: not wired to the daemon yet)"
-        >Tokenize</button>
+          onclick={tokenizeToken}
+          disabled={!canTokenize}
+          title={!daemonState.online
+            ? 'Daemon is offline.'
+            : !dltEnabled
+              ? 'DLT is disabled (air-gap mode). Enable it in Settings to tokenize.'
+              : 'Create this token on Hedera testnet via the daemon.'}
+          aria-label="Tokenize on Hedera testnet"
+        >{tokenizeBusy ? 'Tokenizing…' : 'Tokenize'}</button>
       </div>
-      <p class="hold-confirm">Tokenize is not wired to the daemon yet — coming soon.</p>
+      {#if tokensState.pendingConfirm}
+        <div class="hold-confirm-card" role="group" aria-label="Tokenize confirmation">
+          <pre class="hold-confirm-text">{tokensState.pendingConfirm.content}</pre>
+          <div class="confirmation-actions">
+            <button
+              onclick={() => tokensState.respondConfirm('yes')}
+              disabled={!daemonState.online}
+            >Yes</button>
+            <button
+              onclick={() => tokensState.respondConfirm('no')}
+              disabled={!daemonState.online}
+            >No</button>
+          </div>
+        </div>
+      {/if}
+      {#if tokensState.tokenizeStatus === 'running'}
+        <p class="dash-caps-note">TOKENIZING — WAITING ON THE DAEMON…</p>
+      {/if}
+      {#if tokensState.tokenizeStatus === 'error' && tokensState.tokenizeError}
+        <p class="dash-error">Tokenize failed: {tokensState.tokenizeError}</p>
+      {/if}
+      {#if tokensState.tokenizeStatus === 'done'}
+        <p class="dash-caps-note">
+          TOKENIZED{#if tokensState.createdTokenId} — TOKEN ID {tokensState.createdTokenId}{/if}.
+        </p>
+        {#if tokensState.tokenizeResult}
+          <pre class="source-pre">{tokensState.tokenizeResult}</pre>
+        {/if}
+      {/if}
+      {#if !dltEnabled}
+        <p class="hold-confirm">DLT is disabled (air-gap mode) — enable it in Settings to tokenize.</p>
+      {/if}
+      <p class="dash-caps-note">
+        TOKENIZE CREATES A REAL HTS TOKEN ON HEDERA TESTNET. THE TREASURY ACCOUNT MUST BE ON THE
+        PAYMENT ALLOWLIST (SETTINGS → ACCOUNT ALLOWLIST), AND DLT MUST BE ENABLED.
+      </p>
     </section>
 
     <section class="dash-section">
@@ -248,6 +362,8 @@ const tx = new TokenCreateTransaction()
               <th>Name</th>
               <th>Symbol</th>
               <th>Type</th>
+              <th>Treasury</th>
+              <th>Token ID</th>
               <th>Status</th>
               <th>Created</th>
               <th></th>
@@ -263,6 +379,8 @@ const tx = new TokenCreateTransaction()
                 </td>
                 <td>{t.symbol}</td>
                 <td>{t.token_type}</td>
+                <td>{t.treasury ?? ''}</td>
+                <td>{t.token_id ?? ''}</td>
                 <td><span class={tokensState.statusBadge(t.status)}>{t.status}</span></td>
                 <td>{fmtDate(t.created_at)}</td>
                 <td>
@@ -280,12 +398,16 @@ const tx = new TokenCreateTransaction()
       {#if selected?.source}
         <section class="dash-source-section">
           <h3>Saved script — {selected.name}</h3>
+          {#if selected.token_id}
+            <p class="dash-caps-note">TOKEN ID {selected.token_id}</p>
+          {/if}
+          {#if selected.treasury}
+            <p class="dash-caps-note">TREASURY {selected.treasury}</p>
+          {/if}
           <pre class="source-pre">{selected.source}</pre>
         </section>
       {/if}
     </section>
-
-    <p class="dash-caps-note">Preview — artifacts are stored locally in the GUI, not yet wired to the daemon.</p>
   </div>
 </section>
 
@@ -324,5 +446,17 @@ const tx = new TokenCreateTransaction()
 
   .row-del {
     opacity: 0.75;
+  }
+
+  .hold-confirm-card {
+    margin-top: 0.75rem;
+    border: 1px solid var(--border, #444);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+  }
+
+  .hold-confirm-text {
+    white-space: pre-wrap;
+    margin: 0 0 0.75rem 0;
   }
 </style>

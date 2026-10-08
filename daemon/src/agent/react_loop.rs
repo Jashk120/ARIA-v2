@@ -1938,12 +1938,21 @@ fn payment_confirmation_message(skill: &str, args: &serde_json::Value) -> String
 }
 
 fn direct_payment_details(skill: &str, args: &serde_json::Value) -> Vec<(String, String)> {
+    let token_id = args.get("token_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let amount_label = if token_id.is_empty() || token_id == "0.0.0" {
+        format!("{} HBAR", display_arg(args, "amount"))
+    } else {
+        format!("{} {}", display_arg(args, "amount"), token_id)
+    };
     let mut details = vec![
         ("Skill".to_string(), skill.to_string()),
         ("Recipient".to_string(), display_arg(args, "recipient")),
-        ("Amount".to_string(), format!("{} HBAR", display_arg(args, "amount"))),
+        ("Amount".to_string(), amount_label),
         ("Memo".to_string(), display_arg(args, "memo")),
     ];
+    if !token_id.is_empty() && token_id != "0.0.0" {
+        details.push(("Token".to_string(), token_id.to_string()));
+    }
     if let Some(network) = hedera_network() {
         details.push(("Network".to_string(), network));
     }

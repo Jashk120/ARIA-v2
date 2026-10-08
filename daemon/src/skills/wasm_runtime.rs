@@ -1627,7 +1627,9 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         "aria",
         "host_hedera_pay",
         |mut caller: Caller<'_, HostState>,
-         (recipient_ptr, recipient_len, amount_ptr, amount_len, memo_ptr, memo_len): (
+         (recipient_ptr, recipient_len, amount_ptr, amount_len, memo_ptr, memo_len, token_id_ptr, token_id_len): (
+            i32,
+            i32,
             i32,
             i32,
             i32,
@@ -1657,6 +1659,11 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                         return 0;
                     }
                 };
+                // Empty (or "0.0.0") = HBAR. Defaults to empty on an
+                // unreadable token pair so the HBAR path stays the fallback.
+                let token_id =
+                    read_wasm_str(&mut caller, token_id_ptr, token_id_len).unwrap_or_default();
+                let token_id = token_id.trim().to_string();
                 let amount: f64 = match amount_str.parse() {
                     Ok(a) => a,
                     Err(e) => {
@@ -1673,11 +1680,33 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                     }
                 };
 
-                let receipt = match vault.pay(&recipient, amount, &memo).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("[host_hedera_pay] payment failed: {}", e);
+                let receipt = if token_id.is_empty() || token_id == "0.0.0" {
+                    match vault.pay(&recipient, amount, &memo).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hedera_pay] payment failed: {}", e);
+                            return 0;
+                        }
+                    }
+                } else {
+                    // HTS path: `amount` is in HUMAN token units (e.g. 1.5
+                    // USDC); convert to base units via mirror-node decimals.
+                    let decimals = vault.token_decimals(&token_id).await.unwrap_or(0);
+                    let base_units =
+                        (amount * 10f64.powi(decimals as i32)).round() as i64;
+                    if base_units <= 0 {
+                        eprintln!(
+                            "[host_hedera_pay] token amount {} {} converts to {} base units",
+                            amount, token_id, base_units
+                        );
                         return 0;
+                    }
+                    match vault.pay_token(&token_id, &recipient, base_units, &memo).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hedera_pay] token payment failed: {}", e);
+                            return 0;
+                        }
                     }
                 };
 

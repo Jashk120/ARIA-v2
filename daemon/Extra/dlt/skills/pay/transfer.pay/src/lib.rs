@@ -13,6 +13,8 @@ unsafe extern "C" {
         amount_len: usize,
         memo_ptr: *const u8,
         memo_len: usize,
+        token_id_ptr: *const u8,
+        token_id_len: usize,
     ) -> u64;
 }
 
@@ -44,6 +46,8 @@ struct Input {
     amount: Option<f64>,
     #[serde(default)]
     memo: String,
+    #[serde(default)]
+    token_id: String,
 }
 
 fn execute(input: &str) -> Result<Value, String> {
@@ -64,23 +68,39 @@ fn execute(input: &str) -> Result<Value, String> {
             return Err("transfer.pay requires 'amount' to be a positive number.".to_string());
         }
         None => {
-            return Err("transfer.pay requires an 'amount' argument — no default amount \
-                exists. Provide the HBAR amount to send (e.g. 1.5)."
-                .to_string());
+            let unit = if args.token_id.trim().is_empty() || args.token_id.trim() == "0.0.0" {
+                "HBAR"
+            } else {
+                "human token units (e.g. 1.5 USDC)"
+            };
+            return Err(format!(
+                "transfer.pay requires an 'amount' argument — no default amount \
+                exists. Provide the {unit} amount to send (e.g. 1.5)."
+            ));
         }
     };
 
-    let paid = hedera_pay(&recipient, amount, &args.memo)?;
+    let paid = hedera_pay(&recipient, amount, &args.memo, args.token_id.trim())?;
     serde_json::from_str(&paid).map_err(|e| format!("Bad transfer response JSON: {}", e))
 }
 
-fn hedera_pay(recipient: &str, amount: f64, memo: &str) -> Result<String, String> {
+fn hedera_pay(recipient: &str, amount: f64, memo: &str, token_id: &str) -> Result<String, String> {
     let packed = unsafe {
         let r = recipient.as_bytes();
         let a = amount.to_string();
         let a = a.as_bytes();
         let m = memo.as_bytes();
-        host_hedera_pay(r.as_ptr(), r.len(), a.as_ptr(), a.len(), m.as_ptr(), m.len())
+        let t = token_id.as_bytes();
+        host_hedera_pay(
+            r.as_ptr(),
+            r.len(),
+            a.as_ptr(),
+            a.len(),
+            m.as_ptr(),
+            m.len(),
+            t.as_ptr(),
+            t.len(),
+        )
     };
     read_packed(packed)
 }

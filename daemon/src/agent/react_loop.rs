@@ -1858,7 +1858,7 @@ fn skill_capabilities(skill: &str) -> Option<Capabilities> {
 /// the 402 response has been parsed — that path must not be duplicated here.
 pub(crate) fn skill_requires_confirmation(skill: &str) -> bool {
     skill_capabilities(skill)
-        .map(|capabilities| capabilities.hedera_pay)
+        .map(|capabilities| capabilities.hedera_pay || capabilities.hts)
         .unwrap_or(false)
 }
 
@@ -1870,7 +1870,7 @@ pub(crate) fn skill_requires_confirmation(skill: &str) -> bool {
 /// from env/db on every call so the toggle applies without a restart.
 pub(crate) fn dlt_blocked_error(db: &crate::db::Db, skill: &str) -> Option<String> {
     let capabilities = skill_capabilities(skill).unwrap_or_default();
-    if !(capabilities.hedera_pay || capabilities.x402_pay) {
+    if !(capabilities.hedera_pay || capabilities.x402_pay || capabilities.hts) {
         return None;
     }
     if crate::config::dlt_enabled_live(db) {
@@ -1921,6 +1921,8 @@ fn payment_confirmation_message(skill: &str, args: &serde_json::Value) -> String
     let capabilities = skill_capabilities(skill).unwrap_or_default();
     let details = if capabilities.hedera_pay {
         direct_payment_details(skill, args)
+    } else if capabilities.hts {
+        hts_details(skill, args)
     } else if capabilities.x402_pay {
         x402_payment_details(skill, args)
     } else {
@@ -1962,10 +1964,43 @@ fn direct_payment_details(skill: &str, args: &serde_json::Value) -> Vec<(String,
     details
 }
 
+fn hts_details(skill: &str, args: &serde_json::Value) -> Vec<(String, String)> {
+    let mut details = vec![
+        ("Skill".to_string(), skill.to_string()),
+        (
+            "Name".to_string(),
+            first_present_arg(args, &["name", "token_id", "asset"])
+                .unwrap_or_else(|| "Not specified".to_string()),
+        ),
+        (
+            "Counterparty".to_string(),
+            first_present_arg(args, &["recipient", "treasury", "spender"])
+                .unwrap_or_else(|| "Not specified".to_string()),
+        ),
+        (
+            "Amount".to_string(),
+            first_present_arg(args, &["amount", "initial_supply", "max_supply", "supply"])
+                .unwrap_or_else(|| "Not specified".to_string()),
+        ),
+    ];
+    if let Some(network) = hedera_network() {
+        details.push(("Network".to_string(), network));
+    }
+    if let Some(payer) = hedera_payer() {
+        details.push(("Payer".to_string(), payer));
+    }
+    details
+}
+
 fn payment_proposal_error(skill: &str, args: &serde_json::Value) -> Option<String> {
     let capabilities = skill_capabilities(skill)?;
     if capabilities.hedera_pay {
         return direct_payment_proposal_error(skill, args);
+    }
+    if capabilities.hts
+        && let Err(reason) = extract_payment_recipient_and_amount(skill, args)
+    {
+        return Some(format!("Payment proposal for {} is invalid: {}.", skill, reason));
     }
     None
 }
@@ -2066,7 +2101,7 @@ fn payment_execution_context(skill: &str) -> serde_json::Value {
     let capabilities = skill_capabilities(skill).unwrap_or_default();
     let mut context = serde_json::Map::new();
 
-    if capabilities.hedera_pay || capabilities.x402_pay {
+    if capabilities.hedera_pay || capabilities.x402_pay || capabilities.hts {
         if let Some(network) = hedera_network() {
             context.insert("hedera_network".to_string(), json!(network));
         }
@@ -2413,6 +2448,61 @@ mod tests {
         assert!(payment_proposal_error("transfer.pay", &zero).is_some());
         assert!(payment_proposal_error("transfer.pay", &negative).is_some());
         assert!(payment_proposal_error("transfer.pay", &nonsense).is_some());
+    }
+
+    #[test]
+    fn hts_skills_require_human_confirmation() {
+        assert!(skill_requires_confirmation("token.create"));
+        assert!(skill_requires_confirmation("token.mint"));
+        assert!(skill_requires_confirmation("allowance.set"));
+    }
+
+    #[test]
+    fn hts_extract_recipient_and_amount_uses_counterparty_and_supply_keys() {
+        let create = json!({
+            "name": "Green Bond Token",
+            "symbol": "GBOND",
+            "amount": 1000.0,
+            "treasury": "0.0.1234",
+        });
+        assert_eq!(
+            extract_payment_recipient_and_amount("token.create", &create).unwrap(),
+            ("0.0.1234".to_string(), 1000.0)
+        );
+
+        let mint = json!({
+            "token_id": "0.0.9999",
+            "recipient": "0.0.1234",
+            "amount": 50.0,
+        });
+        assert_eq!(
+            extract_payment_recipient_and_amount("token.mint", &mint).unwrap(),
+            ("0.0.1234".to_string(), 50.0)
+        );
+
+        let approve = json!({
+            "asset": "hbar",
+            "spender": "0.0.5678",
+            "amount": 2.5,
+        });
+        assert_eq!(
+            extract_payment_recipient_and_amount("allowance.set", &approve).unwrap(),
+            ("0.0.5678".to_string(), 2.5)
+        );
+
+        let no_counterparty = json!({"name": "T", "symbol": "T", "amount": 10.0});
+        assert!(extract_payment_recipient_and_amount("token.create", &no_counterparty).is_err());
+        let no_amount = json!({"treasury": "0.0.1234"});
+        assert!(extract_payment_recipient_and_amount("token.create", &no_amount).is_err());
+        let zero = json!({"asset": "hbar", "spender": "0.0.5678", "amount": 0.0});
+        assert!(extract_payment_recipient_and_amount("allowance.set", &zero).is_err());
+
+        assert!(payment_proposal_error("allowance.set", &approve).is_none());
+        assert!(payment_proposal_error("allowance.set", &zero).is_some());
+
+        let confirmation = payment_confirmation_message("token.create", &create);
+        assert!(confirmation.contains("Counterparty"));
+        assert!(confirmation.contains("0.0.1234"));
     }
 
     #[test]
@@ -3306,6 +3396,18 @@ fn extract_payment_recipient_and_amount(
             return Err(format!("Payment proposal for {} is missing recipient account.", skill));
         }
         Ok((recipient, amount))
+    } else if capabilities.hts {
+        let counterparty = first_present_arg(args, &["recipient", "treasury", "spender"])
+            .filter(|s| !s.trim().is_empty() && s != "Not specified")
+            .ok_or_else(|| format!("Payment proposal for {} is missing counterparty.", skill))?;
+        let amount = ["amount", "initial_supply", "max_supply", "supply"]
+            .iter()
+            .find_map(|key| args.get(*key).and_then(json_number_as_f64))
+            .ok_or_else(|| format!("Payment proposal for {} is missing valid amount.", skill))?;
+        if amount <= 0.0 || !amount.is_finite() {
+            return Err(format!("Payment proposal for {} has non-positive amount.", skill));
+        }
+        Ok((counterparty, amount))
     } else {
         Err(format!("Skill {} is not a supported payment skill.", skill))
     }

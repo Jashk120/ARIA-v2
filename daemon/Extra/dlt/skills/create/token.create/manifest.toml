@@ -1,0 +1,48 @@
+name        = "token.create"
+version     = "0.1.0"
+description = "Creates an HTS token on the configured network (testnet by default): a fungible token (RWA tokenization, mintable supply) when token_type is fungible, or an NFT collection when token_type is nft. Treasury defaults to the operator account. Requires human confirmation."
+triggers = []
+
+[display]
+action = "Creating token {name} ({symbol})"
+
+[capabilities]
+hts = true
+
+[call]
+args_schema   = '{"name":"<required — token name, e.g. Green Bond Token>","symbol":"<required — token symbol, e.g. GBOND>","token_type":"<optional — fungible (default) or nft>","decimals":"<optional — decimals for fungible, defaults to 0>","amount":"<required — initial supply for fungible (human units), max supply for nft>","treasury":"<optional — Hedera AccountId treasury, defaults to the operator>","memo":"<optional — token memo, defaults to empty>"}'
+output_schema = '{"token_id":"string","transaction_id":"string","hashscan_url":"string","status":"string"}'
+
+[call.parameters]
+type = "object"
+
+[call.parameters.properties.name]
+type = "string"
+description = "Token name, e.g. Green Bond Token. Required."
+
+[call.parameters.properties.symbol]
+type = "string"
+description = "Token symbol, e.g. GBOND. Required."
+
+[call.parameters.properties.token_type]
+type = "string"
+description = "Token type: fungible (default) or nft."
+
+[call.parameters.properties.decimals]
+type = "integer"
+description = "Decimals for a fungible token. Defaults to 0; ignored for nft."
+
+[call.parameters.properties.amount]
+type = "number"
+description = "Initial supply (human units) for fungible, max supply for nft. Required — no default exists."
+
+[call.parameters.properties.treasury]
+type = "string"
+description = "Hedera AccountId to use as treasury. Defaults to the operator account."
+
+[call.parameters.properties.memo]
+type = "string"
+description = "Optional memo to attach to the token."
+
+[react]
+max_steps = 2

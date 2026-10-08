@@ -49,6 +49,8 @@ pub struct Capabilities {
     #[serde(default)]
     pub x402_pay: bool,
     #[serde(default)]
+    pub hts: bool,
+    #[serde(default)]
     pub exec: bool,
 }
 

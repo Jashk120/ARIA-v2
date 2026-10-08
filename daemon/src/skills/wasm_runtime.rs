@@ -73,7 +73,10 @@ pub async fn run_wasm_instance_async(
     // treats the flag as enabled — fail-open ONLY for lack of a store, to
     // preserve current behavior on those paths; every real daemon path
     // always passes a db, so enforcement applies there.
-    if manifest.capabilities.hedera_pay || manifest.capabilities.x402_pay {
+    if manifest.capabilities.hedera_pay
+        || manifest.capabilities.x402_pay
+        || manifest.capabilities.hts
+    {
         let enabled = match db.as_deref() {
             Some(db) => crate::config::dlt_enabled_live(db),
             None => true,
@@ -130,6 +133,9 @@ pub async fn run_wasm_instance_async(
     }
     if manifest.capabilities.x402_pay {
         wire_x402_pay(&mut linker)?;
+    }
+    if manifest.capabilities.hts {
+        wire_hts(&mut linker)?;
     }
 
     linker.func_wrap("aria", "host_free", |_: Caller<'_, HostState>, _ptr: i32| {
@@ -1743,4 +1749,372 @@ fn wire_hedera_pay(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
         },
     )?;
     Ok(())
+}
+
+// ── HTS capability (HIP-336 allowances + RWA tokenization) ───────────────────
+//
+// Three host functions, all following the `host_hedera_pay` contract: string
+// args in, packed JSON bytes out, bare 0 on any error (the guest surfaces
+// "host call failed" from that). Gated on `capabilities.hts` via `wire_hts`;
+// human-confirmation + air-gap enforcement live in `react_loop.rs` and the
+// air-gap check at the top of `run_wasm_instance_async`, not here.
+fn wire_hts(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
+    // host_hts_create(name, symbol, token_type, decimals, supply, treasury, memo)
+    //   -> packed JSON {token_id, transaction_id, hashscan_url, status}
+    // `token_type`: "fungible" (default) or "nft". `supply` is human units
+    // (initial supply for fungible, max supply for nft). `treasury` defaults
+    // to the operator when empty.
+    linker.func_wrap_async(
+        "aria",
+        "host_hts_create",
+        |mut caller: Caller<'_, HostState>,
+         (name_ptr, name_len, symbol_ptr, symbol_len, type_ptr, type_len, decimals_ptr, decimals_len, supply_ptr, supply_len, treasury_ptr, treasury_len, memo_ptr, memo_len): (
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
+        )| {
+            Box::new(async move {
+                let name = match read_wasm_str(&mut caller, name_ptr, name_len) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("[host_hts_create] bad name: {}", e);
+                        return 0;
+                    }
+                };
+                let symbol = match read_wasm_str(&mut caller, symbol_ptr, symbol_len) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("[host_hts_create] bad symbol: {}", e);
+                        return 0;
+                    }
+                };
+                if name.is_empty() || symbol.is_empty() {
+                    eprintln!("[host_hts_create] name and symbol are required");
+                    return 0;
+                }
+                let token_type =
+                    read_wasm_str(&mut caller, type_ptr, type_len).unwrap_or_default();
+                let decimals_str =
+                    read_wasm_str(&mut caller, decimals_ptr, decimals_len).unwrap_or_default();
+                let supply_str = match read_wasm_str(&mut caller, supply_ptr, supply_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_hts_create] bad supply: {}", e);
+                        return 0;
+                    }
+                };
+                let treasury_str =
+                    read_wasm_str(&mut caller, treasury_ptr, treasury_len).unwrap_or_default();
+                let memo = read_wasm_str(&mut caller, memo_ptr, memo_len).unwrap_or_default();
+
+                let decimals: u32 = decimals_str.trim().parse().unwrap_or(0);
+                let supply: f64 = match supply_str.trim().parse() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_hts_create] bad supply format: {}", e);
+                        return 0;
+                    }
+                };
+                if !supply.is_finite() || supply < 0.0 {
+                    eprintln!("[host_hts_create] supply must be a non-negative number");
+                    return 0;
+                }
+
+                let vault = match caller.data().payment_vault.clone() {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("[host_hts_create] hts capability not enabled");
+                        return 0;
+                    }
+                };
+                let operator_key =
+                    caller.data().x402_vault.as_ref().map(|v| v.operator_key());
+                let client = vault.client();
+                let operator = vault.account_id();
+                let treasury = if treasury_str.trim().is_empty() {
+                    operator
+                } else {
+                    match treasury_str.trim().parse() {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!("[host_hts_create] bad treasury: {}", e);
+                            return 0;
+                        }
+                    }
+                };
+
+                let is_nft = token_type.trim().eq_ignore_ascii_case("nft");
+                let result = if is_nft {
+                    let max_supply = supply.round() as u64;
+                    match operator_key {
+                        Some(key) => {
+                            crate::payments::hts::create_nft(
+                                &client, operator, &key, &name, &symbol, max_supply,
+                                treasury, memo.trim(),
+                            )
+                            .await
+                        }
+                        None => {
+                            eprintln!(
+                                "[host_hts_create] operator key unavailable — \
+                                 cannot set supply/admin keys for NFT create"
+                            );
+                            return 0;
+                        }
+                    }
+                } else {
+                    let base_units = (supply * 10f64.powi(decimals as i32)).round() as u64;
+                    match operator_key {
+                        Some(key) => {
+                            crate::payments::hts::create_fungible_token(
+                                &client, operator, &key, &name, &symbol, decimals,
+                                base_units, treasury, memo.trim(),
+                            )
+                            .await
+                        }
+                        None => {
+                            eprintln!(
+                                "[host_hts_create] operator key unavailable — \
+                                 cannot set supply/admin keys for token create"
+                            );
+                            return 0;
+                        }
+                    }
+                };
+
+                let (token_id, receipt) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[host_hts_create] token create failed: {}", e);
+                        return 0;
+                    }
+                };
+                let bytes = serde_json::to_vec(&json!({
+                    "token_id": token_id,
+                    "transaction_id": receipt.transaction_id,
+                    "hashscan_url": receipt.hashscan_url,
+                    "status": receipt.status,
+                }))
+                .unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+
+    // host_hts_mint(token_id, amount, metadata) -> packed JSON
+    //   {transaction_id, hashscan_url, status}
+    // Empty `metadata` = fungible mint of `amount` human units (converted via
+    // mirror-node decimals, same as host_hedera_pay). Non-empty `metadata` =
+    // NFT mint; hex (optional 0x prefix) or base64 decoded, raw bytes fallback.
+    linker.func_wrap_async(
+        "aria",
+        "host_hts_mint",
+        |mut caller: Caller<'_, HostState>,
+         (token_ptr, token_len, amount_ptr, amount_len, meta_ptr, meta_len): (
+            i32, i32, i32, i32, i32, i32,
+        )| {
+            Box::new(async move {
+                let token_id = match read_wasm_str(&mut caller, token_ptr, token_len) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("[host_hts_mint] bad token_id: {}", e);
+                        return 0;
+                    }
+                };
+                if token_id.is_empty() {
+                    eprintln!("[host_hts_mint] token_id is required");
+                    return 0;
+                }
+                let amount_str = match read_wasm_str(&mut caller, amount_ptr, amount_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_hts_mint] bad amount: {}", e);
+                        return 0;
+                    }
+                };
+                let metadata_str =
+                    read_wasm_str(&mut caller, meta_ptr, meta_len).unwrap_or_default();
+
+                let vault = match caller.data().payment_vault.clone() {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("[host_hts_mint] hts capability not enabled");
+                        return 0;
+                    }
+                };
+                let client = vault.client();
+
+                let receipt = if metadata_str.trim().is_empty() {
+                    let amount: f64 = match amount_str.trim().parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("[host_hts_mint] bad amount format: {}", e);
+                            return 0;
+                        }
+                    };
+                    if !amount.is_finite() || amount <= 0.0 {
+                        eprintln!("[host_hts_mint] amount must be a positive number");
+                        return 0;
+                    }
+                    let decimals = vault.token_decimals(&token_id).await.unwrap_or(0);
+                    let base_units = (amount * 10f64.powi(decimals as i32)).round() as u64;
+                    if base_units == 0 {
+                        eprintln!("[host_hts_mint] amount converts to 0 base units");
+                        return 0;
+                    }
+                    match crate::payments::hts::mint_fungible(&client, &token_id, base_units)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hts_mint] mint failed: {}", e);
+                            return 0;
+                        }
+                    }
+                } else {
+                    let bytes = decode_metadata(metadata_str.trim());
+                    match crate::payments::hts::mint_nft(&client, &token_id, bytes).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hts_mint] NFT mint failed: {}", e);
+                            return 0;
+                        }
+                    }
+                };
+
+                let bytes = serde_json::to_vec(&json!({
+                    "transaction_id": receipt.transaction_id,
+                    "hashscan_url": receipt.hashscan_url,
+                    "status": receipt.status,
+                }))
+                .unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+
+    // host_hts_approve(asset, spender, amount) -> packed JSON
+    //   {transaction_id, hashscan_url, status}
+    // `asset` "hbar"/"0.0.0"/empty = HBAR allowance (`amount` human HBAR ->
+    // tinybars); otherwise an HTS token id (`amount` human units -> base units
+    // via mirror-node decimals).
+    linker.func_wrap_async(
+        "aria",
+        "host_hts_approve",
+        |mut caller: Caller<'_, HostState>,
+         (asset_ptr, asset_len, spender_ptr, spender_len, amount_ptr, amount_len): (
+            i32, i32, i32, i32, i32, i32,
+        )| {
+            Box::new(async move {
+                let asset = match read_wasm_str(&mut caller, asset_ptr, asset_len) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("[host_hts_approve] bad asset: {}", e);
+                        return 0;
+                    }
+                };
+                let spender = match read_wasm_str(&mut caller, spender_ptr, spender_len) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(e) => {
+                        eprintln!("[host_hts_approve] bad spender: {}", e);
+                        return 0;
+                    }
+                };
+                if spender.is_empty() {
+                    eprintln!("[host_hts_approve] spender is required");
+                    return 0;
+                }
+                let amount_str = match read_wasm_str(&mut caller, amount_ptr, amount_len) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[host_hts_approve] bad amount: {}", e);
+                        return 0;
+                    }
+                };
+                let amount: f64 = match amount_str.trim().parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[host_hts_approve] bad amount format: {}", e);
+                        return 0;
+                    }
+                };
+                if !amount.is_finite() || amount <= 0.0 {
+                    eprintln!("[host_hts_approve] amount must be a positive number");
+                    return 0;
+                }
+
+                let vault = match caller.data().payment_vault.clone() {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("[host_hts_approve] hts capability not enabled");
+                        return 0;
+                    }
+                };
+                let client = vault.client();
+                let operator = vault.account_id();
+
+                let receipt = if asset.is_empty()
+                    || asset.eq_ignore_ascii_case("hbar")
+                    || asset == "0.0.0"
+                {
+                    let tinybars = (amount * 100_000_000.0).round() as i64;
+                    if tinybars <= 0 {
+                        eprintln!("[host_hts_approve] amount converts to 0 tinybars");
+                        return 0;
+                    }
+                    match crate::payments::hts::approve_hbar_allowance(
+                        &client, operator, &spender, tinybars,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hts_approve] HBAR allowance failed: {}", e);
+                            return 0;
+                        }
+                    }
+                } else {
+                    let decimals = vault.token_decimals(&asset).await.unwrap_or(0);
+                    let base_units = (amount * 10f64.powi(decimals as i32)).round() as u64;
+                    if base_units == 0 {
+                        eprintln!("[host_hts_approve] amount converts to 0 base units");
+                        return 0;
+                    }
+                    match crate::payments::hts::approve_token_allowance(
+                        &client, operator, &asset, &spender, base_units,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[host_hts_approve] token allowance failed: {}", e);
+                            return 0;
+                        }
+                    }
+                };
+
+                let bytes = serde_json::to_vec(&json!({
+                    "transaction_id": receipt.transaction_id,
+                    "hashscan_url": receipt.hashscan_url,
+                    "status": receipt.status,
+                }))
+                .unwrap_or_default();
+                write_wasm_bytes(&mut caller, &bytes).await.unwrap_or(0)
+            })
+        },
+    )?;
+    Ok(())
+}
+
+/// Decode NFT metadata bytes: hex (with optional `0x` prefix), else base64,
+/// else raw UTF-8 bytes.
+fn decode_metadata(s: &str) -> Vec<u8> {
+    let hex_part = s.strip_prefix("0x").unwrap_or(s);
+    if !hex_part.is_empty() && hex_part.chars().all(|c| c.is_ascii_hexdigit()) && hex_part.len() % 2 == 0
+        && let Ok(bytes) = hex::decode(hex_part)
+    {
+        return bytes;
+    }
+    if let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s) {
+        return bytes;
+    }
+    s.as_bytes().to_vec()
 }

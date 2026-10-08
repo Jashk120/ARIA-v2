@@ -44,6 +44,15 @@ impl X402PaymentVault {
         self.operator_id
     }
 
+    /// Clone of the operator signing key. HTS flows (token create, mint)
+    /// must name key *values* (admin/supply key fields) at build time —
+    /// the operator `Client` signs automatically, but key fields require
+    /// the key itself. The public half is derived via
+    /// `operator_key().public_key()`.
+    pub fn operator_key(&self) -> PrivateKey {
+        self.private_key.clone()
+    }
+
     pub fn new(
         client: Client,
         operator_id: AccountId,

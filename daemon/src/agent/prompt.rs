@@ -288,7 +288,7 @@ fn format_skill_block(m: &SkillManifest) -> String {
 /// True unless the skill needs a DLT capability — the single predicate
 /// both prompt surfaces filter on when the air-gap flag is off.
 fn skill_visible_in_air_gap(m: &SkillManifest) -> bool {
-    !(m.capabilities.hedera_pay || m.capabilities.x402_pay)
+    !(m.capabilities.hedera_pay || m.capabilities.x402_pay || m.capabilities.hts)
 }
 
 // ── Native tools builder ──────────────────────────────────────────────────────

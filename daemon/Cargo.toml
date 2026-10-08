@@ -10,10 +10,14 @@ members = [
     "Extra/dlt/skills/pay/x402.pay",
     "Extra/dlt/skills/pay/query.pay",
     "Extra/dlt/skills/pay/transfer.pay",
+    "Extra/dlt/skills/create/token.create",
+    "Extra/dlt/skills/mint/token.mint",
+    "Extra/dlt/skills/set/allowance.set",
     "skills/doc/write.pdf",
     "skills/doc/write.xlsx",
     "skills/doc/write.docx",
     "skills/exec/run.exec",
+    "skills/create/token.create",
 ]
 
 [package]
